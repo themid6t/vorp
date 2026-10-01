@@ -1,4 +1,5 @@
 use std::{net::SocketAddr, path::PathBuf};
+use vorp_web::SignupMode;
 
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -7,6 +8,9 @@ pub struct RelayConfig {
     pub dashboard_host: String,
     pub database_path: PathBuf,
     pub tls: TlsConfig,
+    pub signup_mode: SignupMode,
+    /// M1 local development credential. File TLS requires a loopback listener.
+    pub dev_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -17,7 +21,9 @@ pub enum TlsConfig {
     },
     Acme(AcmeConfig),
     /// M1 local development only.
-    SelfSigned,
+    SelfSigned {
+        cert_output: PathBuf,
+    },
 }
 
 #[derive(Clone)]

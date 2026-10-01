@@ -1,4 +1,5 @@
 mod repository;
+mod subdomain;
 
 pub use repository::{
     BindPolicy, NewAgentToken, NewSession, NewUser, Repository, RepositoryError, ReservedSubdomain,

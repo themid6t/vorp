@@ -199,8 +199,10 @@ replacing what it defends.
 - **The live traffic feed is authenticated and scoped per-user.** The Go version
   shipped `/api/traffic/recent` and `/api/traffic/stream` **unauthenticated and
   global across all users** — a known leak, especially for a company hosting this
-  internally. Do not reproduce it. Every `/api/*` route except `/healthz` requires
-  a session.
+  internally. Do not reproduce it. Every `/api/*` route requires a session
+  except the necessary entry points (`/api/bootstrap`, `/api/signup`, and
+  `/api/login`); bootstrap is one-shot and signup follows the configured mode.
+  `/healthz` is public and sits outside `/api`.
 - Owner-or-admin checks are enforced **in the query** (`where user_id = ?`), not
   by filtering after the fetch.
 

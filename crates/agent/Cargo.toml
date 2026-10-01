@@ -5,5 +5,23 @@ edition = "2024"
 publish = false
 
 [dependencies]
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+hostname = "0.4"
+http = "1"
+http-body-util = "0.1"
+httparse = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+mac_address = "1"
+rustls-native-certs = "0.8"
+sha2 = "0.10"
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "io-util"] }
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tracing = "0.1"
+url = "2"
 vorp-protocol = { path = "../protocol" }
+yamux = "0.13"

@@ -1,1 +1,3 @@
 /target/
+/vorp.sqlite3*
+*.key

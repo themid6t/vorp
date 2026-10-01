@@ -1,6 +1,6 @@
 # SQLite schema and repository seam
 
-Status: M0 contract. The persistence workstream owns migrations and all SQL in
+Status: SQLite repository implemented. The persistence workstream owns migrations and all SQL in
 `crates/store`. Other crates call `Repository` methods, never SQL directly.
 
 ## Tables
@@ -16,7 +16,8 @@ and columns below are the contract; migration SQL is owned by the store crate.
 | `agent_tokens` | `id INTEGER PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash)=32)`, `bind_policy TEXT NOT NULL CHECK (bind_policy IN ('any','temporary','reserved'))`, `created_at_ms INTEGER NOT NULL`, `revoked_at_ms INTEGER`; index on `user_id` |
 | `token_allowlist` | `token_id INTEGER NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `PRIMARY KEY (token_id,name)` |
 | `reserved_subdomains` | `name TEXT PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at_ms INTEGER NOT NULL`; index on `user_id` |
-| `settings` | `key TEXT PRIMARY KEY`, `value TEXT NOT NULL` for one-shot bootstrap state and signup mode |
+| `settings` | `key TEXT PRIMARY KEY`, `value TEXT NOT NULL` for optional persisted deployment settings; signup mode currently comes from the relay CLI |
+| `signup_invites` | `id INTEGER PRIMARY KEY`, `created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `code_hash BLOB NOT NULL UNIQUE CHECK(length(code_hash)=32)`, `created_at_ms INTEGER NOT NULL`, `used_at_ms INTEGER`; one-time admin-created invite codes |
 
 Bind policy follows the legacy `decideBind` decision table: `any` permits
 temporary tunnels, the user's assigned name, and reserved names they own;
@@ -37,7 +38,8 @@ sessions. Active tunnel and traffic state stays in memory, scoped by `user_id`.
 
 ## Repository signatures
 
-The signatures in `crates/store/src/repository.rs` are authoritative. M0 defines:
+The signatures in `crates/store/src/repository.rs` are authoritative. The M0
+baseline defined:
 
 ```text
 open(path) -> Repository
@@ -62,3 +64,40 @@ Every method returns `Result<_, RepositoryError>` and is async. Scoped writes
 must include `user_id` in the SQL predicate. Admin access should use explicit
 admin methods added in this module, never a fetch-then-filter in a handler.
 The store workstream may extend these signatures alongside a schema doc update.
+
+## Implemented extensions
+
+`user_by_id`, `user_count`, and transactional `bootstrap_admin` support local
+account setup. `update_password` changes the hash and deletes all of that user's
+sessions in one transaction. `setting` and `set_setting` are available for
+persisted deployment options; bootstrap is determined by the users table and
+signup mode is set with `vorp serve --signup`.
+
+`mint_token(user_id, policy, allowlist)` allocates an ID, generates 32 random
+bytes, and returns `vorp_<id>_<hex-secret>` exactly once. Only its SHA-256 hash
+is stored. `authenticate_token(raw)` looks up the ID, compares the complete raw
+token's hash in constant time, and rejects revoked tokens. `token_for_user`
+supports scoped revocation retries. All SQLite operations run on Tokio's
+blocking pool behind one serialized connection.
+
+`mint_invite(admin_user_id)` creates a one-time code after checking the caller
+is an admin in SQL. `create_user_with_invite` validates its SHA-256 hash in
+constant time and creates the user while marking the code used in a single
+immediate transaction. In `signup_mode=invite`, the signup API requires this
+code; `closed` disables self-registration.
+
+Reservations must have 3–63 lowercase ASCII letters, digits, or hyphens, with
+an alphanumeric edge. `www`, `api`, `mail`, `smtp`, `ftp`, `admin`, `dash`,
+`dashboard`, and `vorpd` are reserved. `reservations_for_user` is scoped in SQL.
+
+The web crate exposes `router_with_disconnect` for the relay to provide a
+`TokenDisconnect` callback. The token revocation API fails closed when no
+callback is configured, and retries disconnect even when the token was already
+marked revoked. The dashboard's cookie is `HttpOnly; Secure; SameSite=Lax`; API
+mutations require `X-Vorp-Csrf: 1` from same-origin JavaScript.
+
+The web crate also exposes `DashboardRuntime` for the relay to provide
+per-user tunnel snapshots, owner-scoped force-close, and recent traffic. The
+HTTP handlers derive `user_id` from the server-side session and pass it into
+the runtime; `/api/traffic/recent` and `/api/traffic/stream` cannot return a
+global feed. They return 503 until the relay supplies the runtime hook.

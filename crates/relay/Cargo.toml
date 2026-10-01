@@ -5,7 +5,26 @@ edition = "2024"
 publish = false
 
 [dependencies]
+axum.workspace = true
 thiserror.workspace = true
 vorp-protocol = { path = "../protocol" }
 vorp-store = { path = "../store" }
 vorp-web = { path = "../web" }
+http = "1"
+getrandom = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tokio-rustls = "0.26"
+rcgen = "0.14"
+yamux = "0.13"
+futures = "0.3"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+sha2 = "0.10"
+subtle = "2"
+tracing = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = "0.1"
+serde_json = "1"

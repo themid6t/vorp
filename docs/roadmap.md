@@ -2,6 +2,12 @@
 
 How this gets built, split so several agents can work at once without colliding.
 
+Current state: M0, M1, and M2 are implemented. Local smoke checks cover a
+streamed HTTP upload and response, a WebSocket echo, SQLite-backed agent
+authentication, and live token revocation. M3 and M4 remain to be built; the
+relay currently needs certificate files or a development self-signed
+certificate exported for the agent to trust.
+
 Two rules make the parallelism actually work:
 
 1. **Every workstream owns a disjoint set of paths.** No two agents edit the same
