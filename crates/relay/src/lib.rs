@@ -1,6 +1,7 @@
 mod authz;
 mod config;
 mod httpnorm;
+mod limits;
 mod proxy;
 mod registry;
 mod server;
@@ -28,6 +29,7 @@ use std::{
     pin::Pin,
     sync::{Arc, OnceLock, Weak},
 };
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -39,6 +41,8 @@ struct State {
     config: RelayConfig,
     repository: Option<vorp_store::Repository>,
     registry: registry::Registry,
+    http_requests: Arc<Semaphore>,
+    websockets: Arc<Semaphore>,
     shutdown: CancellationToken,
     web_router: OnceLock<axum::Router>,
 }
@@ -128,12 +132,9 @@ pub async fn serve_until(
     config: RelayConfig,
     shutdown: CancellationToken,
 ) -> Result<(), RelayError> {
-    if config.dev_token.is_some()
-        && !matches!(config.tls, TlsConfig::SelfSigned { .. })
-        && !config.listen.ip().is_loopback()
-    {
+    if !dev_token_mode_allowed(&config) {
         return Err(RelayError::Config(
-            "development token requires self-signed TLS or a loopback listener".into(),
+            "development token requires self-signed TLS and a loopback listener".into(),
         ));
     }
     let repository = if config.dev_token.is_some() {
@@ -146,9 +147,47 @@ pub async fn serve_until(
             config,
             repository,
             registry: registry::Registry::default(),
+            http_requests: Arc::new(Semaphore::new(256)),
+            websockets: Arc::new(Semaphore::new(128)),
             shutdown,
             web_router: OnceLock::new(),
         }),
     };
     relay.run().await
+}
+
+fn dev_token_mode_allowed(config: &RelayConfig) -> bool {
+    config.dev_token.is_none()
+        || (matches!(config.tls, TlsConfig::SelfSigned { .. }) && config.listen.ip().is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn development_token_requires_both_loopback_and_self_signed_tls() {
+        let mut config = RelayConfig {
+            listen: "127.0.0.1:8443".parse().expect("loopback socket"),
+            base_domain: "localhost".into(),
+            dashboard_host: "localhost".into(),
+            database_path: "unused.sqlite3".into(),
+            tls: TlsConfig::SelfSigned {
+                cert_output: "unused.crt".into(),
+            },
+            signup_mode: SignupMode::Closed,
+            dev_token: Some("test-token".into()),
+        };
+        assert!(dev_token_mode_allowed(&config));
+        config.listen = "0.0.0.0:8443".parse().expect("public socket");
+        assert!(!dev_token_mode_allowed(&config));
+        config.listen = "127.0.0.1:8443".parse().expect("loopback socket");
+        config.tls = TlsConfig::Files {
+            cert: "unused.crt".into(),
+            key: "unused.key".into(),
+        };
+        assert!(!dev_token_mode_allowed(&config));
+        config.dev_token = None;
+        assert!(dev_token_mode_allowed(&config));
+    }
 }

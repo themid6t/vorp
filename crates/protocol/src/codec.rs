@@ -33,7 +33,9 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Messag
     decode(header[0], &payload)
 }
 
-/// Write exactly one frame and await the write to preserve backpressure.
+/// Write one bounded, contiguous frame and await it to preserve backpressure.
+/// A cancelled write can leave a partial frame; the caller must close that
+/// stream rather than send another frame.
 pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &Message,
@@ -44,9 +46,11 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     if payload.len() > MAX_FRAME_PAYLOAD {
         return Err(CodecError::Oversized { declared });
     }
-    writer.write_all(&[kind]).await?;
-    writer.write_all(&declared.to_be_bytes()).await?;
-    writer.write_all(&payload).await?;
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&declared.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -290,6 +294,44 @@ impl BodySequence {
 mod tests {
     use super::*;
     use crate::{CloseReason, ErrorCode, RequestHead, ResponseHead};
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    #[derive(Default)]
+    struct WriteProbe {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for WriteProbe {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn raw_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(kind);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
 
     #[tokio::test]
     async fn all_frames_round_trip() {
@@ -383,6 +425,86 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn one_bounded_frame_is_submitted_as_one_contiguous_write() {
+        let mut writer = WriteProbe::default();
+        write_message(
+            &mut writer,
+            &Message::BodyChunk(vec![0x5a; MAX_FRAME_PAYLOAD]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.bytes.len(), 5 + MAX_FRAME_PAYLOAD);
+        assert_eq!(&writer.bytes[..5], &[0x30, 0, 1, 0, 0]);
+        assert!(writer.bytes[5..].iter().all(|byte| *byte == 0x5a));
+
+        let previous = writer.bytes.len();
+        let err = write_message(
+            &mut writer,
+            &Message::BodyChunk(vec![0; MAX_FRAME_PAYLOAD + 1]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CodecError::Oversized { .. }));
+        assert_eq!(writer.bytes.len(), previous);
+        assert_eq!(writer.writes, 1);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_leaves_raw_websocket_bytes_unread() {
+        let mut wire = Vec::new();
+        write_message(
+            &mut wire,
+            &Message::ResponseHead(ResponseHead {
+                status: 101,
+                headers: vec![("upgrade".into(), "websocket".into())],
+                content_length: None,
+            }),
+        )
+        .await
+        .unwrap();
+        wire.extend_from_slice(b"raw-websocket-payload");
+        let mut reader = wire.as_slice();
+        assert!(matches!(
+            read_message(&mut reader).await.unwrap(),
+            Message::ResponseHead(ResponseHead { status: 101, .. })
+        ));
+        assert_eq!(reader, b"raw-websocket-payload");
+    }
+
+    #[tokio::test]
+    async fn missing_option_fields_and_unknown_fields_are_accepted() {
+        let cases = [
+            (
+                "request length omitted",
+                0x20,
+                br#"{"subdomain":"a","method":"GET","target":"/","headers":[],"future_field":true}"#.as_slice(),
+                Message::RequestHead(RequestHead { subdomain: "a".into(), method: "GET".into(), target: "/".into(), headers: vec![], content_length: None }),
+            ),
+            (
+                "response length omitted",
+                0x21,
+                br#"{"status":204,"headers":[],"future_field":true}"#.as_slice(),
+                Message::ResponseHead(ResponseHead { status: 204, headers: vec![], content_length: None }),
+            ),
+            (
+                "tunnel options omitted",
+                0x10,
+                br#"{"future_field":true}"#.as_slice(),
+                Message::RegisterTunnel { subdomain: None, upstream_hint: None },
+            ),
+        ];
+        for (name, kind, payload, expected) in cases {
+            let frame = raw_frame(kind, payload);
+            assert_eq!(
+                read_message(&mut frame.as_slice()).await.unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn body_sequence_table() {
         let cases = [
@@ -414,6 +536,26 @@ mod tests {
             (
                 "chunk after end",
                 vec![Message::BodyEnd, Message::BodyChunk(vec![1])],
+                false,
+            ),
+            (
+                "chunk after abort",
+                vec![
+                    Message::BodyAbort {
+                        message: "gone".into(),
+                    },
+                    Message::BodyChunk(vec![1]),
+                ],
+                false,
+            ),
+            (
+                "abort after end",
+                vec![
+                    Message::BodyEnd,
+                    Message::BodyAbort {
+                        message: "late".into(),
+                    },
+                ],
                 false,
             ),
             (

@@ -3,11 +3,32 @@ use std::{convert::Infallible, net::SocketAddr};
 use axum::body::Body;
 use http::{Request, Response, StatusCode};
 use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::{net::TcpListener, task::JoinSet};
 use tower::ServiceExt;
 
-use crate::{Relay, RelayError};
+use crate::{Relay, RelayError, limits::ConnectionLimiter};
+
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS_PER_IP: usize = 64;
+const HTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchProtocol {
+    Agent,
+    Http1,
+    Http2,
+    Unsupported,
+}
+
+fn dispatch_protocol(alpn: Option<&[u8]>) -> DispatchProtocol {
+    match alpn {
+        Some(value) if value == vorp_protocol::AGENT_ALPN => DispatchProtocol::Agent,
+        Some(b"http/1.1") | None => DispatchProtocol::Http1,
+        Some(b"h2") => DispatchProtocol::Http2,
+        _ => DispatchProtocol::Unsupported,
+    }
+}
 
 impl Relay {
     pub(crate) async fn run(&self) -> Result<(), RelayError> {
@@ -20,14 +41,20 @@ impl Relay {
             })?;
         tracing::info!(address = %self.state.config.listen, "relay listening");
         let mut connections = JoinSet::new();
+        let limiter = ConnectionLimiter::new(MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP);
         loop {
             tokio::select! {
                 _ = self.state.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted.map_err(|error| RelayError::Listener(format!("accept TCP connection: {error}")))?;
+                    let Some(permit) = limiter.try_acquire(peer.ip()) else {
+                        tracing::debug!(peer = %peer, "connection limit reached");
+                        continue;
+                    };
                     let acceptor = tls.acceptor();
                     let relay = self.clone();
                     connections.spawn(async move {
+                        let _permit = permit;
                         let result = tokio::time::timeout(std::time::Duration::from_secs(30), acceptor.accept(socket)).await;
                         match result {
                             Ok(Ok(tls)) => relay.dispatch(tls, peer).await,
@@ -67,15 +94,15 @@ impl Relay {
         peer: SocketAddr,
     ) {
         let alpn = tls.get_ref().1.alpn_protocol();
-        match alpn {
-            Some(value) if value == vorp_protocol::AGENT_ALPN => {
+        match dispatch_protocol(alpn) {
+            DispatchProtocol::Agent => {
                 if let Err(error) = self.handle_agent(tls).await {
                     tracing::warn!(peer = %peer, error = %error, "agent session ended");
                 }
             }
-            Some(b"http/1.1") => self.serve_http1(tls, peer).await,
-            Some(b"h2") => self.serve_http2(tls, peer).await,
-            _ => tracing::warn!(peer = %peer, "unsupported TLS ALPN"),
+            DispatchProtocol::Http1 => self.serve_http1(tls, peer).await,
+            DispatchProtocol::Http2 => self.serve_http2(tls, peer).await,
+            DispatchProtocol::Unsupported => tracing::warn!(peer = %peer, "unsupported TLS ALPN"),
         }
     }
 
@@ -89,7 +116,12 @@ impl Relay {
             let relay = relay.clone();
             async move { Ok::<_, Infallible>(relay.handle_http(request, peer).await) }
         });
-        let connection = hyper::server::conn::http1::Builder::new()
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(HTTP_HEADER_TIMEOUT)
+            .max_buf_size(64 * 1024);
+        let connection = builder
             .serve_connection(TokioIo::new(tls), service)
             .with_upgrades();
         tokio::select! {
@@ -110,8 +142,14 @@ impl Relay {
             let relay = relay.clone();
             async move { Ok::<_, Infallible>(relay.handle_http(request, peer).await) }
         });
-        let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(tls), service);
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        builder
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(128)
+            .max_header_list_size(64 * 1024)
+            .keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(20));
+        let connection = builder.serve_connection(TokioIo::new(tls), service);
         tokio::select! {
             _ = self.state.shutdown.cancelled() => {},
             result = connection => if let Err(error) = result {
@@ -179,4 +217,22 @@ pub(crate) fn status(status: StatusCode) -> Response<Body> {
         .status(status)
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpn_dispatch_table() {
+        for (alpn, expected) in [
+            (None, DispatchProtocol::Http1),
+            (Some(&b"http/1.1"[..]), DispatchProtocol::Http1),
+            (Some(&b"h2"[..]), DispatchProtocol::Http2),
+            (Some(vorp_protocol::AGENT_ALPN), DispatchProtocol::Agent),
+            (Some(&b"unknown"[..]), DispatchProtocol::Unsupported),
+        ] {
+            assert_eq!(dispatch_protocol(alpn), expected);
+        }
+    }
 }

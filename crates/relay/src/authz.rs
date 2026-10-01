@@ -1,7 +1,5 @@
-use vorp_protocol::ErrorCode;
+use vorp_protocol::{ErrorCode, valid_subdomain};
 use vorp_store::BindPolicy;
-
-use crate::subdomain;
 
 pub(crate) struct BindContext<'a> {
     pub requested: &'a str,
@@ -23,7 +21,7 @@ pub(crate) fn decide_bind(context: &BindContext<'_>) -> Result<(), ErrorCode> {
     if context.policy == BindPolicy::Temporary {
         return Err(ErrorCode::SubdomainNotAllowed);
     }
-    if !subdomain::valid(context.requested) {
+    if !valid_subdomain(context.requested) {
         return Err(ErrorCode::SubdomainInvalid);
     }
     if let Some(owner) = context.reservation_owner {

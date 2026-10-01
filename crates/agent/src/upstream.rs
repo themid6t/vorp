@@ -296,17 +296,10 @@ where
         .code
         .ok_or_else(|| UpstreamError::Http("websocket response has no status".into()))?;
     if status != 101 {
-        write_message(
-            &mut stream,
-            &Message::ResponseHead(ResponseHead {
-                status: 502,
-                headers: vec![],
-                content_length: Some(0),
-            }),
-        )
-        .await?;
-        write_message(&mut stream, &Message::BodyEnd).await?;
-        return Ok(());
+        return tokio::select! {
+            _ = cancel.cancelled() => Ok(()),
+            result = forward_websocket_rejection(&mut stream, &mut upstream, &head, status, response.headers) => result,
+        };
     }
     let headers = response
         .headers
@@ -329,6 +322,187 @@ where
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
         result = tokio::io::copy_bidirectional(&mut stream, &mut upstream) => result.map(|_| ()).map_err(UpstreamError::Io),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResponseBodyFraming {
+    Empty,
+    Length(u64),
+    Chunked,
+    UntilEof,
+}
+
+fn websocket_rejection_headers(
+    headers: &[httparse::Header<'_>],
+    status: u16,
+    request_method: &str,
+) -> Result<(Vec<Header>, ResponseBodyFraming), UpstreamError> {
+    let mut map = http::HeaderMap::new();
+    let mut length = None;
+    let mut transfer = None;
+    for header in headers {
+        let name = HeaderName::try_from(header.name)
+            .map_err(|err| UpstreamError::Http(format!("upstream response header name: {err}")))?;
+        let value = HeaderValue::from_bytes(header.value)
+            .map_err(|err| UpstreamError::Http(format!("upstream response header value: {err}")))?;
+        if name == http::header::CONTENT_LENGTH {
+            let raw = value
+                .to_str()
+                .map_err(|_| UpstreamError::Http("non-UTF-8 Content-Length".into()))?;
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|_| UpstreamError::Http("invalid Content-Length".into()))?;
+            if length.is_some_and(|existing| existing != parsed) {
+                return Err(UpstreamError::Http(
+                    "conflicting Content-Length values".into(),
+                ));
+            }
+            length = Some(parsed);
+        }
+        if name == http::header::TRANSFER_ENCODING {
+            if transfer.is_some()
+                || value
+                    .to_str()
+                    .map(|s| !s.eq_ignore_ascii_case("chunked"))
+                    .unwrap_or(true)
+            {
+                return Err(UpstreamError::Http("unsupported Transfer-Encoding".into()));
+            }
+            transfer = Some(());
+        }
+        map.append(name, value);
+    }
+    if length.is_some() && transfer.is_some() {
+        return Err(UpstreamError::Http(
+            "ambiguous upstream response framing".into(),
+        ));
+    }
+    let framing = if request_method.eq_ignore_ascii_case("HEAD")
+        || status == 204
+        || status == 304
+        || (100..200).contains(&status)
+    {
+        ResponseBodyFraming::Empty
+    } else if transfer.is_some() {
+        ResponseBodyFraming::Chunked
+    } else if let Some(length) = length {
+        ResponseBodyFraming::Length(length)
+    } else {
+        ResponseBodyFraming::UntilEof
+    };
+    Ok((response_headers(&map)?, framing))
+}
+
+async fn forward_websocket_rejection<S>(
+    stream: &mut S,
+    upstream: &mut TcpStream,
+    request: &RequestHead,
+    status: u16,
+    raw_headers: &[httparse::Header<'_>],
+) -> Result<(), UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (headers, framing) = websocket_rejection_headers(raw_headers, status, &request.method)?;
+    let content_length = match framing {
+        ResponseBodyFraming::Length(length) => Some(length),
+        ResponseBodyFraming::Empty => Some(0),
+        ResponseBodyFraming::Chunked | ResponseBodyFraming::UntilEof => None,
+    };
+    write_message(
+        stream,
+        &Message::ResponseHead(ResponseHead {
+            status,
+            headers,
+            content_length,
+        }),
+    )
+    .await?;
+    if let Err(err) = forward_response_body(stream, upstream, framing).await {
+        write_message(
+            stream,
+            &Message::BodyAbort {
+                message: format!("upstream response body failed: {err}"),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    write_message(stream, &Message::BodyEnd).await?;
+    Ok(())
+}
+
+async fn forward_response_body<S>(
+    stream: &mut S,
+    upstream: &mut TcpStream,
+    framing: ResponseBodyFraming,
+) -> Result<(), UpstreamError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; 16 * 1024];
+    match framing {
+        ResponseBodyFraming::Empty => {}
+        ResponseBodyFraming::Length(mut left) => {
+            while left > 0 {
+                let take = usize::try_from(left.min(buffer.len() as u64))
+                    .map_err(|_| UpstreamError::Http("body chunk length overflow".into()))?;
+                upstream.read_exact(&mut buffer[..take]).await?;
+                write_message(stream, &Message::BodyChunk(buffer[..take].to_vec())).await?;
+                left -= take as u64;
+            }
+        }
+        ResponseBodyFraming::Chunked => loop {
+            let line = read_crlf_line(upstream).await?;
+            let hex = line
+                .split(|b| *b == b';')
+                .next()
+                .ok_or_else(|| UpstreamError::Http("empty chunk length".into()))?;
+            let hex = std::str::from_utf8(hex)
+                .map_err(|_| UpstreamError::Http("invalid chunk length".into()))?;
+            let mut left = u64::from_str_radix(hex.trim(), 16)
+                .map_err(|_| UpstreamError::Http("invalid chunk length".into()))?;
+            if left == 0 {
+                while !read_crlf_line(upstream).await?.is_empty() {}
+                break;
+            }
+            while left > 0 {
+                let take = usize::try_from(left.min(buffer.len() as u64))
+                    .map_err(|_| UpstreamError::Http("chunk length overflow".into()))?;
+                upstream.read_exact(&mut buffer[..take]).await?;
+                write_message(stream, &Message::BodyChunk(buffer[..take].to_vec())).await?;
+                left -= take as u64;
+            }
+            let mut end = [0u8; 2];
+            upstream.read_exact(&mut end).await?;
+            if end != *b"\r\n" {
+                return Err(UpstreamError::Http("malformed chunk terminator".into()));
+            }
+        },
+        ResponseBodyFraming::UntilEof => loop {
+            let read = upstream.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            write_message(stream, &Message::BodyChunk(buffer[..read].to_vec())).await?;
+        },
+    }
+    Ok(())
+}
+
+async fn read_crlf_line(stream: &mut TcpStream) -> Result<Vec<u8>, UpstreamError> {
+    let mut line = Vec::new();
+    loop {
+        if line.len() >= 8192 {
+            return Err(UpstreamError::Http("chunk line too long".into()));
+        }
+        let byte = stream.read_u8().await?;
+        line.push(byte);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return Ok(line);
+        }
     }
 }
 
@@ -376,6 +550,182 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::{net::TcpListener, time::timeout};
+
+    fn test_config(port: u16) -> AgentConfig {
+        AgentConfig {
+            relay_host: "localhost".into(),
+            relay_addr: "127.0.0.1:443".parse().expect("address"),
+            token: "not-used".into(),
+            upstream: format!("http://127.0.0.1:{port}"),
+            requested_subdomains: vec![None],
+            allow_remote_targets: false,
+            ca_cert: None,
+        }
+    }
+    fn websocket_head() -> RequestHead {
+        RequestHead {
+            subdomain: "test".into(),
+            method: "GET".into(),
+            target: "/socket".into(),
+            headers: vec![
+                ("host".into(), "test.localhost".into()),
+                ("connection".into(), "Upgrade".into()),
+                ("upgrade".into(), "websocket".into()),
+                (
+                    "sec-websocket-key".into(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".into(),
+                ),
+                ("sec-websocket-version".into(), "13".into()),
+            ],
+            content_length: None,
+        }
+    }
+    async fn consume_request_head(socket: &mut TcpStream) {
+        let mut tail = [0u8; 4];
+        loop {
+            let byte = socket.read_u8().await.expect("request byte");
+            tail.rotate_left(1);
+            tail[3] = byte;
+            if tail == *b"\r\n\r\n" {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_rejection_preserves_status_headers_and_streams_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let port = listener.local_addr().expect("addr").port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            consume_request_head(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nContent-Type: text/plain\r\nConnection: close, x-secret\r\nX-Secret: hidden\r\n\r\nforbidden").await.expect("response");
+        });
+        let (mut relay, agent) = tokio::io::duplex(8192);
+        let config = test_config(port);
+        let cancel = CancellationToken::new();
+        let agent_task = tokio::spawn(async move { handle_stream(agent, &config, cancel).await });
+        write_message(&mut relay, &Message::RequestHead(websocket_head()))
+            .await
+            .expect("head");
+        write_message(&mut relay, &Message::BodyEnd)
+            .await
+            .expect("end");
+        let response = timeout(Duration::from_secs(3), read_message(&mut relay))
+            .await
+            .expect("timeout")
+            .expect("response head");
+        assert_eq!(
+            response,
+            Message::ResponseHead(ResponseHead {
+                status: 403,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                content_length: Some(9)
+            })
+        );
+        assert_eq!(
+            read_message(&mut relay).await.expect("body"),
+            Message::BodyChunk(b"forbidden".to_vec())
+        );
+        assert_eq!(
+            read_message(&mut relay).await.expect("body end"),
+            Message::BodyEnd
+        );
+        assert!(agent_task.await.expect("agent task").is_ok());
+        upstream_task.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn websocket_101_still_switches_to_raw_copy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let port = listener.local_addr().expect("addr").port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            consume_request_head(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.expect("response");
+            let mut raw = [0u8; 4];
+            socket.read_exact(&mut raw).await.expect("raw");
+            assert_eq!(&raw, b"ping");
+            socket.write_all(b"pong").await.expect("echo");
+        });
+        let (mut relay, agent) = tokio::io::duplex(8192);
+        let config = test_config(port);
+        let cancel = CancellationToken::new();
+        let agent_cancel = cancel.clone();
+        let agent_task =
+            tokio::spawn(async move { handle_stream(agent, &config, agent_cancel).await });
+        write_message(&mut relay, &Message::RequestHead(websocket_head()))
+            .await
+            .expect("head");
+        write_message(&mut relay, &Message::BodyEnd)
+            .await
+            .expect("end");
+        let response = timeout(Duration::from_secs(3), read_message(&mut relay))
+            .await
+            .expect("timeout")
+            .expect("head");
+        assert!(matches!(
+            response,
+            Message::ResponseHead(ResponseHead { status: 101, .. })
+        ));
+        relay.write_all(b"ping").await.expect("send raw");
+        let mut raw = [0u8; 4];
+        relay.read_exact(&mut raw).await.expect("read raw");
+        assert_eq!(&raw, b"pong");
+        cancel.cancel();
+        assert!(agent_task.await.expect("agent task").is_ok());
+        upstream_task.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn websocket_rejection_streams_chunked_and_close_delimited_bodies() {
+        for (response,expected) in [
+            (b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4\r\nfail\r\n3\r\nure\r\n0\r\nX-Trailer: value\r\n\r\n".as_slice(),vec![b"fail".to_vec(),b"ure".to_vec()]),
+            (b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nforbidden".as_slice(),vec![b"forbidden".to_vec()]),
+        ] {
+            let listener=TcpListener::bind("127.0.0.1:0").await.expect("listen");let port=listener.local_addr().expect("addr").port();
+            let upstream_task=tokio::spawn(async move {let(mut socket,_)=listener.accept().await.expect("accept");consume_request_head(&mut socket).await;socket.write_all(response).await.expect("response");});
+            let(mut relay,agent)=tokio::io::duplex(8192);let config=test_config(port);let cancel=CancellationToken::new();
+            let agent_task=tokio::spawn(async move{handle_stream(agent,&config,cancel).await});
+            write_message(&mut relay,&Message::RequestHead(websocket_head())).await.expect("head");write_message(&mut relay,&Message::BodyEnd).await.expect("end");
+            assert!(matches!(read_message(&mut relay).await.expect("response"),Message::ResponseHead(ResponseHead{status:403,content_length:None,..})));
+            for bytes in expected {assert_eq!(read_message(&mut relay).await.expect("chunk"),Message::BodyChunk(bytes));}
+            assert_eq!(read_message(&mut relay).await.expect("end"),Message::BodyEnd);
+            assert!(agent_task.await.expect("agent task").is_ok());upstream_task.await.expect("upstream task");
+        }
+    }
+
+    #[test]
+    fn websocket_rejection_rejects_ambiguous_framing() {
+        let headers = [
+            httparse::Header {
+                name: "Content-Length",
+                value: b"4",
+            },
+            httparse::Header {
+                name: "Transfer-Encoding",
+                value: b"chunked",
+            },
+        ];
+        assert!(matches!(
+            websocket_rejection_headers(&headers, 403, "GET"),
+            Err(UpstreamError::Http(_))
+        ));
+        let headers = [
+            httparse::Header {
+                name: "Content-Length",
+                value: b"4",
+            },
+            httparse::Header {
+                name: "Content-Length",
+                value: b"5",
+            },
+        ];
+        assert!(matches!(
+            websocket_rejection_headers(&headers, 403, "GET"),
+            Err(UpstreamError::Http(_))
+        ));
+    }
 
     #[tokio::test]
     async fn response_streams_before_upload_ends() {

@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::{
     io::AsyncWrite,
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, mpsc, oneshot, watch},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{compat::FuturesAsyncReadCompatExt, sync::CancellationToken};
@@ -27,6 +27,23 @@ use crate::{Relay, State, httpnorm, registry::TunnelPermit, server::status};
 
 type RelayStream = tokio_util::compat::Compat<yamux::Stream>;
 type BodySender = mpsc::Sender<Result<Bytes, io::Error>>;
+
+struct WebSocketBudget {
+    request: TunnelPermit,
+    global_request: OwnedSemaphorePermit,
+    websocket_limit: Arc<tokio::sync::Semaphore>,
+    tunnel: Arc<crate::registry::Tunnel>,
+}
+
+impl WebSocketBudget {
+    fn upgrade(self) -> Option<(OwnedSemaphorePermit, crate::registry::WebSocketPermit)> {
+        let global = self.websocket_limit.try_acquire_owned().ok()?;
+        let tunnel = self.tunnel.try_acquire_websocket()?;
+        drop(self.request);
+        drop(self.global_request);
+        Some((global, tunnel))
+    }
+}
 
 struct TrafficMeta {
     state: Arc<State>,
@@ -62,6 +79,9 @@ impl Relay {
     ) -> Response<Body> {
         let Some(tunnel) = self.state.registry.tunnel(subdomain) else {
             return status(StatusCode::BAD_GATEWAY);
+        };
+        let Ok(global_permit) = Arc::clone(&self.state.http_requests).try_acquire_owned() else {
+            return status(StatusCode::SERVICE_UNAVAILABLE);
         };
         let Some(permit) = tunnel.try_acquire() else {
             return status(StatusCode::SERVICE_UNAVAILABLE);
@@ -122,7 +142,12 @@ impl Relay {
                 request,
                 stream,
                 head,
-                permit,
+                WebSocketBudget {
+                    request: permit,
+                    global_request: global_permit,
+                    websocket_limit: Arc::clone(&self.state.websockets),
+                    tunnel: Arc::clone(&tunnel),
+                },
                 tunnel.session.cancel.clone(),
                 traffic,
             )
@@ -133,6 +158,7 @@ impl Relay {
             stream,
             head,
             permit,
+            global_permit,
             tunnel.session.cancel.clone(),
             traffic,
         )
@@ -145,6 +171,7 @@ async fn streaming_exchange(
     mut stream: RelayStream,
     head: RequestHead,
     permit: TunnelPermit,
+    global_permit: OwnedSemaphorePermit,
     cancel: CancellationToken,
     traffic: TrafficMeta,
 ) -> Response<Body> {
@@ -158,18 +185,19 @@ async fn streaming_exchange(
     let upload_cancel = cancel.clone();
     let bytes_in = Arc::new(AtomicU64::new(0));
     let upload_bytes = Arc::clone(&bytes_in);
+    let (progress, progress_rx) = watch::channel(());
     let upload = tokio::spawn(async move {
-        if let Err(error) = upload_body(body, &mut writer, &upload_cancel, &upload_bytes).await {
+        if let Err(error) =
+            upload_body(body, &mut writer, &upload_cancel, &upload_bytes, &progress).await
+        {
             tracing::warn!(error = %error, "request body forwarding failed");
         }
     });
-    let first = tokio::select! {
-        _ = cancel.cancelled() => { upload.abort(); return status(StatusCode::BAD_GATEWAY) },
-        result = tokio::time::timeout(Duration::from_secs(30), read_message(&mut reader)) => result,
-    };
-    let head = match first {
-        Ok(Ok(Message::ResponseHead(head))) => head,
-        Err(_) => {
+    let head = match wait_response_head(&mut reader, progress_rx, &cancel, Duration::from_secs(30))
+        .await
+    {
+        Ok(Message::ResponseHead(head)) => head,
+        Err(HeadWaitError::Timeout) => {
             upload.abort();
             return status(StatusCode::GATEWAY_TIMEOUT);
         }
@@ -182,7 +210,7 @@ async fn streaming_exchange(
         upload.abort();
         return status(StatusCode::BAD_GATEWAY);
     }
-    let (mut response, sender) = match build_response(&head, false) {
+    let (response, sender) = match build_response(&head, false) {
         Ok(value) => value,
         Err(_) => {
             upload.abort();
@@ -194,22 +222,50 @@ async fn streaming_exchange(
         upload.abort();
         traffic.record(head.status, bytes_in.load(Ordering::Acquire), bytes_out);
         drop(permit);
+        drop(global_permit);
     });
-    if let Some(length) = head.content_length
-        && let Ok(value) = HeaderValue::from_str(&length.to_string())
-    {
-        response
-            .headers_mut()
-            .insert(http::header::CONTENT_LENGTH, value);
-    }
     response
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadWaitError {
+    Timeout,
+    Cancelled,
+    Protocol,
+}
+
+async fn wait_response_head<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    mut progress: watch::Receiver<()>,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<Message, HeadWaitError> {
+    let head = read_message(reader);
+    tokio::pin!(head);
+    let deadline = tokio::time::sleep(idle_timeout);
+    tokio::pin!(deadline);
+    let mut progress_open = true;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(HeadWaitError::Cancelled),
+            result = &mut head => return result.map_err(|_| HeadWaitError::Protocol),
+            _ = &mut deadline => return Err(HeadWaitError::Timeout),
+            changed = progress.changed(), if progress_open => {
+                if changed.is_ok() {
+                    deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                } else {
+                    progress_open = false;
+                }
+            }
+        }
+    }
 }
 
 async fn websocket_exchange(
     mut request: Request<Incoming>,
     mut stream: RelayStream,
     head: RequestHead,
-    permit: TunnelPermit,
+    budget: WebSocketBudget,
     cancel: CancellationToken,
     traffic: TrafficMeta,
 ) -> Response<Body> {
@@ -222,9 +278,26 @@ async fn websocket_exchange(
     }
     let response_head =
         match tokio::time::timeout(Duration::from_secs(30), read_message(&mut stream)).await {
-            Ok(Ok(Message::ResponseHead(head))) if head.status == 101 => head,
+            Ok(Ok(Message::ResponseHead(head))) => head,
+            Err(_) => return status(StatusCode::GATEWAY_TIMEOUT),
             _ => return status(StatusCode::BAD_GATEWAY),
         };
+    if response_head.status != 101 {
+        let (response, sender) = match build_response(&response_head, false) {
+            Ok(value) => value,
+            Err(_) => return status(StatusCode::BAD_GATEWAY),
+        };
+        let (reader, _writer) = tokio::io::split(stream);
+        tokio::spawn(async move {
+            let bytes_out = pump_response(reader, sender, cancel).await;
+            traffic.record(response_head.status, 0, bytes_out);
+            drop(budget);
+        });
+        return response;
+    }
+    let Some((websocket_permit, tunnel_websocket_permit)) = budget.upgrade() else {
+        return status(StatusCode::SERVICE_UNAVAILABLE);
+    };
     let upgraded = hyper::upgrade::on(&mut request);
     let mut response = match build_response(&response_head, true) {
         Ok((response, _)) => response,
@@ -233,7 +306,11 @@ async fn websocket_exchange(
     // A 101 carries no framed body; hyper owns the upgraded HTTP/1 connection.
     *response.body_mut() = Body::empty();
     tokio::spawn(async move {
-        let Ok(upgraded) = upgraded.await else { return };
+        let upgraded = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = upgraded => result,
+        };
+        let Ok(upgraded) = upgraded else { return };
         let mut client = TokioIo::new(upgraded);
         tokio::select! {
             _ = cancel.cancelled() => {},
@@ -244,7 +321,8 @@ async fn websocket_exchange(
                 }
             }
         }
-        drop(permit);
+        drop(tunnel_websocket_permit);
+        drop(websocket_permit);
     });
     response
 }
@@ -295,10 +373,21 @@ async fn upload_body<W: AsyncWrite + Unpin>(
     writer: &mut W,
     cancel: &CancellationToken,
     bytes_in: &AtomicU64,
+    progress: &watch::Sender<()>,
 ) -> Result<(), io::Error> {
     loop {
         let frame = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
+            _ = cancel.cancelled() => {
+                // The stream may already be closing; an abort is best-effort and
+                // dropping the writer below is the fallback.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    write_message(writer, &Message::BodyAbort {
+                        message: "request upload cancelled".into(),
+                    }),
+                ).await;
+                return Ok(());
+            },
             result = body.frame() => result,
         };
         match frame {
@@ -309,6 +398,7 @@ async fn upload_body<W: AsyncWrite + Unpin>(
                             .await
                             .map_err(io::Error::other)?;
                         bytes_in.fetch_add(chunk.len() as u64, Ordering::Release);
+                        progress.send_replace(());
                     }
                 }
             }
@@ -327,6 +417,7 @@ async fn upload_body<W: AsyncWrite + Unpin>(
                 write_message(writer, &Message::BodyEnd)
                     .await
                     .map_err(io::Error::other)?;
+                progress.send_replace(());
                 return Ok(());
             }
         }
@@ -361,4 +452,56 @@ async fn pump_response(
         }
     }
     bytes_out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn upload_progress_extends_response_head_deadline() {
+        let (mut reader, mut writer) = tokio::io::duplex(1024);
+        let (progress, receiver) = watch::channel(());
+        let send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            progress.send_replace(());
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            write_message(
+                &mut writer,
+                &Message::ResponseHead(ResponseHead {
+                    status: 200,
+                    headers: Vec::new(),
+                    content_length: None,
+                }),
+            )
+            .await
+            .expect("write response head");
+        });
+        let result = wait_response_head(
+            &mut reader,
+            receiver,
+            &CancellationToken::new(),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Ok(Message::ResponseHead(ResponseHead { status: 200, .. }))
+        ));
+        send.await.expect("sender task");
+    }
+
+    #[tokio::test]
+    async fn response_head_times_out_without_progress() {
+        let (mut reader, _writer) = tokio::io::duplex(1024);
+        let (_progress, receiver) = watch::channel(());
+        let result = wait_response_head(
+            &mut reader,
+            receiver,
+            &CancellationToken::new(),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(result, Err(HeadWaitError::Timeout));
+    }
 }

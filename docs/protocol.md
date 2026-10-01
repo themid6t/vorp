@@ -29,9 +29,16 @@ ALPN protocol:
 |---|---|
 | `vorp-agent/1` | yamux session handler (this protocol) |
 | `h2`, `http/1.1` | axum — dashboard, `/api`, and the public tunnel proxy, dispatched by `Host` |
+| no ALPN extension | HTTP/1.1 dashboard or public tunnel proxy |
 
 There is no nginx and no SNI preread. The agent connects to the same `:443` as a
 browser does; ALPN is what separates them.
+The relay currently requires TLS 1.3; support for older TLS clients is a
+separate compatibility decision.
+
+WebSocket upgrades use HTTP/1.1. The relay does not advertise HTTP/2 extended
+`CONNECT` support; an HTTP/2 request cannot request a WebSocket tunnel through
+this protocol.
 
 **The agent only ever dials out.** Inbound work reaches it because the *relay*
 opens a new yamux stream for each HTTP request. This is the whole reason the
@@ -62,6 +69,15 @@ Payload encoding depends on the type:
 - **`BodyChunk`** — raw opaque bytes, no encoding, no framing of its own.
 
 A frame's type determines which it is; there is no flag to inspect.
+
+The frame reader consumes exactly the five-byte prefix and declared payload.
+It must not read ahead into bytes after the frame: a `101` response switches the
+same stream to raw WebSocket bytes, which must remain available to the raw copier.
+If a buffered reader is introduced, its unread buffer must be handed to that
+copier. A sender writes each complete frame from one contiguous buffer and
+awaits the write. This does not make transport writes atomic: cancellation or an
+I/O error can leave a partial frame. After either, close the stream; never send
+another frame on it.
 
 ### Header values must be UTF-8
 
@@ -184,9 +200,13 @@ dedicated field, and the protocol's own chunk/end frames carry the framing:
 }
 ```
 
-The receiver re-establishes framing toward its own peer: set `Content-Length`
-when `content_length` is `Some`, otherwise use chunked encoding. Both hyper and
-the relay do this automatically from the body's known/unknown length.
+The receiver re-establishes framing toward its own peer. `content_length` is
+metadata, not proof that the promised bytes arrived. The agent may use a known
+request length when forwarding to its upstream. The relay treats a response
+length supplied by the agent as unverified and streams the client response with
+unknown length; HTTP/1.1 uses chunked encoding, while HTTP/2 uses DATA frames.
+It must not advertise an unverified `Content-Length` to the browser, because a
+truncated upstream response would otherwise look complete to that browser.
 
 This design removes request smuggling **by construction** rather than by
 validation — there is no path by which a client-supplied framing header reaches
@@ -224,24 +244,46 @@ received `BodyEnd` — an upstream that rejects an upload early (`413`, `401`) m
 be able to answer without the relay having to finish sending. Neither side may
 block its reader on its writer completing.
 
-### Error cases
+### Body state and errors
 
-| Situation | Behaviour |
-|---|---|
-| Agent cannot reach upstream | `ResponseHead` with status `502`, then `BodyEnd` |
-| Upstream dies mid-body | `BodyAbort` — relay terminates the client response abruptly (a truncated chunked body, which is the honest signal) rather than sending a misleading complete one |
-| Client disconnects mid-upload | Relay sends `BodyAbort`, agent aborts the upstream request |
-| Malformed/unexpected frame | `Error` with `STREAM_ERROR`, then close the stream |
-| No `ResponseHead` within the head timeout | Relay answers `504` and closes the stream |
+Each direction has its own state: `RequestHead` or `ResponseHead`, then zero or
+more `BodyChunk` frames, then exactly one `BodyEnd` or `BodyAbort`. The response
+head may arrive while request chunks are still flowing. `BodyEnd` means complete;
+`BodyAbort` means truncated and is terminal for the entire request stream. After
+an abort, close the stream and send no further frames. Two aborts crossing in
+flight are both treated as teardown, not as a second protocol error. A frame
+after `BodyEnd` in the same direction, or any frame outside this sequence, is
+`STREAM_ERROR`; close the stream.
 
-A `BodyAbort` received before any `ResponseHead` becomes a `502` to the client.
+If the agent cannot reach the upstream, it sends `ResponseHead` with status
+`502`, then `BodyEnd`. If the upstream dies after `ResponseHead`, it sends
+`BodyAbort`; the relay cuts off the client response, leaving an honestly
+truncated body. If the client disconnects or its upload fails before `BodyEnd`,
+the relay sends `BodyAbort` when the stream is still writable, then closes it;
+the agent aborts its upstream request and owes no response. If sending the abort
+also fails, closing the stream is the fallback. An agent `BodyAbort` before
+`ResponseHead` is invalid; the relay returns `502` if it can still answer and
+closes the stream. Abort messages are diagnostic only: never forward them to an
+HTTP client or log untrusted text at a level that an agent can flood.
+
+For any other malformed or unexpected frame, send `Error` with `STREAM_ERROR`
+when possible, then close. If no `ResponseHead` arrives before the head timeout,
+the relay answers `504` and closes the stream.
 
 ### WebSocket upgrade
 
-When `ResponseHead` carries status `101`, **framing stops**. Every byte after
-that frame on that stream is raw tunnelled traffic, copied bidirectionally until
-either side closes. The relay reconstructs the `101` toward the client on the
-upgraded connection, clears the stream's idle timeout, and pipes.
+For a validated WebSocket handshake, the relay writes `RequestHead`, then
+`BodyEnd`, and no further request frames. The agent must receive that `BodyEnd`
+before it may send a `101` response. This completes the framed request direction
+before either peer can switch to raw bytes.
+
+When `ResponseHead` carries status `101`, **framing stops**. The agent switches
+after writing that frame; the relay switches after reading it. Every byte after
+that frame on the same stream is raw tunnelled traffic, copied bidirectionally
+until either side closes. The relay reconstructs the `101` toward the client on
+the upgraded connection, clears the stream's idle timeout, and pipes. A non-101
+response to an upgrade request is an ordinary framed response: its status,
+headers, chunks and end/abort are forwarded normally.
 
 This is an exception to the frame format, not to §4 — raw copying is streaming by
 definition.
@@ -256,8 +298,8 @@ agent                                             relay
   │<───────────────────────────── yamux server ────┤
   ├─ open control stream ─────────────────────────>│
   ├─ RegisterAgent ───────────────────────────────>│  version must equal 1
-  │                                                │  token → user (SHA-256 hash lookup,
-  │                                                │    constant-time compare)
+  │                                                │  public token-id prefix → row;
+  │                                                │    constant-time compare of SHA-256 hashes
   │                                                │  displace any live session on the
   │                                                │    same (user_id, machine_id) slot,
   │                                                │    tearing it down with FORCED first
@@ -275,6 +317,10 @@ agent                                             relay
 **client-supplied and not a credential** — two users on one host derive the same
 value, so the session slot key is `(user_id, machine_id)`, never `machine_id`
 alone. A reconnect displaces only that user's own previous session.
+Registration publication and live-token revocation are ordered under the same
+registry lock: if revocation wins, publication is rejected; if publication
+wins, revocation finds and tears down that session. Authentication before
+publication alone is insufficient, because a revoke can commit between them.
 
 ### Heartbeat
 
@@ -334,22 +380,34 @@ a validated WebSocket handshake (`Upgrade: websocket` with an `upgrade` token in
 A client cannot spoof the proxy chain or its own identity.
 
 **Size bounds.** A serialized `RequestHead` exceeding the 64 KiB frame cap is
-answered `431`. Body size limits are policy, enforced as a running byte counter
-across chunks (`413`), default unlimited — streaming means they are no longer a
-memory guard.
+answered `431`. Body-size policy is not yet implemented; bodies currently have
+no configured byte limit. Streaming avoids whole-body allocation, but does not
+prevent bandwidth or upstream-disk exhaustion. A future limit must count bytes
+as they pass and reject oversized declared lengths early with `413`.
+
+**Edge connection bounds.** The relay accepts at most 1,024 concurrent TLS
+connections, including handshakes, and 64 from one peer IP. It allows 256
+concurrent HTTP tunnel requests, 128 upgraded WebSockets globally, and 128 of
+each per tunnel. Excess connections are closed; excess requests receive `503`.
+Authentication attempts are separately rate-limited before argon2id work.
 
 ---
 
 ## 9. Timeouts
 
 A single whole-round-trip deadline is wrong once bodies stream: it would sever
-large uploads and SSE. Three narrower bounds replace it.
+large uploads and SSE. Narrower bounds replace it.
 
 | Bound | Default | Applies to |
 |---|---|---|
-| head timeout | 30s | relay waiting for the first `ResponseHead` |
+| head timeout | 30s | relay waiting for the first `ResponseHead`; reset by progress on that request's upload stream, so an active upload is not cut off |
 | stream idle timeout | 60s | any stream making no frame progress; reset per frame; **cleared** after a `101` |
 | handshake timeout | 30s | reading `RegisterAgent` on a new control stream |
+| TLS handshake timeout | 30s | new accepted TLS connections |
+| HTTP/1 header read timeout | 10s | each request header block; backed by a Hyper timer |
+| HTTP/1 connection buffer | 64 KiB | bounds the parser buffer, including headers |
+| HTTP/2 stream limit | 128 | concurrent streams on one HTTP/2 connection |
+| HTTP/2 header list | 64 KiB | decoded request headers on one HTTP/2 stream |
 
 ---
 
@@ -391,6 +449,9 @@ nothing sends** — the Go version carried three (`SESSION_NOT_FOUND`,
 exits. Everything else is transient. Backoff applies only when establishing a
 *new* session fails (`1s → 2s → 4s → 8s → 16s → 30s → 60s`); a live session that
 drops reconnects immediately with no delay, because the link was just working.
+Forced or expired tunnel closures remain suppressed across reconnects; if all
+configured tunnels are suppressed, the agent exits instead of repeatedly
+reclaiming a displaced machine slot with no usable tunnel.
 
 ---
 

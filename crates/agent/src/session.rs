@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     future::poll_fn,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -64,8 +65,11 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
     config.validate()?;
     let machine_id = machine_id()?;
     let mut failed_attempts = 0_usize;
+    let suppressed = Arc::new(Mutex::new(HashSet::<usize>::new()));
     loop {
-        if shutdown.is_cancelled() {
+        if shutdown.is_cancelled()
+            || all_tunnels_suppressed(&suppressed, config.requested_subdomains.len())
+        {
             return Ok(());
         }
         let mut was_connected = false;
@@ -74,16 +78,23 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
             &machine_id,
             shutdown.child_token(),
             &mut was_connected,
+            Arc::clone(&suppressed),
         )
         .await
         {
             Ok(()) if shutdown.is_cancelled() => return Ok(()),
+            Ok(()) if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) => {
+                return Ok(());
+            }
             Ok(()) => {
                 failed_attempts = 0;
             }
             Err(AgentError::Authentication) => return Err(AgentError::Authentication),
             Err(AgentError::UnsupportedVersion) => return Err(AgentError::UnsupportedVersion),
             Err(err) => {
+                if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) {
+                    return Ok(());
+                }
                 tracing::warn!(error = %err, "agent session disconnected");
                 if was_connected {
                     failed_attempts = 0;
@@ -95,6 +106,15 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
             }
         }
     }
+}
+
+fn all_tunnels_suppressed(suppressed: &Mutex<HashSet<usize>>, total: usize) -> bool {
+    total != 0
+        && suppressed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            >= total
 }
 
 fn machine_id() -> Result<String, AgentError> {
@@ -169,6 +189,7 @@ async fn run_session(
     machine_id: &str,
     cancel: CancellationToken,
     was_connected: &mut bool,
+    suppressed: Arc<Mutex<HashSet<usize>>>,
 ) -> Result<(), AgentError> {
     let tls = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
@@ -189,6 +210,7 @@ async fn run_session(
         cancel.child_token(),
         &mut actor,
         was_connected,
+        suppressed,
     )
     .await;
     cancel.cancel();
@@ -206,6 +228,7 @@ async fn session_work(
     cancel: CancellationToken,
     actor: &mut tokio::task::JoinHandle<Result<(), AgentError>>,
     was_connected: &mut bool,
+    suppressed: Arc<Mutex<HashSet<usize>>>,
 ) -> Result<(), AgentError> {
     let mut control = tokio::select! {
         result = open_stream(open_tx) => result?,
@@ -252,11 +275,21 @@ async fn session_work(
     let mut tasks = JoinSet::new();
     let heartbeat_cancel = cancel.child_token();
     tasks.spawn(async move { heartbeat(control, heartbeat_cancel).await });
-    for requested in config.requested_subdomains.clone() {
+    for (index, requested) in config.requested_subdomains.iter().cloned().enumerate() {
+        if suppressed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&index)
+        {
+            continue;
+        }
         let tx = open_tx.clone();
         let hint = Some(config.upstream.clone());
         let task_cancel = cancel.child_token();
-        tasks.spawn(async move { tunnel_lifecycle(tx, requested, hint, task_cancel).await });
+        let task_suppressed = Arc::clone(&suppressed);
+        tasks.spawn(async move {
+            tunnel_lifecycle(tx, requested, hint, task_cancel, index, task_suppressed).await
+        });
     }
     let outcome = loop {
         tokio::select! {
@@ -282,19 +315,35 @@ async fn connection_actor<T>(
 where
     T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
 {
+    enum Event {
+        Inbound(Option<Result<Stream, yamux::ConnectionError>>),
+        Outbound(Result<Stream, yamux::ConnectionError>),
+    }
     let mut requests = JoinSet::new();
+    let mut pending_open = None;
+    let mut open_channel_open = true;
     let outcome = loop {
         tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
-            Some(reply) = open_rx.recv() => {
-                let opened = tokio::select! {
-                    _ = cancel.cancelled() => break Ok(()),
-                    result = poll_fn(|cx| connection.poll_new_outbound(cx)) => result.map_err(|err| err.to_string()),
-                };
-                let _ = reply.send(opened); // Receiver may have cancelled its registration.
-            }
-            inbound = poll_fn(|cx| connection.poll_next_inbound(cx)) => match inbound {
-                Some(Ok(stream)) => {
+            reply = open_rx.recv(), if pending_open.is_none() && open_channel_open => {
+                if let Some(reply) = reply { pending_open = Some(reply); }
+                else { open_channel_open = false; }
+            },
+            event = poll_fn(|cx| {
+                // A saturated outbound-open limit must not suspend inbound
+                // polling and window updates for existing request streams.
+                if pending_open.is_some()
+                    && let std::task::Poll::Ready(opened) = connection.poll_new_outbound(cx) {
+                    return std::task::Poll::Ready(Event::Outbound(opened));
+                }
+                connection.poll_next_inbound(cx).map(Event::Inbound)
+            }) => match event {
+                Event::Outbound(opened) => {
+                    if let Some(reply) = pending_open.take() {
+                        let _ = reply.send(opened.map_err(|error| error.to_string()));
+                    }
+                }
+                Event::Inbound(Some(Ok(stream))) => {
                     let task_config = config.clone();
                     let task_cancel = cancel.child_token();
                     requests.spawn(async move {
@@ -306,8 +355,8 @@ where
                         }
                     });
                 }
-                Some(Err(err)) => break Err(AgentError::Connection(format!("yamux inbound: {err}"))),
-                None => break Err(AgentError::Connection("relay closed yamux session".into())),
+                Event::Inbound(Some(Err(err))) => break Err(AgentError::Connection(format!("yamux inbound: {err}"))),
+                Event::Inbound(None) => break Err(AgentError::Connection("relay closed yamux session".into())),
             },
             Some(result) = requests.join_next(), if !requests.is_empty() => {
                 if let Err(err) = result { tracing::warn!(error = %err, "request task failed"); }
@@ -375,6 +424,8 @@ async fn tunnel_lifecycle(
     requested: Option<String>,
     hint: Option<String>,
     cancel: CancellationToken,
+    index: usize,
+    suppressed: Arc<Mutex<HashSet<usize>>>,
 ) -> Result<(), AgentError> {
     let mut retry = 0_usize;
     loop {
@@ -410,7 +461,13 @@ async fn tunnel_lifecycle(
                         }
                         match close_action(reason) {
                             CloseAction::StopAgent => return Err(AgentError::Authentication),
-                            CloseAction::StopTunnel => return Ok(()),
+                            CloseAction::StopTunnel => {
+                                suppressed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(index);
+                                return Ok(());
+                            }
                             CloseAction::Retry => acknowledged.map_err(|error| {
                                 AgentError::Connection(format!("acknowledge tunnel close: {error}"))
                             })?,

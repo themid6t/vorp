@@ -55,6 +55,10 @@ the PR description, not a drive-by commit.
 - **Graceful shutdown propagates to listeners.** Cancellation must reach the
   accept loops so they stop accepting and in-flight work drains; a listener that
   only dies when the process does is a bug.
+- **The yamux connection driver must keep polling while a stream can block.**
+  Do not await a per-stream read, write, or open operation in the task that
+  polls the connection; a stalled stream otherwise freezes every tunnel on the
+  session. Keep the driver running independently and cancel it on teardown.
 - **Guard every map removal with `Arc::ptr_eq`.** Session and tunnel maps hold
   `Arc<T>`; remove an entry only when the stored `Arc` is still *the same
   allocation* you are tearing down. This is the Go `DeleteIfMatch` pattern, and it
@@ -153,6 +157,9 @@ replacing what it defends.
 - **Sessions:** opaque random id in a server-side `sessions` table, delivered as
   `HttpOnly; Secure; SameSite=Lax`. Logout and password change delete server-side
   rows — a session must be killable from the server.
+- **Development tokens are loopback-only and self-signed-only.** This mode
+  bypasses the database token lookup and bind ACL for local smoke tests. Both
+  constraints are required; neither one alone makes it safe on a public relay.
 - Revoking or rotating an agent token must **terminate the live agent sessions
   already authenticated with it**, not just future ones. Each session records its
   authenticating token id; revoke → close that token's sessions' tunnels with a
@@ -160,6 +167,10 @@ replacing what it defends.
   and a revoked token kept a live tunnel.
 
 ### Proxy boundary
+
+- **The relay is the edge.** With nginx removed, it must bound concurrent
+  connections, slow request headers, and expensive authentication attempts
+  itself. Streaming prevents body buffering, not bandwidth or CPU exhaustion.
 
 - **HTTP normalization is mandatory** and must be ported from the Go
   `internal/server/httpnorm.go`:
@@ -203,6 +214,9 @@ replacing what it defends.
   except the necessary entry points (`/api/bootstrap`, `/api/signup`, and
   `/api/login`); bootstrap is one-shot and signup follows the configured mode.
   `/healthz` is public and sits outside `/api`.
+- **Mutating dashboard APIs require the `X-Vorp-Csrf: 1` header.** Same-origin
+  JavaScript can set it; a cross-origin form cannot, and there is deliberately
+  no CORS preflight permission. Authentication cookies alone are insufficient.
 - Owner-or-admin checks are enforced **in the query** (`where user_id = ?`), not
   by filtering after the fetch.
 

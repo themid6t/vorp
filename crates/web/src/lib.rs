@@ -19,6 +19,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use vorp_store::{BindPolicy, NewSession, NewUser, Repository, RepositoryError, User};
+mod limits;
+use limits::{AuthLimiter, LimitError, MAX_TRAFFIC_STREAMS, traffic_stream_permit};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignupMode {
@@ -78,6 +81,8 @@ struct AppState {
     config: WebConfig,
     disconnect: Option<Arc<dyn TokenDisconnect>>,
     runtime: Option<Arc<dyn DashboardRuntime>>,
+    auth_limiter: Arc<AuthLimiter>,
+    traffic_stream_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -87,6 +92,7 @@ enum ApiError {
     Conflict,
     Invalid(&'static str),
     Unavailable,
+    TooManyRequests,
     Internal,
 }
 impl IntoResponse for ApiError {
@@ -100,9 +106,18 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "relay disconnect unavailable",
             ),
+            Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded"),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         };
         (status, Json(ErrorBody { error: message })).into_response()
+    }
+}
+impl From<LimitError> for ApiError {
+    fn from(error: LimitError) -> Self {
+        match error {
+            LimitError::Busy => Self::TooManyRequests,
+            LimitError::Poisoned => Self::Internal,
+        }
     }
 }
 #[derive(Serialize)]
@@ -141,6 +156,8 @@ pub fn router_with_runtime(
         config,
         disconnect,
         runtime,
+        auth_limiter: Arc::new(AuthLimiter::new()),
+        traffic_stream_slots: Arc::new(Semaphore::new(MAX_TRAFFIC_STREAMS)),
     };
     Router::new()
         .route("/", get(index))
@@ -210,13 +227,15 @@ async fn stream_traffic(
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let user = current_user(&state, &headers).await?;
     let runtime = state.runtime.clone().ok_or(ApiError::Unavailable)?;
+    let permit = traffic_stream_permit(&state.traffic_stream_slots).map_err(ApiError::from)?;
     let stream = stream::unfold(
         (
             runtime,
             user.id,
             tokio::time::interval(std::time::Duration::from_secs(2)),
+            permit,
         ),
-        |(runtime, user_id, mut interval)| async move {
+        |(runtime, user_id, mut interval, permit)| async move {
             interval.tick().await;
             let payload = match runtime.recent_traffic(user_id).await {
                 Ok(events) => Event::default()
@@ -224,7 +243,7 @@ async fn stream_traffic(
                     .unwrap_or_else(|_| Event::default().data("[]")),
                 Err(_) => Event::default().event("error").data("traffic unavailable"),
             };
-            Some((Ok(payload), (runtime, user_id, interval)))
+            Some((Ok(payload), (runtime, user_id, interval, permit)))
         },
     );
     Ok(Sse::new(stream))
@@ -360,6 +379,10 @@ async fn bootstrap(
     Json(input): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     mutating_request(&headers)?;
+    let _auth_permit = state
+        .auth_limiter
+        .admit(&input.email)
+        .map_err(ApiError::from)?;
     let hash = hash_password(&input.password).await?;
     let user = state
         .repository
@@ -374,6 +397,16 @@ async fn signup(
     Json(input): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     mutating_request(&headers)?;
+    if state.config.signup_mode == SignupMode::Closed {
+        return Err(ApiError::Forbidden);
+    }
+    if state.config.signup_mode == SignupMode::Invite && input.invite_code.is_none() {
+        return Err(ApiError::Invalid("invite code required"));
+    }
+    let _auth_permit = state
+        .auth_limiter
+        .admit(&input.email)
+        .map_err(ApiError::from)?;
     let hash = hash_password(&input.password).await?;
     let user_input = NewUser {
         email: input.email,
@@ -405,6 +438,10 @@ async fn login(
     Json(input): Json<Credentials>,
 ) -> Result<Response, ApiError> {
     mutating_request(&headers)?;
+    let _auth_permit = state
+        .auth_limiter
+        .admit(&input.email)
+        .map_err(ApiError::from)?;
     let user = state
         .repository
         .user_by_email(&input.email)
@@ -460,6 +497,7 @@ async fn change_password(
 ) -> Result<Response, ApiError> {
     mutating_request(&headers)?;
     let u = current_user(&state, &headers).await?;
+    let _auth_permit = state.auth_limiter.admit(&u.email).map_err(ApiError::from)?;
     if !verify_password(&input.old_password, &u.password_hash).await {
         return Err(ApiError::Unauthorized);
     }
@@ -486,6 +524,10 @@ async fn create_user(
     if !admin.is_admin {
         return Err(ApiError::Forbidden);
     }
+    let _auth_permit = state
+        .auth_limiter
+        .admit(&input.email)
+        .map_err(ApiError::from)?;
     let hash = hash_password(&input.password).await?;
     let u = state
         .repository
@@ -738,6 +780,28 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
+    struct EmptyRuntime;
+    impl DashboardRuntime for EmptyRuntime {
+        fn tunnels(
+            &self,
+            _user_id: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TunnelView>, String>> + Send + '_>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn close_tunnel(
+            &self,
+            _user_id: i64,
+            _subdomain: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+            Box::pin(async { Ok(false) })
+        }
+        fn recent_traffic(
+            &self,
+            _user_id: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TrafficEvent>, String>> + Send + '_>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
     #[tokio::test]
     async fn password_hash_is_argon2id() {
         let hash = hash_password("long enough password").await.expect("hash");
@@ -971,5 +1035,72 @@ mod tests {
             .await
             .expect("second");
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn login_rate_limit_returns_429() {
+        let router = router(repo().await, config());
+        let body = r#"{"email":"unknown@example.test","password":"long enough password"}"#;
+        for _ in 0..10 {
+            let response = router
+                .clone()
+                .oneshot(req(Method::POST, "/api/login", body, None))
+                .await
+                .expect("login");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = router
+            .clone()
+            .oneshot(req(Method::POST, "/api/login", body, None))
+            .await
+            .expect("limited");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    #[tokio::test]
+    async fn signup_rate_limit_returns_429_before_hashing() {
+        let router = router(repo().await, config());
+        let body = r#"{"email":"new@example.test","password":"short"}"#;
+        for _ in 0..10 {
+            let response = router
+                .clone()
+                .oneshot(req(Method::POST, "/api/signup", body, None))
+                .await
+                .expect("signup");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = router
+            .clone()
+            .oneshot(req(Method::POST, "/api/signup", body, None))
+            .await
+            .expect("limited");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    #[tokio::test]
+    async fn traffic_stream_cap_releases_on_disconnect() {
+        let router =
+            router_with_runtime(repo().await, config(), None, Some(Arc::new(EmptyRuntime)));
+        let cookie = account(&router, "viewer@example.test").await;
+        let mut streams = Vec::new();
+        for _ in 0..MAX_TRAFFIC_STREAMS {
+            let response = router
+                .clone()
+                .oneshot(req(Method::GET, "/api/traffic/stream", "", Some(&cookie)))
+                .await
+                .expect("stream");
+            assert_eq!(response.status(), StatusCode::OK);
+            streams.push(response);
+        }
+        let full = router
+            .clone()
+            .oneshot(req(Method::GET, "/api/traffic/stream", "", Some(&cookie)))
+            .await
+            .expect("full");
+        assert_eq!(full.status(), StatusCode::TOO_MANY_REQUESTS);
+        streams.pop();
+        let reopened = router
+            .clone()
+            .oneshot(req(Method::GET, "/api/traffic/stream", "", Some(&cookie)))
+            .await
+            .expect("reopened");
+        assert_eq!(reopened.status(), StatusCode::OK);
     }
 }

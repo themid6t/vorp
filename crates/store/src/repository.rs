@@ -1,4 +1,3 @@
-use crate::subdomain::valid_name;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use vorp_protocol::valid_subdomain;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
@@ -467,7 +467,7 @@ impl Repository {
             if t.bind_policy != BindPolicy::Reserved && !t.allowlist.is_empty() {
                 return Err(RepositoryError::Invalid("allowlist requires reserved policy"));
             }
-            if t.allowlist.iter().any(|n| !valid_name(n)) {
+            if t.allowlist.iter().any(|n| !valid_subdomain(n)) {
                 return Err(RepositoryError::Invalid("allowlist name"));
             }
             let tx = c.transaction().map_err(map_db)?;
@@ -492,7 +492,7 @@ impl Repository {
     ) -> Result<(TokenRecord, String), RepositoryError> {
         self.run(move|c|{
         if policy!=BindPolicy::Reserved&&!allowlist.is_empty(){return Err(RepositoryError::Invalid("allowlist requires reserved policy"))}
-        if allowlist.iter().any(|n|!valid_name(n)){return Err(RepositoryError::Invalid("allowlist name"))}
+        if allowlist.iter().any(|n|!valid_subdomain(n)){return Err(RepositoryError::Invalid("allowlist name"))}
         let tx=c.transaction().map_err(map_db)?;
         for name in &allowlist {let owner:Option<i64>=tx.query_row("SELECT user_id FROM reserved_subdomains WHERE name=?",[name],|r|r.get(0)).optional().map_err(map_db)?;if owner!=Some(user_id){return Err(RepositoryError::Invalid("allowlist must contain owned reservations"))}}
         let mut secret=[0u8;32];getrandom::fill(&mut secret).map_err(|_|RepositoryError::Random)?;
@@ -563,7 +563,7 @@ impl Repository {
     ) -> Result<ReservedSubdomain, RepositoryError> {
         let name = name.to_owned();
         self.run(move |c| {
-            if !valid_name(&name) {
+            if !valid_subdomain(&name) {
                 return Err(RepositoryError::Invalid("subdomain name"));
             }
             let tx = c

@@ -21,7 +21,7 @@ use yamux::{Connection, Mode, Stream};
 use crate::{
     Relay,
     authz::{self, BindContext},
-    registry::{Session, Tunnel},
+    registry::{DEFAULT_TUNNEL_REQUEST_LIMIT, DEFAULT_TUNNEL_WEBSOCKET_LIMIT, Session, Tunnel},
     subdomain,
 };
 
@@ -41,6 +41,8 @@ pub(crate) enum SessionError {
     InvalidHandshake,
     #[error("connection ended")]
     Closed,
+    #[error("agent token was revoked during registration")]
+    Revoked,
     #[error("random generation failed: {0}")]
     Random(#[from] getrandom::Error),
 }
@@ -50,29 +52,33 @@ impl Relay {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let mut connection = Connection::new(io.compat(), yamux::Config::default(), Mode::Server);
-        let first = tokio::time::timeout(
-            Duration::from_secs(30),
-            poll_fn(|cx| connection.poll_next_inbound(cx)),
-        )
-        .await
-        .map_err(|_| SessionError::HandshakeTimeout)?
-        .ok_or(SessionError::HandshakeClosed)??;
-        let mut control = first.compat();
-        let register = tokio::time::timeout(
-            Duration::from_secs(30),
-            read_handshake_message(&mut connection, &mut control),
-        )
+        let connection = Connection::new(io.compat(), yamux::Config::default(), Mode::Server);
+        let (open, open_rx) =
+            mpsc::channel::<oneshot::Sender<Result<Stream, yamux::ConnectionError>>>(128);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(32);
+        let mut driver = DriverTask::spawn(connection, open_rx, inbound_tx);
+        let first = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                inbound = inbound_rx.recv() => inbound.ok_or(SessionError::HandshakeClosed),
+                result = &mut driver.handle => {
+                    result.map_err(|_| SessionError::Closed)??;
+                    Err(SessionError::HandshakeClosed)
+                }
+            }
+        })
         .await
         .map_err(|_| SessionError::HandshakeTimeout)??;
+        let mut control = first.compat();
+        let register = tokio::time::timeout(Duration::from_secs(30), read_message(&mut control))
+            .await
+            .map_err(|_| SessionError::HandshakeTimeout)??;
         let Message::RegisterAgent {
             protocol_version,
             token,
             machine_id,
         } = register
         else {
-            write_handshake_message(
-                &mut connection,
+            write_message(
                 &mut control,
                 &Message::AgentErr {
                     code: ErrorCode::StreamError,
@@ -80,13 +86,11 @@ impl Relay {
                 },
             )
             .await?;
-            drop(control);
-            close_yamux_connection(&mut connection).await;
+            driver.close().await;
             return Err(SessionError::InvalidHandshake);
         };
         if protocol_version != PROTOCOL_VERSION {
-            write_handshake_message(
-                &mut connection,
+            write_message(
                 &mut control,
                 &Message::AgentErr {
                     code: ErrorCode::UnsupportedVersion,
@@ -94,15 +98,13 @@ impl Relay {
                 },
             )
             .await?;
-            drop(control);
-            close_yamux_connection(&mut connection).await;
+            driver.close().await;
             return Err(SessionError::InvalidHandshake);
         }
         let credential = match self.authenticate(&token).await? {
             Some(value) => value,
             None => {
-                write_handshake_message(
-                    &mut connection,
+                write_message(
                     &mut control,
                     &Message::AgentErr {
                         code: ErrorCode::AuthFailed,
@@ -110,13 +112,10 @@ impl Relay {
                     },
                 )
                 .await?;
-                drop(control);
-                close_yamux_connection(&mut connection).await;
+                driver.close().await;
                 return Err(SessionError::InvalidHandshake);
             }
         };
-        let (open, mut open_rx) =
-            mpsc::channel::<oneshot::Sender<Result<Stream, yamux::ConnectionError>>>(128);
         let session = Arc::new(Session {
             id: random_session_id()?,
             key: (credential.user_id, machine_id),
@@ -127,11 +126,25 @@ impl Relay {
             teardown_started: AtomicBool::new(false),
             close_reason: Mutex::new(CloseReason::Forced),
         });
-        if let Some(previous) = self.state.registry.insert_session(Arc::clone(&session)) {
+        let previous = match self.state.registry.insert_session(Arc::clone(&session)) {
+            Ok(previous) => previous,
+            Err(()) => {
+                write_message(
+                    &mut control,
+                    &Message::AgentErr {
+                        code: ErrorCode::AuthFailed,
+                        message: "token was revoked".into(),
+                    },
+                )
+                .await?;
+                driver.close().await;
+                return Err(SessionError::Revoked);
+            }
+        };
+        if let Some(previous) = previous {
             self.state.registry.teardown(&previous);
         }
-        if let Err(error) = write_handshake_message(
-            &mut connection,
+        if let Err(error) = write_message(
             &mut control,
             &Message::AgentAck {
                 session_id: session.id.clone(),
@@ -141,7 +154,7 @@ impl Relay {
         .await
         {
             self.state.registry.teardown(&session);
-            return Err(error);
+            return Err(error.into());
         }
         tracing::info!(machine_id = %session.key.1, user_id = session.user_id, "agent connected");
         let mut tunnels = JoinSet::new();
@@ -168,45 +181,33 @@ impl Relay {
                     Ok(_) => break Err(SessionError::InvalidHandshake),
                     Err(error) => break Err(error.into()),
                 },
-                inbound = poll_fn(|cx| connection.poll_next_inbound(cx)) => match inbound {
-                    Some(Ok(stream)) => {
+                inbound = inbound_rx.recv() => match inbound {
+                    Some(stream) => {
                         let relay = self.clone();
                         let session = Arc::clone(&session);
                         tunnels.spawn(async move {
                             relay.handle_tunnel(session, stream).await;
                         });
                     }
-                    Some(Err(error)) => break Err(error.into()),
                     None => break Ok(()),
                 },
-                request = open_rx.recv() => if let Some(reply) = request {
-                    let opened = poll_fn(|cx| connection.poll_new_outbound(cx)).await;
-                    // A dropped HTTP caller no longer needs its stream.
-                    let _ = reply.send(opened);
-                },
+                result = &mut driver.handle => break result.map_err(|_| SessionError::Closed)?,
             }
         };
         self.state.registry.teardown(&session);
         let drain = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut connection_open = true;
-            while !tunnels.is_empty() {
-                tokio::select! {
-                    joined = tunnels.join_next() => {
-                        if let Some(Err(error)) = joined {
-                            tracing::warn!(error = %error, "tunnel task failed during shutdown");
-                        }
-                    }
-                    inbound = poll_fn(|cx| connection.poll_next_inbound(cx)), if connection_open => {
-                        connection_open = inbound.is_some();
-                    }
+            while let Some(joined) = tunnels.join_next().await {
+                if let Err(error) = joined {
+                    tracing::warn!(error = %error, "tunnel task failed during shutdown");
                 }
             }
-        }).await;
+        })
+        .await;
         if drain.is_err() {
             tunnels.abort_all();
         }
         drop(control);
-        close_yamux_connection(&mut connection).await;
+        driver.close().await;
         tracing::info!(machine_id = %session.key.1, user_id = session.user_id, "agent disconnected");
         result
     }
@@ -370,7 +371,7 @@ impl Relay {
                 reservation_owner: owner,
             })
             .map_err(|code| (code, "subdomain bind rejected".into()))?;
-        } else if !requested.is_empty() && !subdomain::valid(requested) {
+        } else if !requested.is_empty() && !vorp_protocol::valid_subdomain(requested) {
             return Err((ErrorCode::SubdomainInvalid, "invalid subdomain".into()));
         }
         if requested.is_empty() {
@@ -383,8 +384,10 @@ impl Relay {
         let tunnel = Arc::new(Tunnel {
             session: Arc::clone(session),
             subdomain: requested.into(),
-            concurrency_limit: 128,
+            concurrency_limit: DEFAULT_TUNNEL_REQUEST_LIMIT,
             active: std::sync::atomic::AtomicUsize::new(0),
+            websocket_limit: DEFAULT_TUNNEL_WEBSOCKET_LIMIT,
+            websocket_active: std::sync::atomic::AtomicUsize::new(0),
             upstream_hint,
             cancel: CancellationToken::new(),
         });
@@ -396,49 +399,112 @@ impl Relay {
     }
 }
 
-async fn read_handshake_message<T>(
-    connection: &mut Connection<T>,
-    control: &mut tokio_util::compat::Compat<Stream>,
-) -> Result<Message, SessionError>
-where
-    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
-{
-    tokio::select! {
-        result = read_message(control) => result.map_err(Into::into),
-        _ = poll_fn(|cx| connection.poll_next_inbound(cx)) => Err(SessionError::InvalidHandshake),
+struct DriverTask {
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<Result<(), SessionError>>,
+}
+
+impl DriverTask {
+    fn spawn<T>(
+        connection: Connection<T>,
+        open_rx: mpsc::Receiver<oneshot::Sender<Result<Stream, yamux::ConnectionError>>>,
+        inbound_tx: mpsc::Sender<Stream>,
+    ) -> Self
+    where
+        T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
+    {
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(connection_driver(
+            connection,
+            open_rx,
+            inbound_tx,
+            cancel.clone(),
+        ));
+        Self { cancel, handle }
+    }
+
+    async fn close(&mut self) {
+        self.cancel.cancel();
+        if !self.handle.is_finished() {
+            match tokio::time::timeout(Duration::from_secs(2), &mut self.handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(error = %error, "yamux driver ended during close")
+                }
+                Ok(Err(error)) => tracing::warn!(error = %error, "yamux driver task failed"),
+                Err(_) => tracing::warn!("yamux driver close timed out"),
+            }
+        }
     }
 }
 
-async fn write_handshake_message<T>(
-    connection: &mut Connection<T>,
-    control: &mut tokio_util::compat::Compat<Stream>,
-    message: &Message,
+impl Drop for DriverTask {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.handle.abort();
+    }
+}
+
+async fn connection_driver<T>(
+    mut connection: Connection<T>,
+    mut open_rx: mpsc::Receiver<oneshot::Sender<Result<Stream, yamux::ConnectionError>>>,
+    inbound_tx: mpsc::Sender<Stream>,
+    cancel: CancellationToken,
 ) -> Result<(), SessionError>
 where
-    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::select! {
-        result = write_message(control, message) => result.map_err(Into::into),
-        _ = poll_fn(|cx| connection.poll_next_inbound(cx)) => Err(SessionError::InvalidHandshake),
+    enum Event {
+        Inbound(Option<Result<Stream, yamux::ConnectionError>>),
+        Outbound(Result<Stream, yamux::ConnectionError>),
     }
-}
-
-async fn close_yamux_connection<T>(connection: &mut Connection<T>)
-where
-    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
-{
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        poll_fn(|cx| connection.poll_close(cx)),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "failed to close agent connection")
+    let mut pending_open = None;
+    let mut open_channel_open = true;
+    let result = loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            request = open_rx.recv(), if pending_open.is_none() && open_channel_open => {
+                if let Some(request) = request { pending_open = Some(request); }
+                else { open_channel_open = false; }
+            }
+            event = poll_fn(|cx| {
+                if pending_open.is_some()
+                    && let std::task::Poll::Ready(opened) = connection.poll_new_outbound(cx) {
+                    return std::task::Poll::Ready(Event::Outbound(opened));
+                }
+                connection.poll_next_inbound(cx).map(Event::Inbound)
+            }) => match event {
+                Event::Outbound(opened) => {
+                    if let Some(reply) = pending_open.take() {
+                        // HTTP callers may disconnect before yamux opens the stream.
+                        let _ = reply.send(opened);
+                    }
+                }
+                Event::Inbound(Some(Ok(stream))) => match inbound_tx.try_send(stream) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_stream)) => {
+                        tracing::debug!("agent opened more streams than the relay can queue");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_stream)) => break Ok(()),
+                },
+                Event::Inbound(Some(Err(error))) => break Err(error.into()),
+                Event::Inbound(None) => break Err(SessionError::Closed),
+            },
         }
-        Err(_) => tracing::warn!("timed out closing agent connection"),
+    };
+    if result.is_ok() {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| connection.poll_close(cx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(error = %error, "failed to close agent connection"),
+            Err(_) => tracing::warn!("timed out closing agent connection"),
+        }
     }
+    result
 }
 
 struct Credential {
@@ -461,4 +527,154 @@ fn now_ms() -> i64 {
         .map_or(0, |duration| {
             duration.as_millis().min(i64::MAX as u128) as i64
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RelayConfig, State, TlsConfig, registry::Registry};
+    use std::sync::OnceLock;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn pending_outbound_open_does_not_block_inbound_driver() {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (server_open, server_requests) = mpsc::channel(300);
+        let (server_inbound, mut incoming) = mpsc::channel(8);
+        let server = DriverTask::spawn(
+            Connection::new(server_io.compat(), yamux::Config::default(), Mode::Server),
+            server_requests,
+            server_inbound,
+        );
+        let (client_open, client_requests) = mpsc::channel(8);
+        let (client_inbound, _client_incoming) = mpsc::channel(8);
+        let client = DriverTask::spawn(
+            Connection::new(client_io.compat(), yamux::Config::default(), Mode::Client),
+            client_requests,
+            client_inbound,
+        );
+
+        // Yamux stops granting new outbound streams at 256 unacknowledged
+        // opens. Hold those streams so the 257th open stays pending.
+        let mut held = Vec::new();
+        for _ in 0..256 {
+            let (reply, answer) = oneshot::channel();
+            server_open.send(reply).await.expect("queue outbound open");
+            held.push(answer.await.expect("driver reply").expect("open stream"));
+        }
+        let (reply, mut blocked) = oneshot::channel();
+        server_open.send(reply).await.expect("queue blocked open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err()
+        );
+
+        let (reply, answer) = oneshot::channel();
+        client_open.send(reply).await.expect("queue client open");
+        let mut from_client = answer
+            .await
+            .expect("client driver reply")
+            .expect("client stream")
+            .compat();
+        from_client
+            .write_all(b"x")
+            .await
+            .expect("initiate inbound stream");
+        let _received = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+            .await
+            .expect("inbound stream was not driven")
+            .expect("driver ended");
+        drop(held);
+        drop(server);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn driver_moves_control_and_tunnel_frames_while_streams_are_read() {
+        let shutdown = CancellationToken::new();
+        let relay = Relay {
+            state: Arc::new(State {
+                config: RelayConfig {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    base_domain: "localhost".into(),
+                    dashboard_host: "localhost".into(),
+                    database_path: "unused.sqlite".into(),
+                    tls: TlsConfig::SelfSigned {
+                        cert_output: "unused-cert.pem".into(),
+                    },
+                    signup_mode: vorp_web::SignupMode::Closed,
+                    dev_token: Some("test-secret".into()),
+                },
+                repository: None,
+                registry: Registry::default(),
+                http_requests: Arc::new(tokio::sync::Semaphore::new(1)),
+                websockets: Arc::new(tokio::sync::Semaphore::new(1)),
+                shutdown: shutdown.clone(),
+                web_router: OnceLock::new(),
+            }),
+        };
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move { relay.handle_agent(server_io).await });
+        let (open_tx, open_rx) = mpsc::channel(8);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let client_connection =
+            Connection::new(client_io.compat(), yamux::Config::default(), Mode::Client);
+        let client_driver = DriverTask::spawn(client_connection, open_rx, inbound_tx);
+        let (reply, received) = oneshot::channel();
+        open_tx.send(reply).await.unwrap();
+        let mut control = received.await.unwrap().unwrap().compat();
+        write_message(
+            &mut control,
+            &Message::RegisterAgent {
+                protocol_version: PROTOCOL_VERSION,
+                token: "test-secret".into(),
+                machine_id: "test-machine".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), read_message(&mut control))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ack, Message::AgentAck { .. }));
+        write_message(
+            &mut control,
+            &Message::Ping {
+                timestamp_ms: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), read_message(&mut control))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(pong, Message::Pong { .. }));
+        let (reply, received) = oneshot::channel();
+        open_tx.send(reply).await.unwrap();
+        let mut tunnel = received.await.unwrap().unwrap().compat();
+        write_message(
+            &mut tunnel,
+            &Message::RegisterTunnel {
+                subdomain: Some("app".into()),
+                upstream_hint: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), read_message(&mut tunnel))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ack, Message::TunnelAck { .. }));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(7), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(client_driver);
+    }
 }

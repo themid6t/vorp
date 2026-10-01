@@ -1,26 +1,4 @@
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-const SYSTEM_RESERVED: &[&str] = &[
-    "www",
-    "api",
-    "mail",
-    "smtp",
-    "ftp",
-    "admin",
-    "dash",
-    "dashboard",
-    "vorpd",
-];
-
-pub(crate) fn valid(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (3..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-        && !SYSTEM_RESERVED.contains(&name)
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SlugError {
@@ -50,28 +28,6 @@ pub(crate) fn generate_slug() -> Result<String, SlugError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validation_table() {
-        for (name, expected) in [
-            ("app", true),
-            ("a-b", true),
-            ("123", true),
-            ("admin", false),
-            ("api", false),
-            ("apis", true),
-            ("ab", false),
-            ("-abc", false),
-            ("abc-", false),
-            ("Aaa", false),
-            ("a_b", false),
-            ("a.b", false),
-        ] {
-            assert_eq!(valid(name), expected, "{name}");
-        }
-        assert!(valid(&"a".repeat(63)));
-        assert!(!valid(&"a".repeat(64)));
-    }
 
     #[test]
     fn slug_entropy_and_failure_paths() {

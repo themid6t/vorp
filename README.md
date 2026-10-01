@@ -51,8 +51,9 @@ For local development, `--listen 127.0.0.1:8443` with `VORP_DEV_TOKEN` lets the
 relay run without the dashboard. Use `--dev-self-signed --dev-cert-out
 ./vorp-dev.crt` to create a temporary certificate, and point the agent's
 `--ca-cert` at that file. Give the agent the same development token. The token
-is accepted only with self-signed TLS or a loopback listener. A loopback relay
-can also use `--tls-cert` and `--tls-key` with a local CA-signed certificate.
+is accepted only when **both** self-signed TLS and a loopback listener are
+configured. To test supplied certificate files instead, use the normal
+SQLite-backed account and token flow.
 
 A high-entropy tunnel URL prevents casual guessing; it is not access control.
 Anyone holding the URL can reach the tunneled application. Protect sensitive
