@@ -5,14 +5,15 @@ relay (`vorp serve`) and an outbound-only agent (`vorp`). A single TLS listener
 uses ALPN to separate agent sessions from the dashboard and public tunnel
 traffic. Tunnel bodies stream through yamux in bounded frames.
 
-The current implementation covers the [M1 and M2 milestones](docs/roadmap.md):
-local TLS with certificate files, tunnels, the SQLite-backed dashboard, users,
-sessions, agent tokens, bind policies, and live revocation. Certificate files
-are checked every 30 seconds and reloaded for new TLS handshakes without
-interrupting existing connections; an invalid replacement leaves the last
-valid certificate in use. ACME automation, install helpers, and distribution
-artifacts are still planned. See [the wire contract](docs/protocol.md) for
-protocol details.
+The [roadmap](docs/roadmap.md) records M0–M2 as done and M3 as partial. Today
+the binary provides tunnels, a SQLite-backed dashboard, users, sessions, agent
+tokens, bind policies, a per-user traffic feed, and live token revocation.
+Supplied certificate files are checked every 30 seconds and reloaded for new
+TLS handshakes without interrupting existing connections; an invalid
+replacement leaves the last valid certificate in use. ACME DNS-01 and renewal,
+agent sidecar probes, `install-service`, and `doctor` are still to build. M4
+distribution artifacts have not started. See the [wire contract](docs/protocol.md)
+for protocol details.
 
 ## Run with an existing wildcard certificate
 

@@ -2,11 +2,20 @@
 
 How this gets built, split so several agents can work at once without colliding.
 
-Current state: M0, M1, and M2 are implemented. Local smoke checks cover a
-streamed HTTP upload and response, a WebSocket echo, SQLite-backed agent
-authentication, and live token revocation. M3 and M4 remain to be built; the
-relay currently needs certificate files or a development self-signed
-certificate exported for the agent to trust.
+Current state: M0, M1, and M2 are implemented; M3 is partial; M4 has not
+started. Local smoke checks cover a streamed HTTP upload and response, a
+WebSocket echo, SQLite-backed agent authentication, live token revocation,
+and certificate-file hot reload. Production TLS currently requires supplied
+certificate files; the development mode generates a self-signed certificate
+that the agent can explicitly trust. ACME issuance is not implemented.
+
+| Milestone | Status | Delivered / remaining |
+|---|---|---|
+| M0 — scaffold | Done | Five-crate workspace, pinned toolchain, CI gates, protocol and schema contracts. |
+| M1 — tunnels | Done | TLS/ALPN relay, outbound agent over yamux, streamed HTTP bodies, WebSocket forwarding, tunnel lifecycle. |
+| M2 — auth and state | Done | SQLite repository, local users and opaque sessions, dashboard/API, bind ACL, scoped traffic feed, live token revocation. |
+| M3 — production surface | Partial | Supplied certificate files reload without dropping existing connections. ACME DNS-01 and renewal, agent sidecar probes, `install-service`, and `doctor` remain. |
+| M4 — distribution | Not started | Container image, Compose, Helm, signed release manifest, and installer remain. |
 
 Two rules make the parallelism actually work:
 
@@ -115,7 +124,8 @@ streams back, and the bind ACL is enforced.
 - An `AcmeDns` trait with Cloudflare as the first implementation.
 - Bring-your-own-cert path: if `tls.cert`/`tls.key` are configured, skip ACME and
   watch the files for changes.
-- Agent `/healthz` + `/readyz` probes for the sidecar case.
+- Agent sidecar liveness/readiness probes. Keep the agent outbound-only; use
+  exec probes or local state instead of adding an inbound HTTP listener.
 - `vorp install-service` (emit a systemd unit) and `vorp doctor` (diagnose DNS,
   cert, port binding, and connectivity in machine-readable output, so an agent
   setting this up can act on the result).
@@ -135,7 +145,7 @@ Mostly not Rust, so it runs in parallel with everything from M1 onward.
 
 ## Milestones
 
-### M0 — Scaffold *(serial, one agent, blocks everything)*
+### M0 — Scaffold *(done)*
 
 Workspace, five crates, `rust-toolchain.toml`, CI with all four gates
 (`fmt`, `clippy -D warnings`, `test`, `deny`), `docs/schema.md`, and **stubs for
@@ -146,7 +156,7 @@ repository method signatures, config struct. Everything compiles; bodies are
 Nothing else may start until the seams exist, and nothing in M0 implements
 behaviour — it exists purely so four agents can then work without blocking.
 
-### M1 — It tunnels *(WS1 ∥ WS3)*
+### M1 — It tunnels *(done; WS1 ∥ WS3)*
 
 Hardcoded token, in-memory tunnel map, self-signed cert, no dashboard, no
 database. `curl https://<slug>.localhost` reaches a local service and streams
@@ -155,18 +165,23 @@ back. WebSocket works.
 This is proof of life and the highest-value milestone — everything after it is
 addition rather than discovery.
 
-### M2 — Real auth and state *(WS2, then WS3 swaps in)*
+### M2 — Real auth and state *(done; WS2, then WS3 swaps in)*
 
 SQLite, users, sessions, login, token CRUD, dashboard pages. WS3 replaces the
 hardcoded token with a store lookup plus the bind ACL, and wires revocation to
 session termination.
 
-### M3 — Production surface *(WS4)*
+### M3 — Production surface *(partial; WS4)*
 
 ACME DNS-01 with hot reload, BYO cert, health probes, `install-service`,
 `doctor`, per-user traffic feed.
 
-### M4 — Distribution *(WS5)*
+Done: BYO certificate loading and 30-second file-change checks for new TLS
+handshakes, plus the per-user traffic feed delivered with M2. Still needed:
+ACME DNS-01 wildcard issuance and renewal with hot certificate replacement;
+outbound-only agent sidecar probes; `install-service`; and `doctor`.
+
+### M4 — Distribution *(not started; WS5)*
 
 Image, compose, chart, release pipeline, install script.
 
