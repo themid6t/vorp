@@ -610,6 +610,7 @@ mod tests {
                 registry: Registry::default(),
                 http_requests: Arc::new(tokio::sync::Semaphore::new(1)),
                 websockets: Arc::new(tokio::sync::Semaphore::new(1)),
+                request_rates: crate::limits::RequestRateLimiter::new(),
                 shutdown: shutdown.clone(),
                 web_router: OnceLock::new(),
             }),

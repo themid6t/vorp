@@ -43,6 +43,7 @@ struct State {
     registry: registry::Registry,
     http_requests: Arc<Semaphore>,
     websockets: Arc<Semaphore>,
+    request_rates: limits::RequestRateLimiter,
     shutdown: CancellationToken,
     web_router: OnceLock<axum::Router>,
 }
@@ -149,6 +150,7 @@ pub async fn serve_until(
             registry: registry::Registry::default(),
             http_requests: Arc::new(Semaphore::new(256)),
             websockets: Arc::new(Semaphore::new(128)),
+            request_rates: limits::RequestRateLimiter::new(),
             shutdown,
             web_router: OnceLock::new(),
         }),

@@ -159,6 +159,9 @@ impl Relay {
     }
 
     async fn handle_http(&self, request: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+        if !self.state.request_rates.allow(peer.ip()) {
+            return status(StatusCode::TOO_MANY_REQUESTS);
+        }
         let requested_host = request
             .uri()
             .authority()
