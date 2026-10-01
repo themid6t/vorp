@@ -1,0 +1,33 @@
+[package]
+name = "vorp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = [
+    "crates/protocol",
+    "crates/store",
+    "crates/relay",
+    "crates/agent",
+    "crates/web",
+]
+default-members = [
+    ".",
+    "crates/protocol",
+    "crates/store",
+    "crates/relay",
+    "crates/agent",
+    "crates/web",
+]
+resolver = "3"
+
+[workspace.dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
+
+[dependencies]
+vorp-agent = { path = "crates/agent" }
+vorp-relay = { path = "crates/relay" }

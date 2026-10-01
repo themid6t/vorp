@@ -1,0 +1,11 @@
+[package]
+name = "vorp-relay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+vorp-protocol = { path = "../protocol" }
+vorp-store = { path = "../store" }
+vorp-web = { path = "../web" }

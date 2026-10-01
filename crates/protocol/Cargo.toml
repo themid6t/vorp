@@ -1,0 +1,10 @@
+[package]
+name = "vorp-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
