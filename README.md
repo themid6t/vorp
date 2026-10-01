@@ -7,9 +7,12 @@ traffic. Tunnel bodies stream through yamux in bounded frames.
 
 The current implementation covers the [M1 and M2 milestones](docs/roadmap.md):
 local TLS with certificate files, tunnels, the SQLite-backed dashboard, users,
-sessions, agent tokens, bind policies, and live revocation. ACME automation,
-certificate hot reload, install helpers, and distribution artifacts are still
-planned. See [the wire contract](docs/protocol.md) for protocol details.
+sessions, agent tokens, bind policies, and live revocation. Certificate files
+are checked every 30 seconds and reloaded for new TLS handshakes without
+interrupting existing connections; an invalid replacement leaves the last
+valid certificate in use. ACME automation, install helpers, and distribution
+artifacts are still planned. See [the wire contract](docs/protocol.md) for
+protocol details.
 
 ## Run with an existing wildcard certificate
 

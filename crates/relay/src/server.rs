@@ -11,7 +11,8 @@ use crate::{Relay, RelayError};
 
 impl Relay {
     pub(crate) async fn run(&self) -> Result<(), RelayError> {
-        let acceptor = crate::tls::acceptor(&self.state.config).await?;
+        let mut tls = crate::tls::TlsManager::new(&self.state.config).await?;
+        let mut certificate_check = tokio::time::interval(std::time::Duration::from_secs(30));
         let listener = TcpListener::bind(self.state.config.listen)
             .await
             .map_err(|error| {
@@ -24,7 +25,7 @@ impl Relay {
                 _ = self.state.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted.map_err(|error| RelayError::Listener(format!("accept TCP connection: {error}")))?;
-                    let acceptor = acceptor.clone();
+                    let acceptor = tls.acceptor();
                     let relay = self.clone();
                     connections.spawn(async move {
                         let result = tokio::time::timeout(std::time::Duration::from_secs(30), acceptor.accept(socket)).await;
@@ -38,6 +39,13 @@ impl Relay {
                 Some(joined) = connections.join_next(), if !connections.is_empty() => {
                     if let Err(error) = joined {
                         tracing::error!(error = %error, "connection task failed");
+                    }
+                }
+                _ = certificate_check.tick(), if tls.is_reloadable() => {
+                    match tls.reload_if_changed().await {
+                        Ok(true) => tracing::info!("TLS certificate reloaded"),
+                        Ok(false) => {},
+                        Err(error) => tracing::warn!(error = %error, "TLS certificate reload failed; retaining the last valid certificate"),
                     }
                 }
             }
