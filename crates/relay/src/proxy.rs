@@ -181,7 +181,7 @@ async fn streaming_exchange(
     {
         return status(StatusCode::BAD_GATEWAY);
     }
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = vorp_protocol::split(stream);
     let upload_cancel = cancel.clone();
     let bytes_in = Arc::new(AtomicU64::new(0));
     let upload_bytes = Arc::clone(&bytes_in);
@@ -287,7 +287,7 @@ async fn websocket_exchange(
             Ok(value) => value,
             Err(_) => return status(StatusCode::BAD_GATEWAY),
         };
-        let (reader, _writer) = tokio::io::split(stream);
+        let (reader, _writer) = vorp_protocol::split(stream);
         tokio::spawn(async move {
             let bytes_out = pump_response(reader, sender, cancel).await;
             traffic.record(response_head.status, 0, bytes_out);
@@ -425,7 +425,7 @@ async fn upload_body<W: AsyncWrite + Unpin>(
 }
 
 async fn pump_response(
-    mut reader: tokio::io::ReadHalf<RelayStream>,
+    mut reader: vorp_protocol::ReadHalf<RelayStream>,
     sender: BodySender,
     cancel: CancellationToken,
 ) -> u64 {

@@ -43,9 +43,12 @@ Store the token locally by passing it on standard input, then start the agent:
 
 ```sh
 vorp authtoken < /path/to/token.txt
-vorp --relay-host example.com --relay-addr 203.0.113.10:443 \
-  --upstream http://127.0.0.1:3000
+vorp --relay-host example.com --upstream http://127.0.0.1:3000
 ```
+
+The agent resolves `--relay-host` on port 443; `--relay-addr 203.0.113.10:443`
+dials a fixed address instead while still verifying the certificate for the
+relay host.
 
 The token file defaults to `$XDG_CONFIG_HOME/vorp/authtoken`, or
 `$HOME/.config/vorp/authtoken` where XDG is unset. `--token-file` chooses another

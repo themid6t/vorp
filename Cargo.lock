@@ -1991,6 +1991,7 @@ dependencies = [
  "anyhow",
  "clap",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "vorp-agent",

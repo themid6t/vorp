@@ -313,7 +313,10 @@ agent                                             relay
   │<──────────────────────────────────── Pong ─────┤
 ```
 
-`machine_id` is `SHA-256(hostname + ":" + first_non_loopback_mac)`. It is
+`machine_id` is `SHA-256(hostname + ":" + first_non_loopback_mac + ":" + pid +
+":" + process_start_nanos)`, computed once per agent process. The process part
+lets several agents on one host and account coexist; reconnects reuse the
+value, so a process still displaces its own stale session. It is
 **client-supplied and not a credential** — two users on one host derive the same
 value, so the session slot key is `(user_id, machine_id)`, never `machine_id`
 alone. A reconnect displaces only that user's own previous session.
@@ -388,8 +391,8 @@ as they pass and reject oversized declared lengths early with `413`.
 **Edge connection bounds.** The relay accepts at most 1,024 concurrent TLS
 connections, including handshakes, and 64 from one peer IP. It allows 256
 concurrent HTTP tunnel requests, 128 upgraded WebSockets globally, and 128 of
-each per tunnel. A per-peer token bucket allows 20 requests/second with a
-40-request burst. Excess connections close before HTTP dispatch; exhausted
+each per tunnel. A per-peer token bucket allows 200 requests/second with a
+400-request burst. Excess connections close before HTTP dispatch; exhausted
 HTTP/WebSocket slots receive `503`, while rate-limited requests receive `429`.
 Authentication attempts are separately rate-limited before argon2id work.
 

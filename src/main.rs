@@ -2,6 +2,8 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::EnvFilter;
 use vorp_agent::AgentConfig;
 use vorp_relay::{RelayConfig, SignupMode, TlsConfig};
 
@@ -51,8 +53,9 @@ struct AgentArgs {
     #[arg(long, default_value = "localhost")]
     relay_host: String,
 
-    #[arg(long, default_value = "127.0.0.1:443")]
-    relay_addr: SocketAddr,
+    /// Dial this address instead of resolving `--relay-host` on port 443.
+    #[arg(long)]
+    relay_addr: Option<SocketAddr>,
 
     #[arg(long)]
     ca_cert: Option<PathBuf>,
@@ -109,7 +112,11 @@ struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
@@ -139,7 +146,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         signup_mode: args.signup.into(),
         dev_token: args.dev_token,
     };
-    vorp_relay::serve(config).await.context("relay stopped")
+    vorp_relay::serve_until(config, shutdown_on_signal()?)
+        .await
+        .context("relay stopped")
 }
 
 async fn run_agent(args: AgentArgs) -> Result<()> {
@@ -174,7 +183,37 @@ async fn run_agent(args: AgentArgs) -> Result<()> {
     config
         .validate()
         .context("agent configuration is invalid")?;
-    vorp_agent::run(config).await.context("agent stopped")
+    vorp_agent::run_until(config, shutdown_on_signal()?)
+        .await
+        .context("agent stopped")
+}
+
+/// Cancels the returned token on Ctrl-C or SIGTERM (what systemd and
+/// Kubernetes send), so listeners stop accepting and in-flight work drains.
+fn shutdown_on_signal() -> Result<CancellationToken> {
+    let shutdown = CancellationToken::new();
+    let cancel = shutdown.clone();
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let terminated = terminate.recv();
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<Option<()>>();
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "Ctrl-C handler failed");
+                }
+            }
+            _ = terminated => {}
+            _ = cancel.cancelled() => return,
+        }
+        tracing::info!("shutdown signal received");
+        cancel.cancel();
+    });
+    Ok(shutdown)
 }
 
 fn default_token_path() -> Result<PathBuf> {

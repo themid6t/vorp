@@ -67,10 +67,11 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
     let mut failed_attempts = 0_usize;
     let suppressed = Arc::new(Mutex::new(HashSet::<usize>::new()));
     loop {
-        if shutdown.is_cancelled()
-            || all_tunnels_suppressed(&suppressed, config.requested_subdomains.len())
-        {
+        if shutdown.is_cancelled() {
             return Ok(());
+        }
+        if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) {
+            return Err(AgentError::TunnelsClosed);
         }
         let mut was_connected = false;
         match run_session(
@@ -84,7 +85,7 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
         {
             Ok(()) if shutdown.is_cancelled() => return Ok(()),
             Ok(()) if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) => {
-                return Ok(());
+                return Err(AgentError::TunnelsClosed);
             }
             Ok(()) => {
                 failed_attempts = 0;
@@ -93,7 +94,7 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
             Err(AgentError::UnsupportedVersion) => return Err(AgentError::UnsupportedVersion),
             Err(err) => {
                 if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) {
-                    return Ok(());
+                    return Err(AgentError::TunnelsClosed);
                 }
                 tracing::warn!(error = %err, "agent session disconnected");
                 if was_connected {
@@ -123,10 +124,17 @@ fn machine_id() -> Result<String, AgentError> {
     let mac = mac_address::get_mac_address()
         .map_err(|err| AgentError::Connection(format!("read machine MAC address: {err}")))?
         .ok_or_else(|| AgentError::Connection("no machine MAC address found".into()))?;
+    // The process nonce keeps two agents on one host and account from
+    // displacing each other's session; reconnects reuse it, so a process still
+    // replaces its own stale session.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
     let mut hasher = Sha256::new();
     hasher.update(hostname.to_string_lossy().as_bytes());
     hasher.update(b":");
     hasher.update(mac.to_string().as_bytes());
+    hasher.update(format!(":{}:{started}", std::process::id()).as_bytes());
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -148,9 +156,11 @@ async fn connect(
     tls_config.alpn_protocols = vec![AGENT_ALPN.to_vec()];
     let name = ServerName::try_from(config.relay_host.clone())
         .map_err(|err| AgentError::Connection(format!("invalid relay host: {err}")))?;
-    let tcp = TcpStream::connect(config.relay_addr)
-        .await
-        .map_err(|err| AgentError::Connection(format!("dial relay: {err}")))?;
+    let tcp = match config.relay_addr {
+        Some(addr) => TcpStream::connect(addr).await,
+        None => TcpStream::connect((config.relay_host.as_str(), 443)).await,
+    }
+    .map_err(|err| AgentError::Connection(format!("dial relay: {err}")))?;
     let tls = TlsConnector::from(Arc::new(tls_config))
         .connect(name, tcp)
         .await
@@ -462,6 +472,7 @@ async fn tunnel_lifecycle(
                         match close_action(reason) {
                             CloseAction::StopAgent => return Err(AgentError::Authentication),
                             CloseAction::StopTunnel => {
+                                tracing::warn!(subdomain = %subdomain, reason = ?reason, "relay closed tunnel permanently");
                                 suppressed
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)

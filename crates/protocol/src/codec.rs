@@ -299,6 +299,27 @@ mod tests {
         task::{Context, Poll},
     };
 
+    /// A peer built before an optional field existed omits it entirely. serde's
+    /// derive maps a missing `Option` to `None`; keep it that way (no custom
+    /// `deserialize_with` on an optional field without `#[serde(default)]`).
+    #[test]
+    fn optional_fields_may_be_absent() {
+        let cases: &[(u8, &str)] = &[
+            (0x10, r#"{}"#),
+            (
+                0x20,
+                r#"{"subdomain":"a","method":"GET","target":"/","headers":[]}"#,
+            ),
+            (0x21, r#"{"status":200,"headers":[]}"#),
+        ];
+        for (kind, payload) in cases {
+            assert!(
+                decode(*kind, payload.as_bytes()).is_ok(),
+                "kind {kind:#04x} rejected a payload without optional fields"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct WriteProbe {
         writes: usize,
