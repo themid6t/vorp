@@ -7,9 +7,7 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const RATE_BUCKET_CAPACITY: u64 = 400_000_000;
 const RATE_TOKEN: u64 = 1_000_000;
-const RATE_REFILL_PER_MILLISECOND: u64 = 200_000;
 const MAX_RATE_BUCKETS: usize = 4096;
 
 struct RateBucket {
@@ -17,17 +15,21 @@ struct RateBucket {
     updated: Instant,
 }
 
-/// Per-peer token bucket: 200 requests/second with a 400-request burst.
-/// Sized for one browser loading an asset-heavy page through a tunnel; the old
-/// nginx value (20/s, burst 40) throttled ordinary page loads.
+/// Per-peer token bucket allowing `per_second` requests with a burst of twice
+/// that. The default (200/s) is sized for one browser loading an asset-heavy
+/// page through a tunnel; the old nginx value (20/s) throttled page loads.
 pub(crate) struct RequestRateLimiter {
     buckets: Mutex<HashMap<IpAddr, RateBucket>>,
+    capacity: u64,
+    refill_per_millisecond: u64,
 }
 
 impl RequestRateLimiter {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(per_second: u64) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
+            capacity: per_second.saturating_mul(2).saturating_mul(RATE_TOKEN),
+            refill_per_millisecond: per_second.saturating_mul(RATE_TOKEN / 1000),
         }
     }
 
@@ -49,17 +51,14 @@ impl RequestRateLimiter {
             }
         }
         let bucket = buckets.entry(ip).or_insert(RateBucket {
-            tokens: RATE_BUCKET_CAPACITY,
+            tokens: self.capacity,
             updated: now,
         });
         let elapsed_ms = now.saturating_duration_since(bucket.updated).as_millis();
         let refill = elapsed_ms
-            .saturating_mul(u128::from(RATE_REFILL_PER_MILLISECOND))
+            .saturating_mul(u128::from(self.refill_per_millisecond))
             .min(u128::from(u64::MAX)) as u64;
-        bucket.tokens = bucket
-            .tokens
-            .saturating_add(refill)
-            .min(RATE_BUCKET_CAPACITY);
+        bucket.tokens = bucket.tokens.saturating_add(refill).min(self.capacity);
         bucket.updated = now;
         if bucket.tokens < RATE_TOKEN {
             return false;
@@ -147,7 +146,7 @@ mod tests {
 
     #[test]
     fn request_rate_has_burst_and_refills_without_exceeding_capacity() {
-        let limiter = RequestRateLimiter::new();
+        let limiter = RequestRateLimiter::new(200);
         let ip = IpAddr::from([127, 0, 0, 1]);
         let now = Instant::now();
         for _ in 0..400 {

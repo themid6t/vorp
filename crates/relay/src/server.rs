@@ -9,8 +9,6 @@ use tower::ServiceExt;
 
 use crate::{Relay, RelayError, limits::ConnectionLimiter};
 
-const MAX_CONNECTIONS: usize = 1024;
-const MAX_CONNECTIONS_PER_IP: usize = 64;
 const HTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,7 +39,8 @@ impl Relay {
             })?;
         tracing::info!(address = %self.state.config.listen, "relay listening");
         let mut connections = JoinSet::new();
-        let limiter = ConnectionLimiter::new(MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP);
+        let limits = self.state.config.limits;
+        let limiter = ConnectionLimiter::new(limits.max_connections, limits.max_connections_per_ip);
         loop {
             tokio::select! {
                 _ = self.state.shutdown.cancelled() => break,

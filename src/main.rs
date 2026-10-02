@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use vorp_agent::AgentConfig;
-use vorp_relay::{RelayConfig, SignupMode, TlsConfig};
+use vorp_relay::{EdgeLimits, RelayConfig, SignupMode, TlsConfig};
 
 #[derive(Parser)]
 #[command(name = "vorp", about = "Self-hosted reverse tunnels")]
@@ -20,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the relay.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Save an agent token read from standard input.
     Authtoken(TokenArgs),
 }
@@ -93,6 +93,18 @@ struct ServeArgs {
     #[arg(long, value_enum, default_value = "closed")]
     signup: SignupArg,
 
+    /// Concurrent TLS connections, including handshakes.
+    #[arg(long, default_value_t = EdgeLimits::default().max_connections)]
+    max_connections: usize,
+
+    /// Concurrent TLS connections from one IP (agents and browsers combined).
+    #[arg(long, default_value_t = EdgeLimits::default().max_connections_per_ip)]
+    max_connections_per_ip: usize,
+
+    /// HTTP requests per second per IP; the burst is twice this.
+    #[arg(long, default_value_t = EdgeLimits::default().requests_per_second_per_ip)]
+    rate_limit_rps: u64,
+
     #[arg(long, requires = "tls_key", conflicts_with = "dev_self_signed")]
     tls_cert: Option<PathBuf>,
 
@@ -119,7 +131,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Serve(args)) => serve(*args).await,
         Some(Command::Authtoken(args)) => save_token(args),
         None => run_agent(cli.agent).await,
     }
@@ -145,6 +157,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tls,
         signup_mode: args.signup.into(),
         dev_token: args.dev_token,
+        limits: EdgeLimits {
+            max_connections: args.max_connections,
+            max_connections_per_ip: args.max_connections_per_ip,
+            requests_per_second_per_ip: args.rate_limit_rps,
+        },
     };
     vorp_relay::serve_until(config, shutdown_on_signal()?)
         .await
