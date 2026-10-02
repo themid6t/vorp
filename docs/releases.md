@@ -5,8 +5,9 @@ already passed staging. There is no permanent `dev` branch.
 
 | Event | Checks | Deployment |
 | --- | --- | --- |
-| Pull request | Format, Clippy, all-feature tests, dependency policy | None |
-| Push/merge to `main` | The same checks, then a Linux amd64 release build | Automatically deploy that build to staging and check `/healthz` |
+| Pull request with non-Markdown changes | Format, Clippy, all-feature tests, dependency policy | None |
+| Push/merge to `main` with non-Markdown changes | The same checks, then a Linux amd64 release build | Automatically deploy that build to staging and check `/healthz` |
+| Markdown-only pull request or push | Lightweight successful check | None |
 | Annotated `vX.Y.Z` tag on a validated `main` commit (planned) | Verify the exact commit passed CI and staging; use its existing build | Create a GitHub Release and automatically deploy that build to production |
 
 The tag is the human production release decision. The production workflow must
@@ -15,6 +16,8 @@ commit that ran on staging, verify its checksum, and deploy it. Record the
 commit, artifact checksum, deployment result, and previous version. Reject tags
 pointing outside `main`, tags without a successful staging deployment, and tags
 whose artifact has expired. Staging artifacts currently expire after 30 days.
+Markdown-only commits do not produce an artifact, so tag the latest commit that
+actually passed staging; it may be an ancestor of the current `main` tip.
 Tags should not be moved or deleted. Use GitHub tag
 rulesets and deployment environments when the repository plan permits them.
 
@@ -27,7 +30,10 @@ rollback workflow should redeploy a previously released artifact by checksum.
 ## Current staging deployment
 
 The `CI` workflow runs all four Rust gates for pull requests and pushes to
-`main`. A successful push to `main` builds a static Linux amd64 binary on a
+`main` when a non-Markdown file changes. A Markdown-only change keeps a green
+`rust` check but skips compilation and deployment. This allows the check to be
+required by future branch protection without leaving documentation PRs
+pending. A successful code push to `main` builds a static Linux amd64 binary on a
 GitHub-hosted runner. It copies the binary to a dedicated `vorp-deploy` account
 over SSH and
 invokes `/usr/local/sbin/vorp-deploy-staging` through a narrowly scoped sudo

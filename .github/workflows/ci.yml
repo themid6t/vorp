@@ -11,21 +11,52 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.changes.outputs.run_ci }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for non-Markdown changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -eu
+          if ! git cat-file -e "$BASE_SHA^{commit}"; then
+            run_ci=true
+          else
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+              BASE_SHA=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            fi
+            git diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/vorp-changed-files"
+            if grep -qEv '\.md$' "$RUNNER_TEMP/vorp-changed-files"; then
+              run_ci=true
+            else
+              run_ci=false
+              echo 'Markdown-only change: skipping Rust gates and staging deployment.' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "run_ci=$run_ci" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
+        if: steps.changes.outputs.run_ci == 'true'
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - uses: EmbarkStudios/cargo-deny-action@v2
+        if: steps.changes.outputs.run_ci == 'true'
         with:
           command: check
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - if: steps.changes.outputs.run_ci == 'true'
+        run: cargo fmt --all --check
+      - if: steps.changes.outputs.run_ci == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - if: steps.changes.outputs.run_ci == 'true'
+        run: cargo test --all-features
 
   staging:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.rust.outputs.run_ci == 'true'
     needs: rust
     runs-on: ubuntu-latest
     concurrency:
