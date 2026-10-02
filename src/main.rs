@@ -105,6 +105,26 @@ struct ServeArgs {
     #[arg(long, default_value_t = EdgeLimits::default().requests_per_second_per_ip)]
     rate_limit_rps: u64,
 
+    /// Concurrent proxied HTTP requests across all tunnels.
+    #[arg(long, default_value_t = EdgeLimits::default().max_requests)]
+    max_requests: usize,
+
+    /// Concurrent WebSockets across all tunnels.
+    #[arg(long, default_value_t = EdgeLimits::default().max_websockets)]
+    max_websockets: usize,
+
+    /// Concurrent proxied HTTP requests per tunnel.
+    #[arg(long, default_value_t = EdgeLimits::default().tunnel_requests)]
+    tunnel_requests: usize,
+
+    /// Concurrent WebSockets per tunnel.
+    #[arg(long, default_value_t = EdgeLimits::default().tunnel_websockets)]
+    tunnel_websockets: usize,
+
+    /// Seconds to wait for an upstream's response head (resets on upload progress).
+    #[arg(long, default_value_t = EdgeLimits::default().response_timeout.as_secs())]
+    response_timeout_secs: u64,
+
     #[arg(long, requires = "tls_key", conflicts_with = "dev_self_signed")]
     tls_cert: Option<PathBuf>,
 
@@ -161,6 +181,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
             max_connections: args.max_connections,
             max_connections_per_ip: args.max_connections_per_ip,
             requests_per_second_per_ip: args.rate_limit_rps,
+            max_requests: args.max_requests,
+            max_websockets: args.max_websockets,
+            tunnel_requests: args.tunnel_requests,
+            tunnel_websockets: args.tunnel_websockets,
+            response_timeout: std::time::Duration::from_secs(args.response_timeout_secs),
         },
     };
     vorp_relay::serve_until(config, shutdown_on_signal()?)

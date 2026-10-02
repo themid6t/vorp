@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use vorp_web::SignupMode;
 
 #[derive(Clone)]
@@ -24,6 +24,16 @@ pub struct EdgeLimits {
     pub max_connections_per_ip: usize,
     /// Sustained HTTP requests per second per peer IP; the burst is twice this.
     pub requests_per_second_per_ip: u64,
+    /// Concurrent proxied HTTP requests across all tunnels.
+    pub max_requests: usize,
+    /// Concurrent upgraded WebSockets across all tunnels.
+    pub max_websockets: usize,
+    /// Concurrent proxied HTTP requests per tunnel.
+    pub tunnel_requests: usize,
+    /// Concurrent upgraded WebSockets per tunnel.
+    pub tunnel_websockets: usize,
+    /// Longest wait for an upstream's response head with no upload progress.
+    pub response_timeout: Duration,
 }
 
 impl Default for EdgeLimits {
@@ -32,6 +42,11 @@ impl Default for EdgeLimits {
             max_connections: 1024,
             max_connections_per_ip: 64,
             requests_per_second_per_ip: 200,
+            max_requests: 256,
+            max_websockets: 128,
+            tunnel_requests: 128,
+            tunnel_websockets: 128,
+            response_timeout: Duration::from_secs(30),
         }
     }
 }
