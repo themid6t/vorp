@@ -293,6 +293,23 @@ cargo deny check          # or, at minimum, cargo audit
 - Release binaries build with `CARGO_PROFILE_RELEASE_*` set for a static,
   trimmed, reproducible artifact — the agent ships as a single file.
 
+## Release and certificate operations
+
+- Use one long-lived `main` branch. Pull requests run the four CI gates; a
+  passing push to `main` builds and deploys to staging automatically. The
+  current pipeline is documented in `docs/releases.md`.
+- Production deployment on an annotated version tag is the agreed release
+  design, **not yet configured**. When it is implemented, promote the exact
+  artifact that passed staging for the same commit; do not rebuild on the tag.
+  Keep production credentials separate from staging and verify the Go relay
+  cutover plan before enabling the production deploy.
+- Until Vorp implements its own ACME DNS-01 issuer, deployed relays use
+  supplied certificate files. Staging obtains and renews its wildcard cert
+  through Certbot and the Cloudflare DNS plugin. Preserve the renewal hook and
+  Vorp's certificate-file reload behavior; see `docs/certificates.md`. Never
+  place the Cloudflare token, TLS private key, or agent tokens in the repo or
+  GitHub Actions artifacts.
+
 ---
 
 ## Extending this file

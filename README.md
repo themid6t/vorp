@@ -5,14 +5,15 @@ relay (`vorp serve`) and an outbound-only agent (`vorp`). A single TLS listener
 uses ALPN to separate agent sessions from the dashboard and public tunnel
 traffic. Tunnel bodies stream through yamux in bounded frames.
 
-The [roadmap](docs/roadmap.md) records M0–M2 as done and M3 as partial. Today
-the binary provides tunnels, a SQLite-backed dashboard, users, sessions, agent
-tokens, bind policies, a per-user traffic feed, and live token revocation.
+The [roadmap](docs/roadmap.md) records M0–M2 as done, M3 as partial, and the
+staging portion of M4 as active. Today the binary provides tunnels, a
+SQLite-backed dashboard, users, sessions, agent tokens, bind policies, a
+per-user traffic feed, and live token revocation.
 Supplied certificate files are checked every 30 seconds and reloaded for new
 TLS handshakes without interrupting existing connections; an invalid
 replacement leaves the last valid certificate in use. ACME DNS-01 and renewal,
 agent sidecar probes, `install-service`, and `doctor` are still to build. M4
-distribution artifacts have not started. See the [wire contract](docs/protocol.md)
+container and installer artifacts remain. See the [wire contract](docs/protocol.md)
 for protocol details.
 
 ## Run with an existing wildcard certificate
@@ -27,6 +28,10 @@ vorp serve \
   --tls-key /path/to/privkey.pem \
   --database-path /var/lib/vorp/vorp.sqlite3
 ```
+
+For Cloudflare DNS and Let's Encrypt, follow the current
+[certificate setup and renewal procedure](docs/certificates.md). The relay
+currently reads supplied files; its built-in ACME issuer remains planned.
 
 The relay listens on `0.0.0.0:443` by default. Open
 `https://example.com/` and use **First-run admin** once to create the initial
@@ -58,3 +63,14 @@ SQLite-backed account and token flow.
 A high-entropy tunnel URL prevents casual guessing; it is not access control.
 Anyone holding the URL can reach the tunneled application. Protect sensitive
 upstreams with their own authentication.
+
+## CI and staging
+
+Pull requests run formatting, Clippy, all-feature tests, and `cargo deny`.
+After the same checks pass on `main`, GitHub Actions builds a static Linux
+amd64 binary and deploys it to staging at
+`https://vorp-staging.themidst.xyz/`. The deployment checks the binary hash,
+restarts the service, verifies `/healthz`, and restores the previous binary
+if it fails. The [release plan](docs/releases.md) records the agreed single
+`main` branch and future tag-triggered production deployment. Production
+automation is not configured yet.

@@ -2,12 +2,15 @@
 
 How this gets built, split so several agents can work at once without colliding.
 
-Current state: M0, M1, and M2 are implemented; M3 is partial; M4 has not
-started. Local smoke checks cover a streamed HTTP upload and response, a
-WebSocket echo, SQLite-backed agent authentication, live token revocation,
+Current state: M0, M1, and M2 are implemented; M3 is partial; M4 has a working
+staging build/deployment pipeline but other distribution work remains. Local
+smoke checks cover a streamed HTTP upload and response, a WebSocket echo,
+SQLite-backed agent authentication, live token revocation,
 and certificate-file hot reload. Production TLS currently requires supplied
 certificate files; the development mode generates a self-signed certificate
-that the agent can explicitly trust. ACME issuance is not implemented.
+that the agent can explicitly trust. Staging obtains its wildcard certificate
+externally with Certbot and Cloudflare DNS-01, as described in
+[certificates.md](certificates.md). Built-in ACME issuance is not implemented.
 
 | Milestone | Status | Delivered / remaining |
 |---|---|---|
@@ -15,7 +18,7 @@ that the agent can explicitly trust. ACME issuance is not implemented.
 | M1 — tunnels | Done | TLS/ALPN relay, outbound agent over yamux, streamed HTTP bodies, WebSocket forwarding, tunnel lifecycle. |
 | M2 — auth and state | Done | SQLite repository, local users and opaque sessions, dashboard/API, bind ACL, scoped traffic feed, live token revocation. |
 | M3 — production surface | Partial | Supplied certificate files reload without dropping existing connections. ACME DNS-01 and renewal, agent sidecar probes, `install-service`, and `doctor` remain. |
-| M4 — distribution | Not started | Container image, Compose, Helm, signed release manifest, and installer remain. |
+| M4 — distribution | Partial | GitHub Actions builds a static Linux amd64 binary and deploys passing `main` commits to staging. Container image, Compose, Helm, production release workflow, signed manifest, and installer remain. |
 
 Two rules make the parallelism actually work:
 
@@ -181,9 +184,11 @@ handshakes, plus the per-user traffic feed delivered with M2. Still needed:
 ACME DNS-01 wildcard issuance and renewal with hot certificate replacement;
 outbound-only agent sidecar probes; `install-service`; and `doctor`.
 
-### M4 — Distribution *(not started; WS5)*
+### M4 — Distribution *(partial; WS5)*
 
-Image, compose, chart, release pipeline, install script.
+The [staging pipeline](releases.md) is live. Image, compose, chart,
+tag-triggered production deployment, signed manifest, and install script
+remain.
 
 ---
 

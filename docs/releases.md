@@ -7,7 +7,7 @@ already passed staging. There is no permanent `dev` branch.
 | --- | --- | --- |
 | Pull request | Format, Clippy, all-feature tests, dependency policy | None |
 | Push/merge to `main` | The same checks, then a Linux amd64 release build | Automatically deploy that build to staging and check `/healthz` |
-| Annotated `vX.Y.Z` tag on a validated `main` commit | Verify the exact commit passed CI and staging; use its existing build | Create a GitHub Release and automatically deploy that build to production |
+| Annotated `vX.Y.Z` tag on a validated `main` commit (planned) | Verify the exact commit passed CI and staging; use its existing build | Create a GitHub Release and automatically deploy that build to production |
 
 The tag is the human production release decision. The production workflow must
 not rebuild from the tag: it should fetch the artifact produced for the same
@@ -26,9 +26,10 @@ rollback workflow should redeploy a previously released artifact by checksum.
 
 ## Current staging deployment
 
-The `CI` workflow runs all four Rust gates for pull requests and pushes. A
-successful push to `main` builds a static Linux amd64 binary on a GitHub-hosted
-runner. It copies the binary to a dedicated `vorp-deploy` account over SSH and
+The `CI` workflow runs all four Rust gates for pull requests and pushes to
+`main`. A successful push to `main` builds a static Linux amd64 binary on a
+GitHub-hosted runner. It copies the binary to a dedicated `vorp-deploy` account
+over SSH and
 invokes `/usr/local/sbin/vorp-deploy-staging` through a narrowly scoped sudo
 rule. The server verifies the checksum, replaces `/opt/vorp/vorp`, restarts
 `vorp.service`, and checks the HTTPS health endpoint. On failure it restores
