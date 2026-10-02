@@ -307,6 +307,7 @@ async fn session_work(
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 let result = result.map_err(|err| AgentError::Connection(format!("session task: {err}")))?;
                 if result.is_err() { break result; }
+                if all_tunnels_suppressed(&suppressed, config.requested_subdomains.len()) { break Ok(()); }
             }
             _ = cancel.cancelled() => break Ok(()),
         }
@@ -494,11 +495,21 @@ async fn tunnel_lifecycle(
             }
             Message::TunnelErr {
                 code:
-                    ErrorCode::SubdomainTaken
+                    code @ (ErrorCode::SubdomainTaken
                     | ErrorCode::SubdomainInvalid
-                    | ErrorCode::SubdomainNotAllowed,
+                    | ErrorCode::SubdomainNotAllowed),
                 ..
             } => {
+                // The relay's message is peer-controlled text; log the code only.
+                tracing::error!(
+                    subdomain = requested.as_deref().unwrap_or(""),
+                    code = ?code,
+                    "relay rejected tunnel; reserve the name in the dashboard or omit --subdomain"
+                );
+                suppressed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(index);
                 return Ok(());
             }
             _ => {
