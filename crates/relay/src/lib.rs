@@ -116,19 +116,6 @@ impl Relay {
     }
 }
 
-pub async fn serve(config: RelayConfig) -> Result<(), RelayError> {
-    let shutdown = CancellationToken::new();
-    let on_signal = shutdown.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            on_signal.cancel();
-        }
-    });
-    let result = serve_until(config, shutdown).await;
-    signal.abort();
-    result
-}
-
 pub async fn serve_until(
     config: RelayConfig,
     shutdown: CancellationToken,

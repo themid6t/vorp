@@ -388,8 +388,8 @@ as they pass and reject oversized declared lengths early with `413`.
 **Edge connection bounds.** The relay accepts at most 1,024 concurrent TLS
 connections, including handshakes, and 64 from one peer IP. It allows 256
 concurrent HTTP tunnel requests, 128 upgraded WebSockets globally, and 128 of
-each per tunnel. A per-peer token bucket allows 20 requests/second with a
-40-request burst. Excess connections close before HTTP dispatch; exhausted
+each per tunnel. A per-peer token bucket allows 200 requests/second with a
+400-request burst. Excess connections close before HTTP dispatch; exhausted
 HTTP/WebSocket slots receive `503`, while rate-limited requests receive `429`.
 Authentication attempts are separately rate-limited before argon2id work.
 

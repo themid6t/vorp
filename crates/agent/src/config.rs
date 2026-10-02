@@ -4,7 +4,8 @@ use url::{Host, Url};
 #[derive(Clone)]
 pub struct AgentConfig {
     pub relay_host: String,
-    pub relay_addr: SocketAddr,
+    /// Overrides DNS resolution of `relay_host` (port 443) when set.
+    pub relay_addr: Option<SocketAddr>,
     pub token: String,
     pub upstream: String,
     pub requested_subdomains: Vec<Option<String>>,
@@ -65,7 +66,7 @@ mod tests {
     fn config(upstream: &str) -> AgentConfig {
         AgentConfig {
             relay_host: "localhost".into(),
-            relay_addr: "127.0.0.1:443".parse().unwrap(),
+            relay_addr: None,
             token: "x".into(),
             upstream: upstream.into(),
             requested_subdomains: vec![None],

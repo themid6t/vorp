@@ -7,9 +7,9 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const RATE_BUCKET_CAPACITY: u64 = 40_000_000;
+const RATE_BUCKET_CAPACITY: u64 = 400_000_000;
 const RATE_TOKEN: u64 = 1_000_000;
-const RATE_REFILL_PER_MILLISECOND: u64 = 20_000;
+const RATE_REFILL_PER_MILLISECOND: u64 = 200_000;
 const MAX_RATE_BUCKETS: usize = 4096;
 
 struct RateBucket {
@@ -17,7 +17,9 @@ struct RateBucket {
     updated: Instant,
 }
 
-/// Per-peer token bucket: 20 requests/second with a 40-request burst.
+/// Per-peer token bucket: 200 requests/second with a 400-request burst.
+/// Sized for one browser loading an asset-heavy page through a tunnel; the old
+/// nginx value (20/s, burst 40) throttled ordinary page loads.
 pub(crate) struct RequestRateLimiter {
     buckets: Mutex<HashMap<IpAddr, RateBucket>>,
 }
@@ -148,13 +150,13 @@ mod tests {
         let limiter = RequestRateLimiter::new();
         let ip = IpAddr::from([127, 0, 0, 1]);
         let now = Instant::now();
-        for _ in 0..40 {
+        for _ in 0..400 {
             assert!(limiter.allow_at(ip, now));
         }
         assert!(!limiter.allow_at(ip, now));
-        assert!(!limiter.allow_at(ip, now + Duration::from_millis(49)));
-        assert!(limiter.allow_at(ip, now + Duration::from_millis(50)));
-        assert!(!limiter.allow_at(ip, now + Duration::from_millis(50)));
+        assert!(!limiter.allow_at(ip, now + Duration::from_millis(4)));
+        assert!(limiter.allow_at(ip, now + Duration::from_millis(5)));
+        assert!(!limiter.allow_at(ip, now + Duration::from_millis(5)));
         assert!(limiter.allow_at(IpAddr::from([127, 0, 0, 2]), now));
     }
 }

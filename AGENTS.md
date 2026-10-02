@@ -59,6 +59,12 @@ the PR description, not a drive-by commit.
   Do not await a per-stream read, write, or open operation in the task that
   polls the connection; a stalled stream otherwise freezes every tunnel on the
   session. Keep the driver running independently and cancel it on teardown.
+- **Split a yamux stream only with `vorp_protocol::split`, never
+  `tokio::io::split`.** A `yamux::Stream`'s reads (window updates) and writes
+  park on one channel sender that keeps a single waker, so a reader polled from
+  another task overwrites a parked writer's waker and the writer never wakes.
+  This deadlocked every HTTP/2 upload over ~150 KiB. `vorp_protocol::split`
+  wakes both halves on any inner wake.
 - **Guard every map removal with `Arc::ptr_eq`.** Session and tunnel maps hold
   `Arc<T>`; remove an entry only when the stored `Arc` is still *the same
   allocation* you are tearing down. This is the Go `DeleteIfMatch` pattern, and it

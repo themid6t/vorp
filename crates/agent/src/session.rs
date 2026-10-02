@@ -148,9 +148,11 @@ async fn connect(
     tls_config.alpn_protocols = vec![AGENT_ALPN.to_vec()];
     let name = ServerName::try_from(config.relay_host.clone())
         .map_err(|err| AgentError::Connection(format!("invalid relay host: {err}")))?;
-    let tcp = TcpStream::connect(config.relay_addr)
-        .await
-        .map_err(|err| AgentError::Connection(format!("dial relay: {err}")))?;
+    let tcp = match config.relay_addr {
+        Some(addr) => TcpStream::connect(addr).await,
+        None => TcpStream::connect((config.relay_host.as_str(), 443)).await,
+    }
+    .map_err(|err| AgentError::Connection(format!("dial relay: {err}")))?;
     let tls = TlsConnector::from(Arc::new(tls_config))
         .connect(name, tcp)
         .await

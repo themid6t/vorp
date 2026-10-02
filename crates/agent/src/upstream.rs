@@ -92,7 +92,7 @@ where
     if is_websocket(&head) {
         return websocket(stream, upstream, head, cancel).await;
     }
-    let (reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = vorp_protocol::split(stream);
     let body_stream = stream::try_unfold(
         (reader, BodySequence::default()),
         |(mut reader, mut sequence)| async move {
@@ -554,7 +554,7 @@ mod tests {
     fn test_config(port: u16) -> AgentConfig {
         AgentConfig {
             relay_host: "localhost".into(),
-            relay_addr: "127.0.0.1:443".parse().expect("address"),
+            relay_addr: None,
             token: "not-used".into(),
             upstream: format!("http://127.0.0.1:{port}"),
             requested_subdomains: vec![None],
@@ -749,7 +749,7 @@ mod tests {
         });
         let config = AgentConfig {
             relay_host: "localhost".into(),
-            relay_addr: "127.0.0.1:443".parse().unwrap(),
+            relay_addr: None,
             token: "not-used".into(),
             upstream: format!("http://127.0.0.1:{}", address.port()),
             requested_subdomains: vec![None],
