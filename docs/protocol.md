@@ -313,7 +313,10 @@ agent                                             relay
   │<──────────────────────────────────── Pong ─────┤
 ```
 
-`machine_id` is `SHA-256(hostname + ":" + first_non_loopback_mac)`. It is
+`machine_id` is `SHA-256(hostname + ":" + first_non_loopback_mac + ":" + pid +
+":" + process_start_nanos)`, computed once per agent process. The process part
+lets several agents on one host and account coexist; reconnects reuse the
+value, so a process still displaces its own stale session. It is
 **client-supplied and not a credential** — two users on one host derive the same
 value, so the session slot key is `(user_id, machine_id)`, never `machine_id`
 alone. A reconnect displaces only that user's own previous session.

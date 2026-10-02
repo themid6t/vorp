@@ -15,4 +15,6 @@ pub enum AgentError {
     Authentication,
     #[error("relay protocol version is unsupported")]
     UnsupportedVersion,
+    #[error("relay closed every tunnel permanently (forced close or expiry)")]
+    TunnelsClosed,
 }
