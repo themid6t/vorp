@@ -395,6 +395,11 @@ each per tunnel. A per-peer token bucket allows 200 requests/second with a
 400-request burst. Excess connections close before HTTP dispatch; exhausted
 HTTP/WebSocket slots receive `503`, while rate-limited requests receive `429`.
 Authentication attempts are separately rate-limited before argon2id work.
+The connection and request-rate bounds are defaults for `--max-connections`,
+`--max-connections-per-ip`, and `--rate-limit-rps`. The per-IP connection cap
+counts agents and HTTP clients together, so a site behind one NAT shares it.
+Run the relay with an open-file limit above `--max-connections` (systemd
+defaults the soft limit to 1024): set `LimitNOFILE=65536` in its unit.
 
 ---
 

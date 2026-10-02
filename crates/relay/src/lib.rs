@@ -9,7 +9,7 @@ mod session;
 mod subdomain;
 mod tls;
 
-pub use config::{AcmeConfig, RelayConfig, TlsConfig};
+pub use config::{AcmeConfig, EdgeLimits, RelayConfig, TlsConfig};
 pub use vorp_web::SignupMode;
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +130,7 @@ pub async fn serve_until(
     } else {
         Some(vorp_store::Repository::open(&config.database_path).await?)
     };
+    let requests_per_second = config.limits.requests_per_second_per_ip;
     let relay = Relay {
         state: Arc::new(State {
             config,
@@ -137,7 +138,7 @@ pub async fn serve_until(
             registry: registry::Registry::default(),
             http_requests: Arc::new(Semaphore::new(256)),
             websockets: Arc::new(Semaphore::new(128)),
-            request_rates: limits::RequestRateLimiter::new(),
+            request_rates: limits::RequestRateLimiter::new(requests_per_second),
             shutdown,
             web_router: OnceLock::new(),
         }),
@@ -166,6 +167,7 @@ mod tests {
             },
             signup_mode: SignupMode::Closed,
             dev_token: Some("test-token".into()),
+            limits: EdgeLimits::default(),
         };
         assert!(dev_token_mode_allowed(&config));
         config.listen = "0.0.0.0:8443".parse().expect("public socket");
