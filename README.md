@@ -66,9 +66,10 @@ upstreams with their own authentication.
 
 ## CI and staging
 
-Pull requests run formatting, Clippy, all-feature tests, and `cargo deny`.
-After the same checks pass on `main`, GitHub Actions builds a static Linux
-amd64 binary and deploys it to staging at
+Pull requests with non-Markdown changes run formatting, Clippy, all-feature
+tests, and `cargo deny`. Markdown-only changes keep a lightweight green check
+and skip the Rust gates and deployment. After the checks pass on `main`,
+GitHub Actions builds a static Linux amd64 binary and deploys it to staging at
 `https://vorp-staging.themidst.xyz/`. The deployment checks the binary hash,
 restarts the service, verifies `/healthz`, and restores the previous binary
 if it fails. The [release plan](docs/releases.md) records the agreed single

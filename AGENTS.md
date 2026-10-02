@@ -275,7 +275,9 @@ replacing what it defends.
 
 ## Tooling and CI gates
 
-All four must pass; CI enforces them and a red gate is not merged:
+All four must pass for changes beyond Markdown; CI enforces them and a red gate
+is not merged. Markdown-only changes keep a successful lightweight check and
+skip the Rust gates and staging deployment:
 
 ```sh
 cargo fmt --all --check
@@ -295,9 +297,10 @@ cargo deny check          # or, at minimum, cargo audit
 
 ## Release and certificate operations
 
-- Use one long-lived `main` branch. Pull requests run the four CI gates; a
-  passing push to `main` builds and deploys to staging automatically. The
-  current pipeline is documented in `docs/releases.md`.
+- Use one long-lived `main` branch. Pull requests with non-Markdown changes run
+  the four CI gates; a passing push to `main` with such changes builds and
+  deploys to staging automatically. The current pipeline is documented in
+  `docs/releases.md`.
 - Production deployment on an annotated version tag is the agreed release
   design, **not yet configured**. When it is implemented, promote the exact
   artifact that passed staging for the same commit; do not rebuild on the tag.
