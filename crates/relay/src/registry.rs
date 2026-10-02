@@ -14,8 +14,6 @@ use yamux::Stream;
 use crate::subdomain::SlugError;
 
 pub(crate) type SessionKey = (i64, String);
-pub(crate) const DEFAULT_TUNNEL_REQUEST_LIMIT: usize = 128;
-pub(crate) const DEFAULT_TUNNEL_WEBSOCKET_LIMIT: usize = 128;
 
 pub(crate) struct Session {
     pub id: String,
@@ -37,6 +35,43 @@ pub(crate) struct Tunnel {
     pub websocket_active: std::sync::atomic::AtomicUsize,
     pub upstream_hint: Option<String>,
     pub cancel: CancellationToken,
+}
+
+/// Per-tunnel concurrency caps, populated from the relay's edge limits so a
+/// future per-user policy can set them per tunnel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TunnelLimits {
+    pub requests: usize,
+    pub websockets: usize,
+}
+
+impl From<&crate::EdgeLimits> for TunnelLimits {
+    fn from(limits: &crate::EdgeLimits) -> Self {
+        Self {
+            requests: limits.tunnel_requests,
+            websockets: limits.tunnel_websockets,
+        }
+    }
+}
+
+impl Tunnel {
+    pub(crate) fn new(
+        session: Arc<Session>,
+        subdomain: String,
+        upstream_hint: Option<String>,
+        limits: TunnelLimits,
+    ) -> Self {
+        Self {
+            session,
+            subdomain,
+            concurrency_limit: limits.requests,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            websocket_limit: limits.websockets,
+            websocket_active: std::sync::atomic::AtomicUsize::new(0),
+            upstream_hint,
+            cancel: CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -82,6 +117,7 @@ impl Registry {
         &self,
         session: Arc<Session>,
         upstream_hint: Option<String>,
+        limits: TunnelLimits,
         mut generate: impl FnMut() -> Result<String, SlugError>,
     ) -> Result<Arc<Tunnel>, SlugError> {
         let mut map = self
@@ -94,16 +130,7 @@ impl Registry {
             }
             let slug = generate()?;
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(slug.clone()) {
-                let tunnel = Arc::new(Tunnel {
-                    session,
-                    subdomain: slug,
-                    concurrency_limit: DEFAULT_TUNNEL_REQUEST_LIMIT,
-                    active: std::sync::atomic::AtomicUsize::new(0),
-                    websocket_limit: DEFAULT_TUNNEL_WEBSOCKET_LIMIT,
-                    websocket_active: std::sync::atomic::AtomicUsize::new(0),
-                    upstream_hint,
-                    cancel: CancellationToken::new(),
-                });
+                let tunnel = Arc::new(Tunnel::new(session, slug, upstream_hint, limits));
                 slot.insert(Arc::clone(&tunnel));
                 return Ok(tunnel);
             }
@@ -289,6 +316,11 @@ impl Drop for WebSocketPermit {
 mod tests {
     use super::*;
 
+    const ONE: TunnelLimits = TunnelLimits {
+        requests: 1,
+        websockets: 1,
+    };
+
     fn session(id: &str) -> Arc<Session> {
         let (open, _) = mpsc::channel(1);
         Arc::new(Session {
@@ -328,18 +360,7 @@ mod tests {
         let registry = Registry::default();
         let old_session = session("old");
         let new_session = session("new");
-        let make = |s: Arc<Session>| {
-            Arc::new(Tunnel {
-                session: s,
-                subdomain: "app".into(),
-                concurrency_limit: 1,
-                active: std::sync::atomic::AtomicUsize::new(0),
-                websocket_limit: 1,
-                websocket_active: std::sync::atomic::AtomicUsize::new(0),
-                upstream_hint: None,
-                cancel: CancellationToken::new(),
-            })
-        };
+        let make = |s: Arc<Session>| Arc::new(Tunnel::new(s, "app".into(), None, ONE));
         let old = make(Arc::clone(&old_session));
         let new = make(Arc::clone(&new_session));
         registry.insert_named_tunnel(Arc::clone(&old));
@@ -363,11 +384,11 @@ mod tests {
         let registry = Registry::default();
         let first = session("first");
         registry
-            .allocate_tunnel(Arc::clone(&first), None, || Ok("collision".into()))
+            .allocate_tunnel(Arc::clone(&first), None, ONE, || Ok("collision".into()))
             .unwrap();
         let mut attempts = 0;
         let second = registry
-            .allocate_tunnel(session("second"), None, || {
+            .allocate_tunnel(session("second"), None, ONE, || {
                 attempts += 1;
                 Ok(if attempts == 1 { "collision" } else { "fresh" }.into())
             })
@@ -375,11 +396,11 @@ mod tests {
         assert_eq!(second.subdomain, "fresh");
         assert_eq!(attempts, 2);
         assert!(matches!(
-            registry.allocate_tunnel(session("third"), None, || Ok("collision".into())),
+            registry.allocate_tunnel(session("third"), None, ONE, || Ok("collision".into())),
             Err(SlugError::Collisions)
         ));
         assert!(matches!(
-            registry.allocate_tunnel(session("fourth"), None, || Err(SlugError::Random(
+            registry.allocate_tunnel(session("fourth"), None, ONE, || Err(SlugError::Random(
                 getrandom::Error::UNSUPPORTED
             ))),
             Err(SlugError::Random(_))
@@ -424,7 +445,7 @@ mod tests {
     fn websocket_and_http_limits_are_independent() {
         let registry = Registry::default();
         let tunnel = registry
-            .allocate_tunnel(session("a"), None, || Ok("slug".into()))
+            .allocate_tunnel(session("a"), None, ONE, || Ok("slug".into()))
             .unwrap();
         let http = tunnel.try_acquire().unwrap();
         let websocket = tunnel.try_acquire_websocket().unwrap();

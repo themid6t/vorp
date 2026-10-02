@@ -23,7 +23,11 @@ use vorp_protocol::{
     MAX_FRAME_PAYLOAD, Message, RequestHead, ResponseHead, read_message, write_message,
 };
 
-use crate::{Relay, State, httpnorm, registry::TunnelPermit, server::status};
+use crate::{
+    Relay, State, httpnorm,
+    registry::TunnelPermit,
+    server::{overloaded, status},
+};
 
 type RelayStream = tokio_util::compat::Compat<yamux::Stream>;
 type BodySender = mpsc::Sender<Result<Bytes, io::Error>>;
@@ -43,6 +47,12 @@ impl WebSocketBudget {
         drop(self.global_request);
         Some((global, tunnel))
     }
+}
+
+/// Request slots held until the response body finishes streaming.
+struct RequestPermits {
+    _tunnel: TunnelPermit,
+    _global: OwnedSemaphorePermit,
 }
 
 struct TrafficMeta {
@@ -78,13 +88,13 @@ impl Relay {
         host: &str,
     ) -> Response<Body> {
         let Some(tunnel) = self.state.registry.tunnel(subdomain) else {
-            return status(StatusCode::BAD_GATEWAY);
+            return status(StatusCode::NOT_FOUND);
         };
         let Ok(global_permit) = Arc::clone(&self.state.http_requests).try_acquire_owned() else {
-            return status(StatusCode::SERVICE_UNAVAILABLE);
+            return overloaded(StatusCode::SERVICE_UNAVAILABLE);
         };
         let Some(permit) = tunnel.try_acquire() else {
-            return status(StatusCode::SERVICE_UNAVAILABLE);
+            return overloaded(StatusCode::SERVICE_UNAVAILABLE);
         };
         let content_length = match httpnorm::validate_framing(request.headers()) {
             Ok(value) => value,
@@ -150,6 +160,7 @@ impl Relay {
                 },
                 tunnel.session.cancel.clone(),
                 traffic,
+                self.state.config.limits.response_timeout,
             )
             .await;
         }
@@ -157,10 +168,13 @@ impl Relay {
             request.into_body(),
             stream,
             head,
-            permit,
-            global_permit,
+            RequestPermits {
+                _tunnel: permit,
+                _global: global_permit,
+            },
             tunnel.session.cancel.clone(),
             traffic,
+            self.state.config.limits.response_timeout,
         )
         .await
     }
@@ -170,10 +184,10 @@ async fn streaming_exchange(
     body: Incoming,
     mut stream: RelayStream,
     head: RequestHead,
-    permit: TunnelPermit,
-    global_permit: OwnedSemaphorePermit,
+    permits: RequestPermits,
     cancel: CancellationToken,
     traffic: TrafficMeta,
+    response_timeout: Duration,
 ) -> Response<Body> {
     if write_message(&mut stream, &Message::RequestHead(head))
         .await
@@ -193,9 +207,7 @@ async fn streaming_exchange(
             tracing::warn!(error = %error, "request body forwarding failed");
         }
     });
-    let head = match wait_response_head(&mut reader, progress_rx, &cancel, Duration::from_secs(30))
-        .await
-    {
+    let head = match wait_response_head(&mut reader, progress_rx, &cancel, response_timeout).await {
         Ok(Message::ResponseHead(head)) => head,
         Err(HeadWaitError::Timeout) => {
             upload.abort();
@@ -221,8 +233,7 @@ async fn streaming_exchange(
         let bytes_out = pump_response(reader, sender, cancel).await;
         upload.abort();
         traffic.record(head.status, bytes_in.load(Ordering::Acquire), bytes_out);
-        drop(permit);
-        drop(global_permit);
+        drop(permits);
     });
     response
 }
@@ -268,6 +279,7 @@ async fn websocket_exchange(
     budget: WebSocketBudget,
     cancel: CancellationToken,
     traffic: TrafficMeta,
+    response_timeout: Duration,
 ) -> Response<Body> {
     if write_message(&mut stream, &Message::RequestHead(head))
         .await
@@ -277,7 +289,7 @@ async fn websocket_exchange(
         return status(StatusCode::BAD_GATEWAY);
     }
     let response_head =
-        match tokio::time::timeout(Duration::from_secs(30), read_message(&mut stream)).await {
+        match tokio::time::timeout(response_timeout, read_message(&mut stream)).await {
             Ok(Ok(Message::ResponseHead(head))) => head,
             Err(_) => return status(StatusCode::GATEWAY_TIMEOUT),
             _ => return status(StatusCode::BAD_GATEWAY),
@@ -296,7 +308,7 @@ async fn websocket_exchange(
         return response;
     }
     let Some((websocket_permit, tunnel_websocket_permit)) = budget.upgrade() else {
-        return status(StatusCode::SERVICE_UNAVAILABLE);
+        return overloaded(StatusCode::SERVICE_UNAVAILABLE);
     };
     let upgraded = hyper::upgrade::on(&mut request);
     let mut response = match build_response(&response_head, true) {

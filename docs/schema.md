@@ -12,7 +12,7 @@ and columns below are the contract; migration SQL is owned by the store crate.
 | Table | Columns and constraints |
 |---|---|
 | `users` | `id INTEGER PRIMARY KEY`, `email TEXT NOT NULL UNIQUE COLLATE NOCASE`, `password_hash TEXT NOT NULL` (argon2id PHC string), `is_admin INTEGER NOT NULL CHECK (is_admin IN (0,1))`, `assigned_subdomain TEXT UNIQUE` (nullable until first assignment), `created_at_ms INTEGER NOT NULL` |
-| `sessions` | `id TEXT PRIMARY KEY` (opaque CSPRNG value), `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `expires_at_ms INTEGER NOT NULL`; index on `user_id` and expiry |
+| `sessions` | `id TEXT PRIMARY KEY` (lowercase hex SHA-256 of the opaque CSPRNG cookie value; the raw value is never stored), `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `expires_at_ms INTEGER NOT NULL`; index on `user_id` and expiry |
 | `agent_tokens` | `id INTEGER PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash)=32)`, `bind_policy TEXT NOT NULL CHECK (bind_policy IN ('any','temporary','reserved'))`, `created_at_ms INTEGER NOT NULL`, `revoked_at_ms INTEGER`; index on `user_id` |
 | `token_allowlist` | `token_id INTEGER NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `PRIMARY KEY (token_id,name)` |
 | `reserved_subdomains` | `name TEXT PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at_ms INTEGER NOT NULL`; index on `user_id` |

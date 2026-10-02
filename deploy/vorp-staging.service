@@ -1,0 +1,29 @@
+# Installed as /etc/systemd/system/vorp.service on the staging host.
+# CI replaces only /opt/vorp/vorp; change this file and reinstall it by hand
+# (see docs/releases.md) when relay flags or limits change.
+[Unit]
+Description=Vorp staging reverse tunnel relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vorp
+Group=vorp
+WorkingDirectory=/var/lib/vorp
+ExecStart=/opt/vorp/vorp serve --base-domain vorp-staging.themidst.xyz --dashboard-host vorp-staging.themidst.xyz --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem --database-path /var/lib/vorp/vorp.sqlite3
+Restart=on-failure
+# Restarting faster than reconnecting agents spread out (0-5s) re-forms the herd.
+RestartSec=5s
+# Above --max-connections (default 1024); systemd's soft default is 1024.
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vorp
+
+[Install]
+WantedBy=multi-user.target

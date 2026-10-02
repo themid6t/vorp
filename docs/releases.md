@@ -42,6 +42,14 @@ rule. The server verifies the checksum, replaces `/opt/vorp/vorp`, restarts
 the previous binary and restarts the service. The SQLite database and TLS
 files are outside this release path.
 
+The systemd unit is versioned as [`deploy/vorp-staging.service`](../deploy/vorp-staging.service)
+but is not deployed by CI. After changing it, install it on the host:
+
+```sh
+sudo install -m 0644 deploy/vorp-staging.service /etc/systemd/system/vorp.service
+sudo systemctl daemon-reload && sudo systemctl restart vorp
+```
+
 Repository configuration:
 
 - `STAGING_SSH_KEY` (secret): private key for the dedicated deploy account.

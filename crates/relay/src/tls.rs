@@ -117,11 +117,15 @@ fn configure(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Arc<rustls::ServerConfig>, RelayError> {
-    let mut server =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|error| RelayError::Tls(format!("configure TLS certificate: {error}")))?;
+    // TLS 1.2 stays enabled for public tunnel visitors on older clients (Java 8,
+    // older Android WebViews, corporate proxies); the agent negotiates 1.3.
+    let mut server = rustls::ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+        &rustls::version::TLS12,
+    ])
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|error| RelayError::Tls(format!("configure TLS certificate: {error}")))?;
     server.alpn_protocols = vec![
         vorp_protocol::AGENT_ALPN.to_vec(),
         b"h2".to_vec(),

@@ -33,8 +33,8 @@ ALPN protocol:
 
 There is no nginx and no SNI preread. The agent connects to the same `:443` as a
 browser does; ALPN is what separates them.
-The relay currently requires TLS 1.3; support for older TLS clients is a
-separate compatibility decision.
+The relay accepts TLS 1.3 and 1.2 (rustls' AEAD-only 1.2 suites), so public
+tunnel visitors on older clients can connect; the agent negotiates 1.3.
 
 WebSocket upgrades use HTTP/1.1. The relay does not advertise HTTP/2 extended
 `CONNECT` support; an HTTP/2 request cannot request a WebSocket tunnel through
@@ -457,8 +457,11 @@ nothing sends** — the Go version carried three (`SESSION_NOT_FOUND`,
 
 `AUTH_FAILED` and `UNSUPPORTED_VERSION` are permanent: the agent reports and
 exits. Everything else is transient. Backoff applies only when establishing a
-*new* session fails (`1s → 2s → 4s → 8s → 16s → 30s → 60s`); a live session that
-drops reconnects immediately with no delay, because the link was just working.
+*new* session fails (`1s → 2s → 4s → 8s → 16s → 30s → 60s`, each randomized to
+between half and the full step); a live session that drops reconnects after a
+random 0–5s wait. The wait is short because the link was just working, and
+random so that every agent of a restarted relay does not redial at once — on a
+small host that herd re-exhausted memory and crashed the relay in a loop.
 Forced or expired tunnel closures remain suppressed across reconnects; if all
 configured tunnels are suppressed, the agent exits instead of repeatedly
 reclaiming a displaced machine slot with no usable tunnel.

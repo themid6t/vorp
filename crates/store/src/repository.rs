@@ -121,6 +121,16 @@ fn map_db(e: rusqlite::Error) -> RepositoryError {
         _ => RepositoryError::Database(e.to_string()),
     }
 }
+/// Sessions are stored by SHA-256 of the cookie value, so a copy of the
+/// database cannot be replayed as live logins. The id is 256 random bits, so
+/// an unsalted fast hash suffices, as for agent tokens.
+fn session_key(id: &str) -> String {
+    Sha256::digest(id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn now_ms() -> Result<i64, RepositoryError> {
     i64::try_from(
         SystemTime::now()
@@ -396,10 +406,11 @@ impl Repository {
         .await
     }
     pub async fn create_session(&self, s: NewSession) -> Result<(), RepositoryError> {
+        let key = session_key(&s.id);
         self.run(move |c| {
             c.execute(
                 "INSERT INTO sessions(id,user_id,expires_at_ms) VALUES(?,?,?)",
-                params![s.id, s.user_id, s.expires_at_ms],
+                params![key, s.user_id, s.expires_at_ms],
             )
             .map_err(map_db)?;
             Ok(())
@@ -407,16 +418,16 @@ impl Repository {
         .await
     }
     pub async fn session_by_id(&self, id: &str) -> Result<Option<Session>, RepositoryError> {
-        let id = id.to_owned();
+        let (id, key) = (id.to_owned(), session_key(id));
         self.run(move |c| {
             c.query_row(
-                "SELECT id,user_id,expires_at_ms FROM sessions WHERE id=? AND expires_at_ms>?",
-                params![id, now_ms()?],
+                "SELECT user_id,expires_at_ms FROM sessions WHERE id=? AND expires_at_ms>?",
+                params![key, now_ms()?],
                 |r| {
                     Ok(Session {
-                        id: r.get(0)?,
-                        user_id: r.get(1)?,
-                        expires_at_ms: r.get(2)?,
+                        id,
+                        user_id: r.get(0)?,
+                        expires_at_ms: r.get(1)?,
                     })
                 },
             )
@@ -426,9 +437,9 @@ impl Repository {
         .await
     }
     pub async fn delete_session(&self, id: &str) -> Result<(), RepositoryError> {
-        let id = id.to_owned();
+        let key = session_key(id);
         self.run(move |c| {
-            c.execute("DELETE FROM sessions WHERE id=?", [id])
+            c.execute("DELETE FROM sessions WHERE id=?", [key])
                 .map_err(map_db)?;
             Ok(())
         })
@@ -715,6 +726,39 @@ mod tests {
         .expect("session");
         r.update_password(a.id, "new").await.expect("password");
         assert!(r.session_by_id("s").await.expect("lookup").is_none());
+    }
+    #[tokio::test]
+    async fn sessions_are_stored_hashed_and_resolve_from_the_cookie_value() {
+        let r = repo().await;
+        let a = user(&r, "a@x.test").await;
+        r.create_session(NewSession {
+            id: "cookie-value".into(),
+            user_id: a.id,
+            expires_at_ms: i64::MAX,
+        })
+        .await
+        .expect("session");
+        let stored: String = r
+            .run(|c| {
+                c.query_row("SELECT id FROM sessions", [], |row| row.get(0))
+                    .map_err(map_db)
+            })
+            .await
+            .expect("stored id");
+        assert_ne!(stored, "cookie-value");
+        assert!(r.session_by_id(&stored).await.expect("lookup").is_none());
+        let found = r.session_by_id("cookie-value").await.expect("lookup");
+        assert_eq!(
+            found.map(|s| (s.id, s.user_id)),
+            Some(("cookie-value".into(), a.id))
+        );
+        r.delete_session("cookie-value").await.expect("logout");
+        assert!(
+            r.session_by_id("cookie-value")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
     }
     #[tokio::test]
     async fn minted_token_authenticates_only_until_revocation() {

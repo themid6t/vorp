@@ -159,7 +159,7 @@ impl Relay {
 
     async fn handle_http(&self, request: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         if !self.state.request_rates.allow(peer.ip()) {
-            return status(StatusCode::TOO_MANY_REQUESTS);
+            return overloaded(StatusCode::TOO_MANY_REQUESTS);
         }
         let requested_host = request
             .uri()
@@ -219,6 +219,18 @@ pub(crate) fn status(status: StatusCode) -> Response<Body> {
         .status(status)
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// A capacity rejection (`429`/`503`) telling clients to back off for a second
+/// instead of retrying immediately, which under overload starved successful
+/// requests of the slots the retries kept churning.
+pub(crate) fn overloaded(code: StatusCode) -> Response<Body> {
+    let mut response = status(code);
+    response.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 #[cfg(test)]

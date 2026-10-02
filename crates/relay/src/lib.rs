@@ -130,15 +130,15 @@ pub async fn serve_until(
     } else {
         Some(vorp_store::Repository::open(&config.database_path).await?)
     };
-    let requests_per_second = config.limits.requests_per_second_per_ip;
+    let limits = config.limits;
     let relay = Relay {
         state: Arc::new(State {
             config,
             repository,
             registry: registry::Registry::default(),
-            http_requests: Arc::new(Semaphore::new(256)),
-            websockets: Arc::new(Semaphore::new(128)),
-            request_rates: limits::RequestRateLimiter::new(requests_per_second),
+            http_requests: Arc::new(Semaphore::new(limits.max_requests)),
+            websockets: Arc::new(Semaphore::new(limits.max_websockets)),
+            request_rates: limits::RequestRateLimiter::new(limits.requests_per_second_per_ip),
             shutdown,
             web_router: OnceLock::new(),
         }),

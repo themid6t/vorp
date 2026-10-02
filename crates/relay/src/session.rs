@@ -21,7 +21,7 @@ use yamux::{Connection, Mode, Stream};
 use crate::{
     Relay,
     authz::{self, BindContext},
-    registry::{DEFAULT_TUNNEL_REQUEST_LIMIT, DEFAULT_TUNNEL_WEBSOCKET_LIMIT, Session, Tunnel},
+    registry::{Session, Tunnel, TunnelLimits},
     subdomain,
 };
 
@@ -235,6 +235,19 @@ impl Relay {
         }))
     }
 
+    /// Why a tunnel ends with its session. A relay shutdown (a deploy or
+    /// restart) is recoverable: reporting the session's default `Forced` made
+    /// every agent treat a routine restart as permanent and exit.
+    fn session_close_reason(&self, session: &Session) -> CloseReason {
+        if self.state.shutdown.is_cancelled() {
+            return CloseReason::Recoverable;
+        }
+        *session
+            .close_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn handle_tunnel(&self, session: Arc<Session>, stream: Stream) {
         let mut stream = stream.compat();
         let result = self.register_tunnel(&session, &mut stream).await;
@@ -269,7 +282,7 @@ impl Relay {
         tracing::info!(subdomain = %tunnel.subdomain, user_id = session.user_id, "tunnel registered");
         tokio::select! {
             _ = session.cancel.cancelled() => {
-                let reason = *session.close_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let reason = self.session_close_reason(&session);
                 let _ = tokio::time::timeout(Duration::from_secs(2), write_message(&mut stream, &Message::TunnelClose {
                     subdomain: tunnel.subdomain.clone(), reason,
                 })).await;
@@ -277,7 +290,7 @@ impl Relay {
             _ = tunnel.cancel.cancelled() => {
                 // The dashboard has already detached this tunnel from routing.
                 let reason = if session.cancel.is_cancelled() {
-                    *session.close_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    self.session_close_reason(&session)
                 } else {
                     CloseReason::Forced
                 };
@@ -378,19 +391,20 @@ impl Relay {
             return self
                 .state
                 .registry
-                .allocate_tunnel(Arc::clone(session), upstream_hint, subdomain::generate_slug)
+                .allocate_tunnel(
+                    Arc::clone(session),
+                    upstream_hint,
+                    TunnelLimits::from(&self.state.config.limits),
+                    subdomain::generate_slug,
+                )
                 .map_err(|error| (ErrorCode::StreamError, error.to_string()));
         }
-        let tunnel = Arc::new(Tunnel {
-            session: Arc::clone(session),
-            subdomain: requested.into(),
-            concurrency_limit: DEFAULT_TUNNEL_REQUEST_LIMIT,
-            active: std::sync::atomic::AtomicUsize::new(0),
-            websocket_limit: DEFAULT_TUNNEL_WEBSOCKET_LIMIT,
-            websocket_active: std::sync::atomic::AtomicUsize::new(0),
+        let tunnel = Arc::new(Tunnel::new(
+            Arc::clone(session),
+            requested.into(),
             upstream_hint,
-            cancel: CancellationToken::new(),
-        });
+            TunnelLimits::from(&self.state.config.limits),
+        ));
         if self.state.registry.insert_named_tunnel(Arc::clone(&tunnel)) {
             Ok(tunnel)
         } else {
@@ -672,6 +686,20 @@ mod tests {
             .unwrap();
         assert!(matches!(ack, Message::TunnelAck { .. }));
         shutdown.cancel();
+        let close = tokio::time::timeout(Duration::from_secs(2), read_message(&mut tunnel))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                close,
+                Message::TunnelClose {
+                    reason: CloseReason::Recoverable,
+                    ..
+                }
+            ),
+            "a relay shutdown must not tell agents to give up: {close:?}"
+        );
         tokio::time::timeout(Duration::from_secs(7), server)
             .await
             .unwrap()

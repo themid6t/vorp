@@ -37,6 +37,10 @@ const SESSION_BACKOFF: [Duration; 7] = [
     Duration::from_secs(30),
     Duration::from_secs(60),
 ];
+/// Upper bound of the random wait before redialing after a live session ends.
+/// Without it every agent of a restarted relay redials at once, and on a small
+/// host that herd re-exhausted memory and crashed the relay in a loop.
+const RECONNECT_SPREAD: Duration = Duration::from_secs(5);
 const TUNNEL_BACKOFF: [Duration; 5] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
@@ -89,6 +93,9 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
             }
             Ok(()) => {
                 failed_attempts = 0;
+                if !sleep_or_shutdown(random_up_to(RECONNECT_SPREAD), &shutdown).await {
+                    return Ok(());
+                }
             }
             Err(AgentError::Authentication) => return Err(AgentError::Authentication),
             Err(AgentError::UnsupportedVersion) => return Err(AgentError::UnsupportedVersion),
@@ -97,16 +104,39 @@ pub async fn run_until(config: AgentConfig, shutdown: CancellationToken) -> Resu
                     return Err(AgentError::TunnelsClosed);
                 }
                 tracing::warn!(error = %err, "agent session disconnected");
-                if was_connected {
+                let delay = if was_connected {
                     failed_attempts = 0;
-                    continue;
+                    random_up_to(RECONNECT_SPREAD)
+                } else {
+                    let base = SESSION_BACKOFF[failed_attempts.min(SESSION_BACKOFF.len() - 1)];
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    base / 2 + random_up_to(base / 2)
+                };
+                if !sleep_or_shutdown(delay, &shutdown).await {
+                    return Ok(());
                 }
-                let delay = SESSION_BACKOFF[failed_attempts.min(SESSION_BACKOFF.len() - 1)];
-                failed_attempts = failed_attempts.saturating_add(1);
-                tokio::select! { _ = shutdown.cancelled() => return Ok(()), _ = time::sleep(delay) => {} }
             }
         }
     }
+}
+
+/// Returns false when shutdown arrived first.
+async fn sleep_or_shutdown(delay: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = time::sleep(delay) => true,
+    }
+}
+
+/// Uniform in `[0, max]`. Spreading reconnects needs no CSPRNG; std's
+/// per-instance random hasher keys are enough.
+fn random_up_to(max: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let sample = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let nanos = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    Duration::from_nanos(sample % nanos.saturating_add(1))
 }
 
 fn all_tunnels_suppressed(suppressed: &Mutex<HashSet<usize>>, total: usize) -> bool {
@@ -521,6 +551,23 @@ async fn tunnel_lifecycle(
         let delay = TUNNEL_BACKOFF[retry.min(TUNNEL_BACKOFF.len() - 1)];
         retry = retry.saturating_add(1);
         tokio::select! { _ = cancel.cancelled() => return Ok(()), _ = time::sleep(delay) => {} }
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::*;
+
+    #[test]
+    fn random_up_to_stays_in_range_and_varies() {
+        let max = Duration::from_secs(5);
+        let samples: HashSet<Duration> = (0..64).map(|_| random_up_to(max)).collect();
+        assert!(samples.iter().all(|d| *d <= max));
+        assert!(
+            samples.len() > 32,
+            "reconnect delays must be spread, not constant"
+        );
+        assert_eq!(random_up_to(Duration::ZERO), Duration::ZERO);
     }
 }
 
