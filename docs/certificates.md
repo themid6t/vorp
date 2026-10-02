@@ -108,6 +108,8 @@ compare the certificate serial numbers in `/etc/letsencrypt/live/<cert-name>/`
 and `/etc/vorp/fullchain.pem`, then make a new HTTPS connection. The
 [Certbot renewal guide](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)
 explains how renewal reuses the saved plugin settings and deploy hook.
+Certbot may add a random delay before a noninteractive dry run; wait for its
+final success or failure message.
 
 Staging currently uses Certbot 4.0.0 and an ECDSA certificate for
 `vorp-staging.themidst.xyz` and `*.vorp-staging.themidst.xyz`. The Cloudflare
