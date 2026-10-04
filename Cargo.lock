@@ -1996,6 +1996,8 @@ dependencies = [
  "tracing-subscriber",
  "vorp-agent",
  "vorp-relay",
+ "vorp-store",
+ "vorp-web",
 ]
 
 [[package]]

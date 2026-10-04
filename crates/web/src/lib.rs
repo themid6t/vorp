@@ -21,8 +21,10 @@ use std::{
 use vorp_store::{BindPolicy, NewSession, NewUser, Repository, RepositoryError, User};
 mod limits;
 mod quota;
+mod recovery;
 use limits::{AuthLimiter, LimitError, MAX_TRAFFIC_STREAMS, traffic_stream_permit};
 use quota::{LimitsBody, default_limits, list_users, set_default_limits, set_user_limits};
+pub use recovery::{ResetError, reset_password};
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
