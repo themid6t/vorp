@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::sse::{Event, Sse},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::stream::{self, Stream};
@@ -35,6 +35,8 @@ pub enum SignupMode {
 pub struct WebConfig {
     pub signup_mode: SignupMode,
     pub session_ttl_secs: u64,
+    /// Tunnel hostnames are `<subdomain>.<base_domain>`; the dashboard builds links from it.
+    pub base_domain: String,
 }
 
 /// Implement this with the relay's `disconnect_token`. A failed disconnect is surfaced to the
@@ -165,7 +167,10 @@ pub fn router_with_runtime(
     };
     Router::new()
         .route("/", get(index))
+        .route("/dashboard.js", get(script))
+        .route("/dashboard.css", get(stylesheet))
         .route("/healthz", get(health))
+        .route("/api/config", get(public_config))
         .route("/api/bootstrap", post(bootstrap))
         .route("/api/signup", post(signup))
         .route("/api/login", post(login))
@@ -261,8 +266,57 @@ async fn stream_traffic(
     );
     Ok(Sse::new(stream))
 }
-async fn index() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
+/// Scripts and styles load only from this origin, so injected markup cannot run inline code.
+const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+async fn index() -> Response {
+    asset("text/html; charset=utf-8", include_str!("dashboard.html"))
+}
+async fn script() -> Response {
+    asset(
+        "text/javascript; charset=utf-8",
+        include_str!("dashboard.js"),
+    )
+}
+async fn stylesheet() -> Response {
+    asset("text/css; charset=utf-8", include_str!("dashboard.css"))
+}
+#[derive(Serialize)]
+struct ConfigBody {
+    signup_mode: &'static str,
+    needs_bootstrap: bool,
+    base_domain: String,
+}
+/// Public: the login screen needs it before anyone has a session.
+async fn public_config(State(state): State<AppState>) -> Result<Json<ConfigBody>, ApiError> {
+    let users = state
+        .repository
+        .user_count()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ConfigBody {
+        signup_mode: match state.config.signup_mode {
+            SignupMode::Open => "open",
+            SignupMode::Invite => "invite",
+            SignupMode::Closed => "closed",
+        },
+        needs_bootstrap: users == 0,
+        base_domain: state.config.base_domain.clone(),
+    }))
 }
 async fn health() -> StatusCode {
     StatusCode::OK
@@ -761,6 +815,7 @@ mod tests {
         WebConfig {
             signup_mode: SignupMode::Open,
             session_ttl_secs: 3600,
+            base_domain: "vorp.test".into(),
         }
     }
     async fn repo() -> Repository {
@@ -1024,7 +1079,7 @@ mod tests {
             repository,
             WebConfig {
                 signup_mode: SignupMode::Invite,
-                session_ttl_secs: 3600,
+                ..config()
             },
         );
         let bootstrap = router
@@ -1238,6 +1293,62 @@ mod tests {
         ] {
             let (status, _) = json(&router, req(Method::PUT, path, body, Some(&admin))).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+        }
+    }
+    #[tokio::test]
+    async fn public_config_reports_bootstrap_until_first_user() {
+        let router = router(repo().await, config());
+        let get = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request")
+        };
+        let (status, body) = json(&router, get("/api/config")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"signup_mode":"open","needs_bootstrap":true,"base_domain":"vorp.test"})
+        );
+        account(&router, "alice@example.test").await;
+        let (_, body) = json(&router, get("/api/config")).await;
+        assert_eq!(body["needs_bootstrap"], false);
+    }
+    #[tokio::test]
+    async fn dashboard_assets_carry_csp() {
+        let router = router(repo().await, config());
+        for (path, content_type) in [
+            ("/", "text/html"),
+            ("/dashboard.js", "text/javascript"),
+            ("/dashboard.css", "text/css"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            assert!(
+                header(header::CONTENT_TYPE).starts_with(content_type),
+                "{path}"
+            );
+            assert!(
+                header(header::CONTENT_SECURITY_POLICY).contains("script-src 'self'"),
+                "{path}"
+            );
         }
     }
 }

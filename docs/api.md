@@ -4,8 +4,8 @@ The embedded dashboard is same-origin with this API; there is no CORS. All
 bodies are JSON. Authentication is the `vorp_session` cookie
 (`HttpOnly; Secure; SameSite=Lax`), set by bootstrap, signup and login.
 
-- Every `/api/*` route needs a session except `bootstrap`, `signup` and
-  `login`. Missing or expired sessions get `401`.
+- Every `/api/*` route needs a session except `config`, `bootstrap`,
+  `signup` and `login`. Missing or expired sessions get `401`.
 - Every mutating request (`POST`, `PUT`, `DELETE`) must send
   `X-Vorp-Csrf: 1`, or it is rejected with `403`.
 - Admin-only routes return `403` to a non-admin.
@@ -17,12 +17,18 @@ bodies are JSON. Authentication is the `vorp_session` cookie
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
+| GET | `/api/config` | — | `{signup_mode: "open"\|"invite"\|"closed", needs_bootstrap, base_domain}`; public, read-only |
 | POST | `/api/bootstrap` | `{email, password}` | `{ok}`; creates the first admin, once |
 | POST | `/api/signup` | `{email, password, invite_code?}` | `{ok}`; per `--signup` mode |
 | POST | `/api/login` | `{email, password}` | `{ok}` |
 | POST | `/api/logout` | — | `{ok}` |
 | GET | `/api/me` | — | `{id, email, is_admin, assigned_subdomain, limits}` |
 | POST | `/api/password` | `{old_password, new_password}` | `{ok}`; ends every session |
+
+`/api/config` lets the login screen choose between first-run setup, login and
+signup before anyone has a session. `needs_bootstrap` is true only while no
+user exists, which `POST /api/bootstrap` already reveals. Tunnels are served at
+`https://<subdomain>.<base_domain>`.
 
 `limits` in `/api/me` is the user's effective quota
 (`{max_tunnels, bandwidth_bytes_per_sec, max_concurrent_requests}`), or

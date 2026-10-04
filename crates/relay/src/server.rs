@@ -197,6 +197,7 @@ impl Relay {
             vorp_web::router_with_runtime(
                 repository.clone(),
                 vorp_web::WebConfig {
+                    base_domain: self.state.config.base_domain.clone(),
                     signup_mode: self.state.config.signup_mode,
                     session_ttl_secs: 86_400,
                 },

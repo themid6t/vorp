@@ -1,13 +1,189 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>vorp dashboard</title>
-<style>body{font:16px system-ui,sans-serif;max-width:760px;margin:3rem auto;padding:0 1rem;color:#17212b;background:#f7f9fb}section{background:white;border:1px solid #dce2e8;border-radius:12px;padding:1.25rem;margin:1rem 0}input,select,button{font:inherit;padding:.55rem;margin:.2rem}button{cursor:pointer;background:#2455d6;color:white;border:0;border-radius:6px}pre{overflow:auto;background:#eef2f7;padding:1rem;border-radius:6px}small{color:#596878}</style></head>
-<body><h1>vorp</h1><p>Self hosted tunnel dashboard. A tunnel URL is public to anyone who holds it; secure the application behind it.</p>
-<section><h2>Account</h2><input id="email" type="email" placeholder="Email" autocomplete="username"><input id="password" type="password" placeholder="Password" autocomplete="current-password"><input id="invite" placeholder="Invite code, if required"><div><button onclick="account('login')">Log in</button><button onclick="account('signup')">Sign up</button><button onclick="account('bootstrap')">First-run admin</button><button onclick="request('/api/logout',{method:'POST'})">Log out</button><button onclick="request('/api/invites',{method:'POST'})">Create invite (admin)</button></div><small>First-run admin works only before the first account exists. An invite code is shown once.</small></section>
-<section><h2>Agent tokens</h2><p>Copy a new token when it appears. It cannot be viewed again.</p><select id="policy"><option>any</option><option>temporary</option><option>reserved</option></select><input id="allowlist" placeholder="Reserved names, comma separated"><button onclick="mint()">Create token</button><button onclick="request('/api/tokens')">List tokens</button><p>Revoke token ID <input id="token-id" type="number"><button onclick="request('/api/tokens/'+document.getElementById('token-id').value+'/revoke',{method:'POST'})">Revoke</button></p></section>
-<section><h2>Reserved subdomains</h2><input id="reserve-name" placeholder="Name"><button onclick="request('/api/reservations',{method:'POST',body:JSON.stringify({name:document.getElementById('reserve-name').value})})">Reserve</button><button onclick="request('/api/reservations')">List</button></section>
-<section><h2>Result</h2><pre id="result">Log in to begin.</pre></section>
-<script>
-async function request(path,options={}){try{const response=await fetch(path,{...options,headers:{'content-type':'application/json','x-vorp-csrf':'1',...options.headers}});const data=await response.json();document.getElementById('result').textContent=JSON.stringify(data,null,2);if(!response.ok)throw new Error(data.error||response.status);return data}catch(error){document.getElementById('result').textContent=String(error);}}
-function account(action){return request('/api/'+action,{method:'POST',body:JSON.stringify({email:document.getElementById('email').value,password:document.getElementById('password').value,invite_code:document.getElementById('invite').value||undefined})})}
-function mint(){return request('/api/tokens',{method:'POST',body:JSON.stringify({bind_policy:document.getElementById('policy').value,allowlist:document.getElementById('allowlist').value.split(',').map(v=>v.trim()).filter(Boolean)})})}
-</script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vorp</title>
+<link rel="stylesheet" href="/dashboard.css">
+<script src="/dashboard.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <strong class="brand">vorp</strong>
+  <span class="spacer"></span>
+  <span id="whoami" class="muted" hidden></span>
+  <button id="logout" class="ghost" type="button" hidden>Log out</button>
+</header>
+<p class="warning" role="note"><strong>Tunnel URLs are public.</strong> Anyone who has the URL can reach the app behind it. A URL is not access control, so protect the app itself.</p>
+<div id="notice" role="alert" hidden><span id="notice-text"></span><button id="notice-close" class="ghost" type="button" aria-label="Dismiss">×</button></div>
+<noscript><p class="card">The dashboard needs JavaScript.</p></noscript>
+
+<main id="auth" hidden>
+  <form id="auth-form" class="card narrow">
+    <h1 id="auth-title">Log in</h1>
+    <p id="auth-help" class="muted"></p>
+    <label>Email <input name="email" type="email" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" minlength="12" required></label>
+    <label id="invite-field" hidden>Invite code <input name="invite_code" autocomplete="off"></label>
+    <button type="submit" id="auth-submit">Log in</button>
+    <p id="auth-switch"><button type="button" class="link" id="auth-toggle"></button></p>
+  </form>
+</main>
+
+<div id="app" hidden>
+  <nav id="tabs">
+    <a href="#overview">Overview</a>
+    <a href="#tunnels">Tunnels</a>
+    <a href="#tokens">Tokens</a>
+    <a href="#names">Reserved names</a>
+    <a href="#traffic">Traffic</a>
+    <a href="#account">Account</a>
+    <a href="#admin" data-admin hidden>Admin</a>
+  </nav>
+  <main>
+    <section data-view="overview" hidden>
+      <div class="card">
+        <h2>Your account</h2>
+        <dl class="facts">
+          <dt>Email</dt><dd id="ov-email"></dd>
+          <dt>Role</dt><dd id="ov-role"></dd>
+          <dt>Assigned subdomain</dt><dd id="ov-subdomain"></dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h2>Your quota</h2>
+        <div id="ov-quota"></div>
+        <ul class="muted small">
+          <li>Over the bandwidth limit, transfers slow down. Nothing is dropped.</li>
+          <li>Over the request limit, new requests wait up to 10 seconds, then visitors get a 503 with Retry-After.</li>
+          <li>Over the tunnel limit, the agent's new tunnel is refused with <code>TUNNEL_LIMIT</code>.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Start a tunnel</h2>
+        <ol>
+          <li>Create a token on the <a href="#tokens">Tokens</a> tab.</li>
+          <li>Run the agent next to the app you want to share:</li>
+        </ol>
+        <pre id="ov-command"></pre>
+        <p id="ov-command-note" class="muted small" hidden></p>
+      </div>
+    </section>
+
+    <section data-view="tunnels" hidden>
+      <div class="card">
+        <div class="row"><h2>Live tunnels</h2><span class="spacer"></span><button type="button" class="ghost" id="tunnels-refresh">Refresh</button></div>
+        <p id="tunnels-count"></p>
+        <div id="tunnels-list"></div>
+      </div>
+    </section>
+
+    <section data-view="tokens" hidden>
+      <div id="token-created" class="card highlight" hidden>
+        <h2>Copy your token now</h2>
+        <p><strong>This is the only time this token is shown.</strong> Neither you nor the relay can view it again. If you lose it, revoke it and create a new one.</p>
+        <div class="copyable"><input id="token-raw" readonly aria-label="New agent token"><button type="button" data-copy="token-raw">Copy</button></div>
+        <p>Run the agent with it:</p>
+        <div class="copyable"><pre id="token-command"></pre><button type="button" data-copy="token-command">Copy</button></div>
+        <p id="token-command-note" class="muted small" hidden></p>
+        <button type="button" id="token-done" class="ghost">I've saved it</button>
+      </div>
+      <form id="token-form" class="card">
+        <h2>Create an agent token</h2>
+        <fieldset>
+          <legend>The token may open</legend>
+          <label class="choice"><input type="radio" name="bind_policy" value="any" checked> <span><strong>Any</strong>: random names, your assigned subdomain, and any name you have reserved</span></label>
+          <label class="choice"><input type="radio" name="bind_policy" value="temporary"> <span><strong>Temporary</strong>: random names only</span></label>
+          <label class="choice"><input type="radio" name="bind_policy" value="reserved"> <span><strong>Reserved</strong>: only the reserved names you pick below</span></label>
+        </fieldset>
+        <fieldset id="token-allowlist" hidden>
+          <legend>Allowed reserved names</legend>
+          <div id="token-allowlist-options"></div>
+        </fieldset>
+        <button type="submit">Create token</button>
+      </form>
+      <div class="card">
+        <h2>Your tokens</h2>
+        <p class="muted small">Revoking a token also disconnects every agent using it.</p>
+        <div id="tokens-list"></div>
+      </div>
+    </section>
+
+    <section data-view="names" hidden>
+      <form id="name-form" class="card">
+        <h2>Reserve a subdomain</h2>
+        <p class="muted small">Only your tokens can open a name you have reserved. Your tunnels appear at <code id="name-example"></code>.</p>
+        <div class="row"><input name="name" aria-label="Subdomain" placeholder="my-app" autocomplete="off" required><button type="submit">Reserve</button></div>
+      </form>
+      <div class="card">
+        <h2>Your reserved names</h2>
+        <div id="names-list"></div>
+      </div>
+    </section>
+
+    <section data-view="traffic" hidden>
+      <div class="card">
+        <div class="row"><h2>Recent traffic</h2><span class="spacer"></span><span id="traffic-status" class="pill">Connecting</span><button type="button" class="ghost" id="traffic-reconnect" hidden>Reconnect</button></div>
+        <div id="traffic-list"></div>
+      </div>
+    </section>
+
+    <section data-view="account" hidden>
+      <form id="password-form" class="card narrow">
+        <h2>Change password</h2>
+        <p class="muted small">This logs you out everywhere, including this browser.</p>
+        <label>Current password <input name="old_password" type="password" autocomplete="current-password" required></label>
+        <label>New password <input name="new_password" type="password" autocomplete="new-password" minlength="12" required></label>
+        <label>Repeat new password <input name="repeat_password" type="password" autocomplete="new-password" minlength="12" required></label>
+        <button type="submit">Change password</button>
+      </form>
+    </section>
+
+    <section data-view="admin" hidden>
+      <form id="defaults-form" class="card">
+        <h2>Default quotas</h2>
+        <p class="muted small">These apply to every non-admin user who has no override. Changes reach live tunnels immediately. Lowering the tunnel limit does not close tunnels that are already open.</p>
+        <div class="grid3">
+          <label>Max tunnels <input name="max_tunnels" type="number" min="1" step="1" required></label>
+          <label>Bandwidth (MiB/s) <input name="bandwidth" type="number" min="0.001" step="any" required></label>
+          <label>Concurrent requests <input name="max_concurrent_requests" type="number" min="1" step="1" required></label>
+        </div>
+        <button type="submit">Save defaults</button>
+      </form>
+      <div class="card">
+        <h2>Users</h2>
+        <p class="muted small">Values marked <span class="tag">default</span> follow the default quotas. Admins are exempt from quotas.</p>
+        <div id="users-list"></div>
+      </div>
+      <form id="user-form" class="card narrow">
+        <h2>Create a user</h2>
+        <label>Email <input name="email" type="email" autocomplete="off" required></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+        <button type="submit">Create user</button>
+      </form>
+      <div class="card narrow">
+        <h2>Invite codes</h2>
+        <p id="invite-mode" class="muted small"></p>
+        <button type="button" id="invite-create">Create invite code</button>
+        <div id="invite-created" hidden>
+          <p><strong>This code is shown only once.</strong> Copy it now. It works for one signup.</p>
+          <div class="copyable"><input id="invite-code" readonly aria-label="Invite code"><button type="button" data-copy="invite-code">Copy</button></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="limits-dialog">
+  <form id="limits-form" method="dialog">
+    <h2>Quota for <span id="limits-email"></span></h2>
+    <p class="muted small">Tick "default" to follow the default quota. Saving replaces all three values.</p>
+    <div data-field="max_tunnels" class="override"><label>Max tunnels <input type="number" min="1" step="1"></label><label class="inline"><input type="checkbox"> default (<span></span>)</label></div>
+    <div data-field="bandwidth_bytes_per_sec" class="override"><label>Bandwidth (MiB/s) <input type="number" min="0.001" step="any"></label><label class="inline"><input type="checkbox"> default (<span></span>)</label></div>
+    <div data-field="max_concurrent_requests" class="override"><label>Concurrent requests <input type="number" min="1" step="1"></label><label class="inline"><input type="checkbox"> default (<span></span>)</label></div>
+    <p class="muted small">Changes reach live tunnels immediately. Lowering the tunnel limit does not close tunnels that are already open.</p>
+    <div class="row"><span class="spacer"></span><button type="button" class="ghost" id="limits-cancel">Cancel</button><button type="submit" id="limits-save">Save</button></div>
+  </form>
+</dialog>
+</body>
+</html>
