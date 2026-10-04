@@ -38,9 +38,10 @@ currently reads supplied files; its built-in ACME issuer remains planned.
 The relay listens on `0.0.0.0:443` by default. Open `https://example.com/`
 right away: on an empty database the dashboard asks you to **create the admin
 account**, which works exactly once. Until you do, anyone who reaches the URL
-could claim it. Signup defaults to `closed`, so the admin adds users or, with
-`--signup invite`, issues one-time invite codes; `--signup open` lets anyone
-register. Mint an agent token in the dashboard and copy it when shown; the raw
+could claim it. Signup defaults to `closed`, so the admin adds users, who must
+choose their own password at first login; `--signup open` lets anyone
+register. Users request reserved subdomains and an admin approves them, unless
+the admin allows a user to reserve directly. Mint an agent token in the dashboard and copy it when shown; the raw
 value cannot be retrieved later.
 
 If an account's password is lost, reset it on the relay host as the user that
@@ -51,7 +52,8 @@ sudo -u vorp vorp admin reset-password --email you@example.com \
   --database-path /var/lib/vorp/vorp.sqlite3
 ```
 
-It prints a new random password once and ends that account's sessions.
+It prints a new random password once and ends that account's sessions. The
+dashboard asks for a new password at the next login.
 
 Store the token locally by passing it on standard input, then start the agent:
 

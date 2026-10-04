@@ -94,7 +94,7 @@ migrations is how two agents corrupt each other's work.
   else.
 - `web`: argon2id registration/login, opaque server-side sessions
   (`HttpOnly; Secure; SameSite=Lax`), first-run bootstrap admin, admin-creates-user,
-  `signup: open | invite | closed`, token CRUD (raw value shown once), reserved
+  `signup: open | closed`, token CRUD (raw value shown once), reserved
   subdomain CRUD, tunnel list/force-close, per-user traffic feed, embedded assets.
 
 **Deliver the token and subdomain repository methods first**, ahead of the

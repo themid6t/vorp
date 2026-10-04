@@ -11,14 +11,19 @@ and columns below are the contract; migration SQL is owned by the store crate.
 
 | Table | Columns and constraints |
 |---|---|
-| `users` | `id INTEGER PRIMARY KEY`, `email TEXT NOT NULL UNIQUE COLLATE NOCASE`, `password_hash TEXT NOT NULL` (argon2id PHC string), `is_admin INTEGER NOT NULL CHECK (is_admin IN (0,1))`, `assigned_subdomain TEXT UNIQUE` (nullable until first assignment), `created_at_ms INTEGER NOT NULL` |
+| `users` | `id INTEGER PRIMARY KEY`, `email TEXT NOT NULL UNIQUE COLLATE NOCASE`, `password_hash TEXT NOT NULL` (argon2id PHC string), `is_admin INTEGER NOT NULL CHECK (is_admin IN (0,1))`, `assigned_subdomain TEXT UNIQUE` (nullable until first assignment), `created_at_ms INTEGER NOT NULL`, `must_change_password INTEGER NOT NULL DEFAULT 0 CHECK (IN (0,1))`, `can_reserve_directly INTEGER NOT NULL DEFAULT 0 CHECK (IN (0,1))` |
 | `sessions` | `id TEXT PRIMARY KEY` (lowercase hex SHA-256 of the opaque CSPRNG cookie value; the raw value is never stored), `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `expires_at_ms INTEGER NOT NULL`; index on `user_id` and expiry |
 | `agent_tokens` | `id INTEGER PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash)=32)`, `bind_policy TEXT NOT NULL CHECK (bind_policy IN ('any','temporary','reserved'))`, `created_at_ms INTEGER NOT NULL`, `revoked_at_ms INTEGER`; index on `user_id` |
 | `token_allowlist` | `token_id INTEGER NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `PRIMARY KEY (token_id,name)` |
 | `reserved_subdomains` | `name TEXT PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at_ms INTEGER NOT NULL`; index on `user_id` |
+| `reservation_requests` | `name TEXT PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at_ms INTEGER NOT NULL`; index on `user_id`; a name a user asked an admin for, held against other users until approved or rejected |
 | `settings` | `key TEXT PRIMARY KEY`, `value TEXT NOT NULL` for optional persisted deployment settings; signup mode currently comes from the relay CLI |
 | `user_limits` | `user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE`, nullable `max_tunnels`, `bandwidth_bytes_per_sec`, `max_concurrent_requests` (each `CHECK (>0)`); an admin's per-user quota overrides, where `NULL` inherits the default |
-| `signup_invites` | `id INTEGER PRIMARY KEY`, `created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `code_hash BLOB NOT NULL UNIQUE CHECK(length(code_hash)=32)`, `created_at_ms INTEGER NOT NULL`, `used_at_ms INTEGER`; one-time admin-created invite codes |
+
+Schema changes: `open` runs `CREATE TABLE IF NOT EXISTS`, which leaves an
+older table as it was, then adds any `users` column listed in
+`ADDED_USER_COLUMNS` that is missing. New columns therefore need a default.
+Invite codes were removed; `open` drops the old `signup_invites` table.
 
 Bind policy follows the legacy `decideBind` decision table: `any` permits
 temporary tunnels, the user's assigned name, and reserved names they own;
@@ -28,6 +33,12 @@ may have allowlist entries. The assigned name belongs to the user, not a token.
 It is generated from a CSPRNG, stored uniquely, and returned by
 `get_or_create_assigned_subdomain`. Reservation creation must check assigned
 name ownership so another user cannot reserve it.
+
+Who may take a name is the pure `names::name_conflict` decision: a name is held
+by a reservation, a pending request, or an assigned subdomain, and each
+conflict is a typed `NameConflict` (`RepositoryError::NameTaken`) whose message
+the API returns with `409`. Pending requests never reach `reservation_owner`,
+so the bind ACL only ever sees approved reservations.
 
 `agent_tokens.token_hash` contains SHA-256 of a high-entropy raw token. The raw
 token includes its public token ID as a prefix, is returned by the creation API
@@ -80,7 +91,8 @@ caller is an admin. Every value must be at least 1.
 
 `user_by_id`, `user_count`, and transactional `bootstrap_admin` support local
 account setup. `update_password` changes the hash and deletes all of that user's
-sessions in one transaction. `setting` and `set_setting` are available for
+sessions in one transaction; its `must_change` flag sets or clears
+`must_change_password`. `setting` and `set_setting` are available for
 persisted deployment options; bootstrap is determined by the users table and
 signup mode is set with `vorp serve --signup`.
 
@@ -91,11 +103,14 @@ token's hash in constant time, and rejects revoked tokens. `token_for_user`
 supports scoped revocation retries. All SQLite operations run on Tokio's
 blocking pool behind one serialized connection.
 
-`mint_invite(admin_user_id)` creates a one-time code after checking the caller
-is an admin in SQL. `create_user_with_invite` validates its SHA-256 hash in
-constant time and creates the user while marking the code used in a single
-immediate transaction. In `signup_mode=invite`, the signup API requires this
-code; `closed` disables self-registration.
+`request_subdomain` files a pending request; `reserve_subdomain` takes a free
+name at once and replaces the owner's own pending request.
+`approve_subdomain_request` re-checks the name and moves the request into
+`reserved_subdomains` in one immediate transaction; `reject_subdomain_request`
+and `cancel_subdomain_request` delete it. `reservation_requests` lists every
+pending request for the admin. `set_user_access(user_id, is_admin,
+can_reserve_directly)` refuses a change that would leave no admin.
+`signup_mode=open` allows self-registration; `closed` disables it.
 
 Reservations must have 3–63 lowercase ASCII letters, digits, or hyphens, with
 an alphanumeric edge. `www`, `api`, `mail`, `smtp`, `ftp`, `admin`, `dash`,
