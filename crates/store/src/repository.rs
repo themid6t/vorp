@@ -8,7 +8,10 @@ use std::{
 use subtle::ConstantTimeEq;
 use vorp_protocol::valid_subdomain;
 
-use crate::{LimitOverrides, UserLimitEntry, UserLimits};
+use crate::{
+    LimitOverrides, UserLimitEntry, UserLimits,
+    names::{NameAction, NameConflict, NameHolders, name_conflict},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
@@ -20,6 +23,8 @@ pub enum RepositoryError {
     Conflict,
     #[error("invalid record: {0}")]
     Invalid(&'static str),
+    #[error("subdomain name unavailable: {}", .0.message())]
+    NameTaken(NameConflict),
     #[error("secure random generation failed")]
     Random,
 }
@@ -54,12 +59,18 @@ pub struct User {
     pub is_admin: bool,
     pub assigned_subdomain: Option<String>,
     pub created_at_ms: i64,
+    /// Set for accounts an admin created or a host reset; cleared when the
+    /// user picks their own password.
+    pub must_change_password: bool,
+    /// Reservations take effect at once instead of waiting for an admin.
+    pub can_reserve_directly: bool,
 }
 #[derive(Clone)]
 pub struct NewUser {
     pub email: String,
     pub password_hash: String,
     pub is_admin: bool,
+    pub must_change_password: bool,
 }
 #[derive(Clone)]
 pub struct Session {
@@ -94,6 +105,13 @@ pub struct ReservedSubdomain {
     pub name: String,
     pub user_id: i64,
 }
+#[derive(Debug, Clone)]
+pub struct ReservationRequest {
+    pub name: String,
+    pub user_id: i64,
+    pub email: String,
+    pub created_at_ms: i64,
+}
 
 /// A single SQLite connection is serialized behind a mutex; each operation runs on Tokio's
 /// blocking pool, so a busy transaction never holds an async executor worker.
@@ -102,7 +120,7 @@ pub struct Repository {
     db: Arc<Mutex<Connection>>,
 }
 const SCHEMA:&str = "
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE COLLATE NOCASE,password_hash TEXT NOT NULL,is_admin INTEGER NOT NULL CHECK(is_admin IN(0,1)),assigned_subdomain TEXT UNIQUE,created_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE COLLATE NOCASE,password_hash TEXT NOT NULL,is_admin INTEGER NOT NULL CHECK(is_admin IN(0,1)),assigned_subdomain TEXT UNIQUE,created_at_ms INTEGER NOT NULL,must_change_password INTEGER NOT NULL DEFAULT 0 CHECK(must_change_password IN(0,1)),can_reserve_directly INTEGER NOT NULL DEFAULT 0 CHECK(can_reserve_directly IN(0,1)));
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id); CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at_ms);
 CREATE TABLE IF NOT EXISTS agent_tokens(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,token_hash BLOB NOT NULL UNIQUE CHECK(length(token_hash)=32),bind_policy TEXT NOT NULL CHECK(bind_policy IN('any','temporary','reserved')),created_at_ms INTEGER NOT NULL,revoked_at_ms INTEGER);
@@ -110,9 +128,27 @@ CREATE INDEX IF NOT EXISTS tokens_user ON agent_tokens(user_id);
 CREATE TABLE IF NOT EXISTS token_allowlist(token_id INTEGER NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE,name TEXT NOT NULL,PRIMARY KEY(token_id,name));
 CREATE TABLE IF NOT EXISTS reserved_subdomains(name TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS reservations_user ON reserved_subdomains(user_id);
-CREATE TABLE IF NOT EXISTS signup_invites(id INTEGER PRIMARY KEY,created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,code_hash BLOB NOT NULL UNIQUE CHECK(length(code_hash)=32),created_at_ms INTEGER NOT NULL,used_at_ms INTEGER);
+CREATE TABLE IF NOT EXISTS reservation_requests(name TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at_ms INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS reservation_requests_user ON reservation_requests(user_id);
+DROP TABLE IF EXISTS signup_invites;
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS user_limits(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,max_tunnels INTEGER CHECK(max_tunnels>0),bandwidth_bytes_per_sec INTEGER CHECK(bandwidth_bytes_per_sec>0),max_concurrent_requests INTEGER CHECK(max_concurrent_requests>0));";
+
+/// `users` columns added after the first release, with their definitions.
+/// `CREATE TABLE IF NOT EXISTS` leaves an older table as it was, so `open`
+/// adds each missing column in place.
+const ADDED_USER_COLUMNS: [(&str, &str); 2] = [
+    (
+        "must_change_password",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(must_change_password IN(0,1))",
+    ),
+    (
+        "can_reserve_directly",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(can_reserve_directly IN(0,1))",
+    ),
+];
+/// Every `users` column, in the order `user_row` reads them.
+const USER_COLUMNS: &str = "id,email,password_hash,is_admin,assigned_subdomain,created_at_ms,must_change_password,can_reserve_directly";
 
 const LIMIT_KEYS: [&str; 3] = [
     "limits.max_tunnels",
@@ -157,7 +193,67 @@ fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         is_admin: r.get(3)?,
         assigned_subdomain: r.get(4)?,
         created_at_ms: r.get(5)?,
+        must_change_password: r.get(6)?,
+        can_reserve_directly: r.get(7)?,
     })
+}
+fn add_missing_user_columns(c: &Connection) -> Result<(), RepositoryError> {
+    let existing = {
+        let mut s = c
+            .prepare("SELECT name FROM pragma_table_info('users')")
+            .map_err(map_db)?;
+        s.query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db)?
+    };
+    for (name, definition) in ADDED_USER_COLUMNS {
+        if !existing.iter().any(|column| column == name) {
+            c.execute_batch(&format!("ALTER TABLE users ADD COLUMN {name} {definition}"))
+                .map_err(map_db)?;
+        }
+    }
+    Ok(())
+}
+fn name_holders_in(c: &Connection, name: &str) -> Result<NameHolders, RepositoryError> {
+    let owner = |sql: &str| -> Result<Option<i64>, RepositoryError> {
+        c.query_row(sql, [name], |r| r.get(0))
+            .optional()
+            .map_err(map_db)
+    };
+    Ok(NameHolders {
+        reserved_by: owner("SELECT user_id FROM reserved_subdomains WHERE name=?")?,
+        requested_by: owner("SELECT user_id FROM reservation_requests WHERE name=?")?,
+        assigned_to: owner("SELECT id FROM users WHERE assigned_subdomain=?")?,
+    })
+}
+/// Stores a reservation and drops the owner's pending request for the name.
+fn insert_reservation(c: &Connection, name: &str, user_id: i64) -> Result<(), RepositoryError> {
+    c.execute(
+        "DELETE FROM reservation_requests WHERE name=? AND user_id=?",
+        params![name, user_id],
+    )
+    .map_err(map_db)?;
+    c.execute(
+        "INSERT INTO reserved_subdomains(name,user_id,created_at_ms) VALUES(?,?,?)",
+        params![name, user_id, now_ms()?],
+    )
+    .map_err(map_db)?;
+    Ok(())
+}
+fn check_name(
+    c: &Connection,
+    name: &str,
+    requester: i64,
+    action: NameAction,
+) -> Result<(), RepositoryError> {
+    if !valid_subdomain(name) {
+        return Err(RepositoryError::Invalid("subdomain name"));
+    }
+    match name_conflict(name_holders_in(c, name)?, requester, action) {
+        Some(conflict) => Err(RepositoryError::NameTaken(conflict)),
+        None => Ok(()),
+    }
 }
 fn token_row(
     conn: &Connection,
@@ -238,6 +334,7 @@ impl Repository {
             c.pragma_update(None, "journal_mode", "WAL")
                 .map_err(map_db)?;
             c.execute_batch(SCHEMA).map_err(map_db)?;
+            add_missing_user_columns(&c)?;
             Ok(Self {
                 db: Arc::new(Mutex::new(c)),
             })
@@ -267,8 +364,8 @@ impl Repository {
             }
             let now = now_ms()?;
             c.execute(
-                "INSERT INTO users(email,password_hash,is_admin,created_at_ms) VALUES(?,?,?,?)",
-                params![email, u.password_hash, u.is_admin, now],
+                "INSERT INTO users(email,password_hash,is_admin,created_at_ms,must_change_password) VALUES(?,?,?,?,?)",
+                params![email, u.password_hash, u.is_admin, now, u.must_change_password],
             )
             .map_err(map_db)?;
             Ok(User {
@@ -278,116 +375,36 @@ impl Repository {
                 is_admin: u.is_admin,
                 assigned_subdomain: None,
                 created_at_ms: now,
-            })
-        })
-        .await
-    }
-    pub async fn mint_invite(&self, admin_user_id: i64) -> Result<String, RepositoryError> {
-        self.run(move |conn| {
-            let tx = conn.transaction().map_err(map_db)?;
-            let admin: Option<bool> = tx
-                .query_row(
-                    "SELECT is_admin FROM users WHERE id=?",
-                    [admin_user_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db)?;
-            if admin != Some(true) {
-                return Err(RepositoryError::NotFound);
-            }
-            let mut secret = [0u8; 32];
-            getrandom::fill(&mut secret).map_err(|_| RepositoryError::Random)?;
-            let placeholder = Sha256::digest(secret);
-            tx.execute(
-                "INSERT INTO signup_invites(created_by,code_hash,created_at_ms) VALUES(?,?,?)",
-                params![admin_user_id, placeholder.as_slice(), now_ms()?],
-            )
-            .map_err(map_db)?;
-            let id = tx.last_insert_rowid();
-            let raw = format!(
-                "vorp-invite_{id}_{}",
-                secret
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            );
-            let digest = Sha256::digest(raw.as_bytes());
-            tx.execute(
-                "UPDATE signup_invites SET code_hash=? WHERE id=?",
-                params![digest.as_slice(), id],
-            )
-            .map_err(map_db)?;
-            tx.commit().map_err(map_db)?;
-            Ok(raw)
-        })
-        .await
-    }
-    pub async fn create_user_with_invite(
-        &self,
-        u: NewUser,
-        raw: &str,
-    ) -> Result<User, RepositoryError> {
-        let raw = raw.to_owned();
-        self.run(move |conn| {
-            let id = raw
-                .strip_prefix("vorp-invite_")
-                .and_then(|s| s.split_once('_'))
-                .and_then(|(id, _)| id.parse::<i64>().ok())
-                .ok_or(RepositoryError::Invalid("invite code"))?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(map_db)?;
-            let stored: Option<(Vec<u8>, Option<i64>)> = tx
-                .query_row(
-                    "SELECT code_hash,used_at_ms FROM signup_invites WHERE id=?",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(map_db)?;
-            let (hash, used) = stored.ok_or(RepositoryError::Invalid("invite code"))?;
-            let hash: [u8; 32] = hash
-                .try_into()
-                .map_err(|_| RepositoryError::Invalid("stored invite hash"))?;
-            if used.is_some() || !bool::from(Sha256::digest(raw.as_bytes()).as_slice().ct_eq(&hash))
-            {
-                return Err(RepositoryError::Invalid("invite code"));
-            }
-            let email = u.email.trim().to_ascii_lowercase();
-            if email.is_empty() || !email.contains('@') {
-                return Err(RepositoryError::Invalid("email"));
-            }
-            let now = now_ms()?;
-            tx.execute(
-                "INSERT INTO users(email,password_hash,is_admin,created_at_ms) VALUES(?,?,0,?)",
-                params![email, u.password_hash, now],
-            )
-            .map_err(map_db)?;
-            let user_id = tx.last_insert_rowid();
-            tx.execute(
-                "UPDATE signup_invites SET used_at_ms=? WHERE id=? AND used_at_ms IS NULL",
-                params![now, id],
-            )
-            .map_err(map_db)?;
-            tx.commit().map_err(map_db)?;
-            Ok(User {
-                id: user_id,
-                email,
-                password_hash: u.password_hash,
-                is_admin: false,
-                assigned_subdomain: None,
-                created_at_ms: now,
+                must_change_password: u.must_change_password,
+                can_reserve_directly: false,
             })
         })
         .await
     }
     pub async fn user_by_email(&self, email: &str) -> Result<Option<User>, RepositoryError> {
         let e = email.to_owned();
-        self.run(move|c|c.query_row("SELECT id,email,password_hash,is_admin,assigned_subdomain,created_at_ms FROM users WHERE email=?",[e],user_row).optional().map_err(map_db)).await
+        self.run(move |c| {
+            c.query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE email=?"),
+                [e],
+                user_row,
+            )
+            .optional()
+            .map_err(map_db)
+        })
+        .await
     }
     pub async fn user_by_id(&self, id: i64) -> Result<Option<User>, RepositoryError> {
-        self.run(move|c|c.query_row("SELECT id,email,password_hash,is_admin,assigned_subdomain,created_at_ms FROM users WHERE id=?",[id],user_row).optional().map_err(map_db)).await
+        self.run(move |c| {
+            c.query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE id=?"),
+                [id],
+                user_row,
+            )
+            .optional()
+            .map_err(map_db)
+        })
+        .await
     }
     pub async fn user_count(&self) -> Result<i64, RepositoryError> {
         self.run(|c| {
@@ -431,6 +448,8 @@ impl Repository {
                 is_admin: true,
                 assigned_subdomain: None,
                 created_at_ms: now,
+                must_change_password: false,
+                can_reserve_directly: false,
             })
         })
         .await
@@ -439,7 +458,7 @@ impl Repository {
         &self,
         user_id: i64,
     ) -> Result<String, RepositoryError> {
-        self.run(move|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_db)?; let existing:Option<String>=tx.query_row("SELECT assigned_subdomain FROM users WHERE id=?",[user_id],|r|r.get(0)).optional().map_err(map_db)?.ok_or(RepositoryError::NotFound)?; if let Some(n)=existing {return Ok(n);} for _ in 0..32 { let mut bytes=[0u8;10]; getrandom::fill(&mut bytes).map_err(|_|RepositoryError::Random)?; let name=bytes.iter().map(|b|format!("{b:02x}")).collect::<String>(); let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM reserved_subdomains WHERE name=?)",[&name],|r|r.get(0)).map_err(map_db)?; if reserved {continue;} match tx.execute("UPDATE users SET assigned_subdomain=? WHERE id=?",params![name,user_id]) { Ok(_)=>{tx.commit().map_err(map_db)?;return Ok(name)},Err(e) if matches!(&e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::ConstraintViolation)=>continue,Err(e)=>return Err(map_db(e)) } } Err(RepositoryError::Conflict) }).await
+        self.run(move|c| { let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_db)?; let existing:Option<String>=tx.query_row("SELECT assigned_subdomain FROM users WHERE id=?",[user_id],|r|r.get(0)).optional().map_err(map_db)?.ok_or(RepositoryError::NotFound)?; if let Some(n)=existing {return Ok(n);} for _ in 0..32 { let mut bytes=[0u8;10]; getrandom::fill(&mut bytes).map_err(|_|RepositoryError::Random)?; let name=bytes.iter().map(|b|format!("{b:02x}")).collect::<String>(); let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM reserved_subdomains WHERE name=?1) OR EXISTS(SELECT 1 FROM reservation_requests WHERE name=?1)",[&name],|r|r.get(0)).map_err(map_db)?; if reserved {continue;} match tx.execute("UPDATE users SET assigned_subdomain=? WHERE id=?",params![name,user_id]) { Ok(_)=>{tx.commit().map_err(map_db)?;return Ok(name)},Err(e) if matches!(&e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::ConstraintViolation)=>continue,Err(e)=>return Err(map_db(e)) } } Err(RepositoryError::Conflict) }).await
     }
     pub async fn assigned_subdomain_owner(
         &self,
@@ -505,14 +524,21 @@ impl Repository {
         })
         .await
     }
-    pub async fn update_password(&self, user_id: i64, hash: &str) -> Result<(), RepositoryError> {
+    /// Replaces the password and ends every session. `must_change` makes the
+    /// next login ask for a new password, as after an admin or host reset.
+    pub async fn update_password(
+        &self,
+        user_id: i64,
+        hash: &str,
+        must_change: bool,
+    ) -> Result<(), RepositoryError> {
         let hash = hash.to_owned();
         self.run(move |c| {
             let tx = c.transaction().map_err(map_db)?;
             if tx
                 .execute(
-                    "UPDATE users SET password_hash=? WHERE id=?",
-                    params![hash, user_id],
+                    "UPDATE users SET password_hash=?,must_change_password=? WHERE id=?",
+                    params![hash, must_change, user_id],
                 )
                 .map_err(map_db)?
                 == 0
@@ -619,6 +645,7 @@ impl Repository {
         })
         .await
     }
+    /// Takes a free name at once, replacing the owner's own pending request.
     pub async fn reserve_subdomain(
         &self,
         name: &str,
@@ -626,33 +653,163 @@ impl Repository {
     ) -> Result<ReservedSubdomain, RepositoryError> {
         let name = name.to_owned();
         self.run(move |c| {
-            if !valid_subdomain(&name) {
-                return Err(RepositoryError::Invalid("subdomain name"));
-            }
             let tx = c
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(map_db)?;
-            let assigned: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM users WHERE assigned_subdomain=?",
-                    [&name],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(map_db)?;
-            if assigned.is_some_and(|id| id != owner_user_id) {
-                return Err(RepositoryError::Conflict);
-            }
-            tx.execute(
-                "INSERT INTO reserved_subdomains(name,user_id,created_at_ms) VALUES(?,?,?)",
-                params![name, owner_user_id, now_ms()?],
-            )
-            .map_err(map_db)?;
+            check_name(&tx, &name, owner_user_id, NameAction::Reserve)?;
+            insert_reservation(&tx, &name, owner_user_id)?;
             tx.commit().map_err(map_db)?;
             Ok(ReservedSubdomain {
                 name,
                 user_id: owner_user_id,
             })
+        })
+        .await
+    }
+    /// Asks an admin for a free name; it holds the name against other users
+    /// until approved or rejected.
+    pub async fn request_subdomain(&self, name: &str, user_id: i64) -> Result<(), RepositoryError> {
+        let name = name.to_owned();
+        self.run(move |c| {
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_db)?;
+            check_name(&tx, &name, user_id, NameAction::Request)?;
+            tx.execute(
+                "INSERT INTO reservation_requests(name,user_id,created_at_ms) VALUES(?,?,?)",
+                params![name, user_id, now_ms()?],
+            )
+            .map_err(map_db)?;
+            tx.commit().map_err(map_db)
+        })
+        .await
+    }
+    /// The user's pending request names.
+    pub async fn requests_for_user(&self, user_id: i64) -> Result<Vec<String>, RepositoryError> {
+        self.run(move |c| {
+            let mut s = c
+                .prepare("SELECT name FROM reservation_requests WHERE user_id=? ORDER BY name")
+                .map_err(map_db)?;
+            s.query_map([user_id], |r| r.get(0))
+                .map_err(map_db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_db)
+        })
+        .await
+    }
+    pub async fn cancel_subdomain_request(
+        &self,
+        name: &str,
+        user_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let name = name.to_owned();
+        self.run(move |c| {
+            Ok(c.execute(
+                "DELETE FROM reservation_requests WHERE name=? AND user_id=?",
+                params![name, user_id],
+            )
+            .map_err(map_db)?
+                > 0)
+        })
+        .await
+    }
+    /// Every pending request, oldest first. The caller must have checked that
+    /// the requester is an admin.
+    pub async fn reservation_requests(&self) -> Result<Vec<ReservationRequest>, RepositoryError> {
+        self.run(|c| {
+            let mut s = c
+                .prepare(
+                    "SELECT r.name,r.user_id,u.email,r.created_at_ms FROM reservation_requests r
+                     JOIN users u ON u.id=r.user_id ORDER BY r.created_at_ms,r.name",
+                )
+                .map_err(map_db)?;
+            s.query_map([], |r| {
+                Ok(ReservationRequest {
+                    name: r.get(0)?,
+                    user_id: r.get(1)?,
+                    email: r.get(2)?,
+                    created_at_ms: r.get(3)?,
+                })
+            })
+            .map_err(map_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db)
+        })
+        .await
+    }
+    /// Turns a pending request into a reservation for its requester.
+    pub async fn approve_subdomain_request(
+        &self,
+        name: &str,
+    ) -> Result<ReservedSubdomain, RepositoryError> {
+        let name = name.to_owned();
+        self.run(move |c| {
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_db)?;
+            let user_id: i64 = tx
+                .query_row(
+                    "SELECT user_id FROM reservation_requests WHERE name=?",
+                    [&name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_db)?
+                .ok_or(RepositoryError::NotFound)?;
+            // Re-check: an assigned subdomain may have taken the name since.
+            check_name(&tx, &name, user_id, NameAction::Reserve)?;
+            insert_reservation(&tx, &name, user_id)?;
+            tx.commit().map_err(map_db)?;
+            Ok(ReservedSubdomain { name, user_id })
+        })
+        .await
+    }
+    pub async fn reject_subdomain_request(&self, name: &str) -> Result<bool, RepositoryError> {
+        let name = name.to_owned();
+        self.run(move |c| {
+            Ok(
+                c.execute("DELETE FROM reservation_requests WHERE name=?", [name])
+                    .map_err(map_db)?
+                    > 0,
+            )
+        })
+        .await
+    }
+    /// Sets a user's role and reservation permission. Refuses to remove the
+    /// last admin, which would leave nobody able to manage the relay.
+    pub async fn set_user_access(
+        &self,
+        user_id: i64,
+        is_admin: bool,
+        can_reserve_directly: bool,
+    ) -> Result<(), RepositoryError> {
+        self.run(move |c| {
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_db)?;
+            let was_admin: bool = tx
+                .query_row("SELECT is_admin FROM users WHERE id=?", [user_id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(map_db)?
+                .ok_or(RepositoryError::NotFound)?;
+            tx.execute(
+                "UPDATE users SET is_admin=?,can_reserve_directly=? WHERE id=?",
+                params![is_admin, can_reserve_directly, user_id],
+            )
+            .map_err(map_db)?;
+            if was_admin && !is_admin {
+                let admins: i64 = tx
+                    .query_row("SELECT count(*) FROM users WHERE is_admin=1", [], |r| {
+                        r.get(0)
+                    })
+                    .map_err(map_db)?;
+                if admins == 0 {
+                    return Err(RepositoryError::Invalid("at least one admin must remain"));
+                }
+            }
+            tx.commit().map_err(map_db)
         })
         .await
     }
@@ -791,7 +948,7 @@ impl Repository {
         self.run(|c| {
             let mut s = c
                 .prepare(
-                    "SELECT u.id,u.email,u.is_admin,u.created_at_ms,l.max_tunnels,l.bandwidth_bytes_per_sec,l.max_concurrent_requests
+                    "SELECT u.id,u.email,u.is_admin,u.created_at_ms,u.must_change_password,u.can_reserve_directly,l.max_tunnels,l.bandwidth_bytes_per_sec,l.max_concurrent_requests
                      FROM users u LEFT JOIN user_limits l ON l.user_id=u.id ORDER BY u.id",
                 )
                 .map_err(map_db)?;
@@ -801,7 +958,9 @@ impl Repository {
                     email: r.get(1)?,
                     is_admin: r.get(2)?,
                     created_at_ms: r.get(3)?,
-                    overrides: overrides_at(r, 4)?,
+                    must_change_password: r.get(4)?,
+                    can_reserve_directly: r.get(5)?,
+                    overrides: overrides_at(r, 6)?,
                 })
             })
             .map_err(map_db)?
@@ -827,6 +986,7 @@ mod tests {
             email: email.into(),
             password_hash: "hash".into(),
             is_admin: false,
+            must_change_password: false,
         })
         .await
         .expect("user")
@@ -874,7 +1034,7 @@ mod tests {
         );
         assert!(matches!(
             r.reserve_subdomain(&n, b.id).await,
-            Err(RepositoryError::Conflict)
+            Err(RepositoryError::NameTaken(NameConflict::AssignedToOther))
         ));
         r.create_session(NewSession {
             id: "s".into(),
@@ -883,8 +1043,17 @@ mod tests {
         })
         .await
         .expect("session");
-        r.update_password(a.id, "new").await.expect("password");
+        r.update_password(a.id, "new", true)
+            .await
+            .expect("password");
         assert!(r.session_by_id("s").await.expect("lookup").is_none());
+        let reset = r.user_by_id(a.id).await.expect("lookup").expect("user");
+        assert!(reset.must_change_password);
+        r.update_password(a.id, "mine", false)
+            .await
+            .expect("password");
+        let changed = r.user_by_id(a.id).await.expect("lookup").expect("user");
+        assert!(!changed.must_change_password);
     }
     #[tokio::test]
     async fn sessions_are_stored_hashed_and_resolve_from_the_cookie_value() {
@@ -946,38 +1115,118 @@ mod tests {
         assert!(r.authenticate_token(&raw).await.expect("revoked").is_none());
     }
     #[tokio::test]
-    async fn invite_is_admin_only_and_single_use() {
+    async fn requests_hold_names_until_approved_or_rejected() {
         let r = repo().await;
-        let regular = user(&r, "regular@x.test").await;
+        let a = user(&r, "a@x.test").await;
+        let b = user(&r, "b@x.test").await;
+        r.request_subdomain("demo", a.id).await.expect("request");
+        assert!(r.reservation_owner("demo").await.expect("owner").is_none());
+        for (name, requester, expected) in [
+            ("demo", a.id, NameConflict::AlreadyRequested),
+            ("demo", b.id, NameConflict::RequestedByOther),
+        ] {
+            assert!(matches!(
+                r.request_subdomain(name, requester).await,
+                Err(RepositoryError::NameTaken(c)) if c == expected
+            ));
+        }
         assert!(matches!(
-            r.mint_invite(regular.id).await,
+            r.reserve_subdomain("demo", b.id).await,
+            Err(RepositoryError::NameTaken(NameConflict::RequestedByOther))
+        ));
+        assert_eq!(r.requests_for_user(a.id).await.expect("list"), ["demo"]);
+        let listed = r.reservation_requests().await.expect("pending");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|q| (q.name.as_str(), q.email.as_str()))
+                .collect::<Vec<_>>(),
+            [("demo", "a@x.test")]
+        );
+        let approved = r.approve_subdomain_request("demo").await.expect("approve");
+        assert_eq!(approved.user_id, a.id);
+        assert_eq!(
+            r.reservation_owner("demo").await.expect("owner"),
+            Some(a.id)
+        );
+        assert!(r.requests_for_user(a.id).await.expect("list").is_empty());
+        assert!(matches!(
+            r.approve_subdomain_request("demo").await,
             Err(RepositoryError::NotFound)
         ));
-        let admin = r.bootstrap_admin("admin@x.test", "hash").await;
-        assert!(matches!(admin, Err(RepositoryError::Conflict)));
-        // The first account can be elevated only through bootstrap, so use a fresh repository.
+
+        r.request_subdomain("other", b.id).await.expect("request");
+        assert!(r.reject_subdomain_request("other").await.expect("reject"));
+        r.request_subdomain("other", a.id)
+            .await
+            .expect("free again");
+        // Reserving directly replaces the requester's own pending request.
+        r.reserve_subdomain("other", a.id).await.expect("reserve");
+        assert!(r.requests_for_user(a.id).await.expect("list").is_empty());
+        r.request_subdomain("mine", b.id).await.expect("request");
+        assert!(
+            r.cancel_subdomain_request("mine", b.id)
+                .await
+                .expect("cancel")
+        );
+        assert!(
+            !r.cancel_subdomain_request("mine", b.id)
+                .await
+                .expect("gone")
+        );
+    }
+    #[tokio::test]
+    async fn access_changes_keep_one_admin() {
         let r = repo().await;
-        let admin = r
-            .bootstrap_admin("admin@x.test", "hash")
+        let a = user(&r, "a@x.test").await;
+        let admin = r.bootstrap_admin_for_test().await;
+        r.set_user_access(a.id, true, true).await.expect("promote");
+        let promoted = r.user_by_id(a.id).await.expect("lookup").expect("user");
+        assert!(promoted.is_admin && promoted.can_reserve_directly);
+        r.set_user_access(admin, false, false)
             .await
-            .expect("admin");
-        let invite = r.mint_invite(admin.id).await.expect("invite");
-        let user = NewUser {
-            email: "invited@x.test".into(),
-            password_hash: "hash".into(),
-            is_admin: false,
-        };
+            .expect("demote");
         assert!(matches!(
-            r.create_user_with_invite(user.clone(), "wrong").await,
+            r.set_user_access(a.id, false, false).await,
             Err(RepositoryError::Invalid(_))
         ));
-        r.create_user_with_invite(user.clone(), &invite)
-            .await
-            .expect("redeem");
+        assert!(
+            r.user_by_id(a.id)
+                .await
+                .expect("lookup")
+                .expect("user")
+                .is_admin
+        );
         assert!(matches!(
-            r.create_user_with_invite(user, &invite).await,
-            Err(RepositoryError::Invalid(_))
+            r.set_user_access(9_999, false, false).await,
+            Err(RepositoryError::NotFound)
         ));
+    }
+    #[tokio::test]
+    async fn open_adds_new_user_columns_to_an_older_database() {
+        let dir = std::env::temp_dir().join(format!("vorp-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("old.sqlite3");
+        let _ = std::fs::remove_file(&path); // Absent on a clean run.
+        {
+            let c = Connection::open(&path).expect("old db");
+            c.execute_batch(
+                "CREATE TABLE users(id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE COLLATE NOCASE,password_hash TEXT NOT NULL,is_admin INTEGER NOT NULL CHECK(is_admin IN(0,1)),assigned_subdomain TEXT UNIQUE,created_at_ms INTEGER NOT NULL);
+                 INSERT INTO users(email,password_hash,is_admin,created_at_ms) VALUES('old@x.test','hash',0,1);",
+            )
+            .expect("old schema");
+        }
+        let r = Repository::open(&path).await.expect("migrate");
+        let old = r
+            .user_by_email("old@x.test")
+            .await
+            .expect("lookup")
+            .expect("user");
+        assert!(!old.must_change_password && !old.can_reserve_directly);
+        drop(r);
+        // Opening again finds the columns present and leaves them alone.
+        Repository::open(&path).await.expect("reopen");
+        let _ = std::fs::remove_dir_all(&dir); // Leftover temp files are harmless.
     }
     #[tokio::test]
     async fn limits_resolve_defaults_overrides_and_admin_exemption() {
@@ -1053,6 +1302,7 @@ mod tests {
                 email: "admin@x.test".into(),
                 password_hash: "hash".into(),
                 is_admin: true,
+                must_change_password: false,
             })
             .await
             .expect("admin")

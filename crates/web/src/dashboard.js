@@ -3,6 +3,27 @@
 // Content is always set with textContent, never innerHTML, so API data cannot inject markup.
 
 const MIB = 1024 * 1024;
+const THEME_KEY = 'vorp-theme';
+
+// Runs before the body paints so a stored light theme never flashes dark.
+// Storage can be unavailable (private windows, blocked site data); the
+// system preference is the fallback.
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+}
+function storedTheme() {
+  try {
+    const value = localStorage.getItem(THEME_KEY);
+    if (value === 'light' || value === 'dark') return value;
+  } catch { /* Storage unavailable: use the system preference. */ }
+  return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch { /* Not remembered; still applied. */ }
+}
+applyTheme(storedTheme());
 const state = { config: null, me: null, reservations: [], view: null, timer: null, feed: null };
 
 const $ = (id) => document.getElementById(id);
@@ -76,6 +97,9 @@ async function attempt(action, button) {
   } catch (error) {
     if (error instanceof ApiError && error.status === 401 && state.me) {
       signedOut('Your session ended. Log in again.');
+    } else if (error instanceof ApiError && error.message === 'Password change required.' && state.me) {
+      // Another session reset the password; reload so the forced form shows.
+      attempt(enterApp);
     } else {
       notify(error.message || String(error));
     }
@@ -194,11 +218,8 @@ function setAuthMode(mode) {
   const signupMode = state.config ? state.config.signup_mode : 'closed';
   $('auth-title').textContent = m.title;
   $('auth-submit').textContent = m.submit;
-  $('auth-help').textContent = mode === 'signup' && signupMode === 'invite'
-    ? 'Signup needs an invite code from an administrator.' : m.help;
-  $('auth-help').hidden = !$('auth-help').textContent;
-  $('invite-field').hidden = !(mode === 'signup' && signupMode === 'invite');
-  $('auth-form').elements.invite_code.required = !$('invite-field').hidden;
+  $('auth-help').textContent = m.help;
+  $('auth-help').hidden = !m.help;
   $('auth-form').elements.password.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
   // Signing up is offered only when the server allows it.
   const canSwitch = mode !== 'bootstrap' && signupMode !== 'closed';
@@ -225,9 +246,8 @@ async function signedOut(message) {
 async function submitAuth(event) {
   event.preventDefault();
   const form = event.target;
-  const { email, password, invite_code: invite } = formData(form);
+  const { email, password } = formData(form);
   const body = { email, password };
-  if (authMode === 'signup' && invite) body.invite_code = invite.trim();
   const errors = {
     login: { 401: 'Wrong email or password.' },
     signup: { 403: 'Signup is closed on this relay. Ask an administrator for an account.',
@@ -270,7 +290,16 @@ async function enterApp() {
   $('whoami').hidden = false;
   $('logout').hidden = false;
   for (const el of document.querySelectorAll('[data-admin]')) el.hidden = !state.me.is_admin;
+  // Until the user picks their own password the API refuses everything else,
+  // so only the password form is offered.
+  const forced = state.me.must_change_password;
+  $('tabs').hidden = forced;
+  $('password-forced').hidden = !forced;
   route();
+  if (state.me.is_admin && !forced) {
+    // Shows pending requests on the admin link from any page.
+    attempt(async () => showRequestCount((await api('/api/admin/reservation-requests')).length));
+  }
 }
 
 const VIEWS = {
@@ -287,6 +316,7 @@ function route() {
   if (!state.me) return;
   let view = location.hash.slice(1);
   if (!VIEWS[view] || (view === 'admin' && !state.me.is_admin)) view = 'overview';
+  if (state.me.must_change_password) view = 'account';
   stopViewWork();
   state.view = view;
   for (const section of document.querySelectorAll('[data-view]')) section.hidden = section.dataset.view !== view;
@@ -321,10 +351,12 @@ function loadOverview() {
       stat('Tunnels at once', me.limits.max_tunnels),
       stat('Bandwidth', formatRate(me.limits.bandwidth_bytes_per_sec)),
       stat('Concurrent requests', me.limits.max_concurrent_requests))
-    : h('p', {}, 'Administrators have no quota.'));
+    : h('div', { class: 'stats' }, stat('Quota', 'None'), stat('Role', 'Admin')));
   showCommand('ov-command', 'ov-command-note');
 }
-function stat(label, value) { return h('div', { class: 'stat' }, h('span', { class: 'muted small' }, label), h('b', {}, value)); }
+function stat(label, value) {
+  return h('div', { class: 'card' }, h('div', { class: 'stat-value' }, value), h('div', { class: 'stat-label' }, label));
+}
 
 // --- Tunnels -----------------------------------------------------------------
 
@@ -347,7 +379,7 @@ async function refreshTunnels() {
     { label: 'Machine', cell: (t) => t.machine_id },
     { label: 'Upstream', cell: (t) => t.upstream_hint || '—' },
     { label: 'Active requests', cell: (t) => t.active_requests },
-    { label: '', className: 'actions', cell: (t) => h('button', { type: 'button', class: 'danger', onclick: (e) => closeTunnel(t.subdomain, e.target) }, 'Close') },
+    { label: '', className: 'actions', cell: (t) => h('button', { type: 'button', class: 'danger small', onclick: (e) => closeTunnel(t.subdomain, e.target) }, 'Close') },
   ], 'No tunnels are open. Start the agent to open one.'));
 }
 
@@ -364,14 +396,14 @@ async function closeTunnel(name, button) {
 
 async function loadTokens() {
   const [tokens, reservations] = await Promise.all([api('/api/tokens'), api('/api/reservations')]);
-  state.reservations = reservations;
+  state.reservations = reservations.filter((r) => r.status === 'reserved');
   renderAllowlistOptions();
   render('tokens-list', table(tokens, [
     { label: 'ID', cell: (t) => t.id },
     { label: 'May open', cell: (t) => t.bind_policy },
     { label: 'Allowed names', cell: (t) => t.allowlist.join(', ') || '—' },
-    { label: 'Status', cell: (t) => t.revoked ? h('span', { class: 'revoked' }, 'revoked') : 'active' },
-    { label: '', className: 'actions', cell: (t) => t.revoked ? '' : h('button', { type: 'button', class: 'danger', onclick: (e) => revokeToken(t.id, e.target) }, 'Revoke') },
+    { label: 'Status', cell: (t) => t.revoked ? h('span', { class: 'badge bad' }, 'revoked') : h('span', { class: 'badge ok' }, 'active') },
+    { label: '', className: 'actions', cell: (t) => t.revoked ? '' : h('button', { type: 'button', class: 'danger small', onclick: (e) => revokeToken(t.id, e.target) }, 'Revoke') },
   ], 'You have no tokens yet.'));
 }
 
@@ -379,7 +411,7 @@ function renderAllowlistOptions() {
   render('token-allowlist-options', state.reservations.length
     ? h('div', {}, state.reservations.map((r) => h('label', { class: 'choice' },
       h('input', { type: 'checkbox', name: 'allowlist', value: r.name }), ' ', r.name)))
-    : h('p', { class: 'empty' }, 'You have no reserved names. Reserve one on the ', h('a', { href: '#names' }, 'Reserved names'), ' tab first.'));
+    : h('p', { class: 'empty' }, 'You have no approved reserved names. Reserve one on the ', h('a', { href: '#names' }, 'Reserved names'), ' page first.'));
 }
 
 function updatePolicyFields() {
@@ -431,13 +463,21 @@ async function revokeToken(id, button) {
 // --- Reserved names ----------------------------------------------------------
 
 async function loadNames() {
+  const direct = state.me.can_reserve_directly;
   $('name-example').textContent = tunnelUrl('<name>');
-  state.reservations = await api('/api/reservations');
-  render('names-list', table(state.reservations, [
+  $('name-mode').textContent = direct
+    ? 'Names you reserve are yours at once.'
+    : 'An administrator approves each name you request. A pending request already holds the name, so nobody else can take it.';
+  $('name-submit').textContent = direct ? 'Reserve' : 'Request';
+  const names = await api('/api/reservations');
+  render('names-list', table(names, [
     { label: 'Name', cell: (r) => r.name },
-    { label: 'URL', cell: (r) => tunnelLink(r.name) },
-    { label: '', className: 'actions', cell: (r) => h('button', { type: 'button', class: 'danger', onclick: (e) => releaseName(r.name, e.target) }, 'Release') },
-  ], 'You have not reserved any names.'));
+    { label: 'Status', cell: (r) => r.status === 'reserved'
+      ? h('span', { class: 'badge ok' }, 'reserved')
+      : h('span', { class: 'badge pending' }, 'awaiting approval') },
+    { label: 'URL', cell: (r) => r.status === 'reserved' ? tunnelLink(r.name) : '—' },
+    { label: '', className: 'actions', cell: (r) => h('button', { type: 'button', class: 'danger small', onclick: (e) => releaseName(r, e.target) }, r.status === 'reserved' ? 'Release' : 'Withdraw') },
+  ], 'You have not reserved or requested any names.'));
 }
 
 async function reserveName(event) {
@@ -445,19 +485,25 @@ async function reserveName(event) {
   const form = event.target;
   const name = form.elements.name.value.trim().toLowerCase();
   await attempt(async () => {
-    await api('/api/reservations', { method: 'POST', body: { name },
-      errors: { 409: `${name} is already taken.` } });
+    // A 409 carries the relay's explanation of who holds the name.
+    const result = await api('/api/reservations', { method: 'POST', body: { name } });
     form.reset();
-    notify(`Reserved ${name}.`, true);
+    notify(result.status === 'reserved'
+      ? `Reserved ${result.name}.`
+      : `Requested ${result.name}. It is yours once an administrator approves it.`, true);
     await loadNames();
-  }, form.querySelector('button[type="submit"]'));
+  }, $('name-submit'));
 }
 
-async function releaseName(name, button) {
-  if (!confirm(`Release ${name}? Anyone can reserve it afterwards.`)) return;
+async function releaseName(reservation, button) {
+  const { name, status } = reservation;
+  const question = status === 'reserved'
+    ? `Release ${name}? Anyone can reserve it afterwards.`
+    : `Withdraw your request for ${name}?`;
+  if (!confirm(question)) return;
   await attempt(async () => {
     await api(`/api/reservations/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    notify(`Released ${name}.`, true);
+    notify(status === 'reserved' ? `Released ${name}.` : `Withdrew the request for ${name}.`, true);
     await loadNames();
   }, button);
 }
@@ -498,7 +544,7 @@ function openFeed() {
 
 function setFeedStatus(text, live) {
   $('traffic-status').textContent = text;
-  $('traffic-status').className = live ? 'pill live' : 'pill';
+  $('traffic-status').className = live ? 'badge ok' : 'badge';
 }
 
 function renderTraffic(events) {
@@ -555,14 +601,11 @@ let defaults = null;
 let editing = null;
 
 async function loadAdmin() {
-  const modes = {
-    open: 'Signup is open: anyone can create an account, so invite codes are not needed.',
-    invite: 'Signup needs an invite code. Each code works once.',
-    closed: 'Signup is closed: invite codes cannot be used. Create accounts below instead.',
-  };
-  $('invite-mode').textContent = modes[state.config.signup_mode] || '';
-  const [limits, users] = await Promise.all([api('/api/admin/limits'), api('/api/admin/users')]);
+  const [limits, users, requests] = await Promise.all([
+    api('/api/admin/limits'), api('/api/admin/users'), api('/api/admin/reservation-requests')]);
   defaults = limits;
+  showRequestCount(requests.length);
+  renderRequests(requests);
   const form = $('defaults-form').elements;
   form.max_tunnels.value = limits.max_tunnels;
   form.bandwidth.value = bytesToMib(limits.bandwidth_bytes_per_sec);
@@ -574,17 +617,66 @@ function renderUsers(users) {
   const cell = (field, format = (v) => v) => (u) => {
     if (!u.effective) return h('span', { class: 'muted' }, 'exempt');
     const inherited = u.overrides[field] == null;
-    return h('span', {}, format(u.effective[field]), ' ', inherited ? h('span', { class: 'tag' }, 'default') : null);
+    return h('span', {}, format(u.effective[field]), ' ', inherited ? h('span', { class: 'badge plain' }, 'default') : null);
   };
   render('users-list', table(users, [
-    { label: 'Email', cell: (u) => u.email },
-    { label: 'Role', cell: (u) => u.is_admin ? 'admin' : 'user' },
-    { label: 'Created', cell: (u) => new Date(u.created_at_ms).toLocaleDateString() },
+    { label: 'Email', cell: (u) => h('span', {}, u.email, u.must_change_password ? h('span', {}, ' ', h('span', { class: 'badge pending' }, 'must set password')) : null) },
+    { label: 'Role', cell: (u) => h('span', {},
+      h('span', { class: u.is_admin ? 'badge ok' : 'badge' }, u.is_admin ? 'admin' : 'user'), ' ',
+      u.id === state.me.id
+        ? h('span', { class: 'muted' }, '(you)')
+        : h('button', { type: 'button', class: 'small', onclick: (e) => setAccess(u, { is_admin: !u.is_admin }, e.target) }, u.is_admin ? 'Make user' : 'Make admin')) },
+    { label: 'Direct', cell: (u) => u.is_admin
+      ? h('span', { class: 'muted' }, 'always')
+      : h('input', { type: 'checkbox', 'aria-label': `Direct reservation for ${u.email}`, checked: u.can_reserve_directly, onchange: (e) => setAccess(u, { can_reserve_directly: e.target.checked }, e.target) }) },
     { label: 'Tunnels', cell: cell('max_tunnels') },
     { label: 'Bandwidth', cell: cell('bandwidth_bytes_per_sec', formatRate) },
     { label: 'Requests', cell: cell('max_concurrent_requests') },
-    { label: '', className: 'actions', cell: (u) => u.is_admin ? '' : h('button', { type: 'button', class: 'ghost', onclick: () => openLimits(u) }, 'Edit quota') },
+    { label: '', className: 'actions', cell: (u) => u.is_admin ? '' : h('button', { type: 'button', class: 'small', onclick: () => openLimits(u) }, 'Edit quota') },
   ], 'No users.'));
+}
+
+function showRequestCount(count) {
+  $('admin-count').textContent = count;
+  $('admin-count').hidden = !count;
+}
+
+function renderRequests(requests) {
+  render('requests-list', table(requests, [
+    { label: 'Name', cell: (r) => r.name },
+    { label: 'Requested by', cell: (r) => r.email },
+    { label: 'When', cell: (r) => new Date(r.created_at_ms).toLocaleString() },
+    { label: '', className: 'actions', cell: (r) => h('span', {},
+      h('button', { type: 'button', class: 'primary small', onclick: (e) => decideRequest(r, 'approve', e.target) }, 'Approve'),
+      h('button', { type: 'button', class: 'danger small', onclick: (e) => decideRequest(r, 'reject', e.target) }, 'Reject')) },
+  ], 'No pending requests.'));
+}
+
+async function decideRequest(request, decision, button) {
+  if (decision === 'reject' && !confirm(`Reject ${request.email}'s request for ${request.name}? The name becomes free.`)) return;
+  await attempt(async () => {
+    await api(`/api/admin/reservation-requests/${encodeURIComponent(request.name)}/${decision}`, { method: 'POST' });
+    notify(decision === 'approve'
+      ? `${request.name} is now reserved for ${request.email}.`
+      : `Rejected the request for ${request.name}.`, true);
+    await loadAdmin();
+  }, button);
+}
+
+// The PUT replaces both fields, so start from the user's current values.
+async function setAccess(user, change, control) {
+  const body = { is_admin: user.is_admin, can_reserve_directly: user.can_reserve_directly, ...change };
+  if (change.is_admin !== undefined && !confirm(change.is_admin
+    ? `Make ${user.email} an administrator? Admins manage every user and have no quota.`
+    : `Remove ${user.email}'s admin role? Their quota applies again at once.`)) return;
+  const ok = await attempt(async () => {
+    await api(`/api/admin/users/${user.id}`, { method: 'PUT', body, errors: { 503: LIMITS_503 } });
+    notify(`Updated ${user.email}.`, true);
+    return true;
+  }, control);
+  // Reload either way so a failed toggle shows the stored value again.
+  await attempt(loadAdmin);
+  return ok;
 }
 
 // Reads a positive integer field; returns null and reports when invalid.
@@ -670,23 +762,16 @@ async function createUser(event) {
     const user = await api('/api/users', { method: 'POST', body: { email, password },
       errors: { 409: 'That email is already registered.' } });
     form.reset();
-    notify(`Created ${user.email}. Send them their password over a private channel.`, true);
+    notify(`Created ${user.email}. Send them the password privately; they must change it at first login.`, true);
     await loadAdmin();
   }, form.querySelector('button[type="submit"]'));
-}
-
-async function createInvite() {
-  await attempt(async () => {
-    const result = await api('/api/invites', { method: 'POST' });
-    $('invite-code').value = result.invite_code;
-    $('invite-created').hidden = false;
-  }, $('invite-create'));
 }
 
 // --- Startup -----------------------------------------------------------------
 
 function wire() {
   $('notice-close').addEventListener('click', clearNotice);
+  for (const button of document.querySelectorAll('[data-theme-toggle]')) button.addEventListener('click', toggleTheme);
   $('logout').addEventListener('click', logout);
   $('auth-form').addEventListener('submit', submitAuth);
   $('auth-toggle').addEventListener('click', () => { clearNotice(); setAuthMode(authMode === 'login' ? 'signup' : 'login'); });
@@ -702,7 +787,6 @@ function wire() {
   $('limits-form').addEventListener('submit', saveLimits);
   $('limits-cancel').addEventListener('click', () => $('limits-dialog').close());
   $('user-form').addEventListener('submit', createUser);
-  $('invite-create').addEventListener('click', createInvite);
   for (const button of document.querySelectorAll('[data-copy]')) {
     button.addEventListener('click', () => {
       const source = $(button.dataset.copy);
@@ -727,4 +811,4 @@ async function start() {
   }
 }
 
-start();
+document.addEventListener('DOMContentLoaded', start);

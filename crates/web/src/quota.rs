@@ -77,12 +77,14 @@ pub(crate) struct UserLimitsBody {
     email: String,
     is_admin: bool,
     created_at_ms: i64,
+    must_change_password: bool,
+    can_reserve_directly: bool,
     overrides: OverridesBody,
     /// `null` for an admin.
     effective: Option<LimitsBody>,
 }
 
-async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+pub(crate) async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let user = current_user(state, headers).await?;
     if user.is_admin {
         Ok(user)
@@ -94,7 +96,7 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, Ap
 /// The write is already stored when this runs, so a failure only delays
 /// live sessions until their next registration; it is reported so the admin
 /// can retry, which is idempotent.
-async fn apply_live(state: &AppState) -> Result<(), ApiError> {
+pub(crate) async fn apply_live(state: &AppState) -> Result<(), ApiError> {
     match &state.runtime {
         Some(runtime) => runtime
             .limits_changed()
@@ -158,6 +160,8 @@ pub(crate) async fn list_users(
                 email: u.email,
                 is_admin: u.is_admin,
                 created_at_ms: u.created_at_ms,
+                must_change_password: u.must_change_password,
+                can_reserve_directly: u.can_reserve_directly,
                 overrides: u.overrides.into(),
                 effective: (!u.is_admin).then(|| defaults.with_overrides(&u.overrides).into()),
             })

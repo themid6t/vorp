@@ -90,6 +90,8 @@ pub struct UserLimitEntry {
     pub email: String,
     pub is_admin: bool,
     pub created_at_ms: i64,
+    pub must_change_password: bool,
+    pub can_reserve_directly: bool,
     pub overrides: LimitOverrides,
 }
 

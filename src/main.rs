@@ -54,7 +54,6 @@ struct TokenArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum SignupArg {
     Open,
-    Invite,
     Closed,
 }
 
@@ -62,7 +61,6 @@ impl From<SignupArg> for SignupMode {
     fn from(value: SignupArg) -> Self {
         match value {
             SignupArg::Open => Self::Open,
-            SignupArg::Invite => Self::Invite,
             SignupArg::Closed => Self::Closed,
         }
     }
@@ -231,7 +229,7 @@ async fn reset_password(args: ResetPasswordArgs) -> Result<()> {
     // the tracing log.
     writeln!(
         std::io::stdout().lock(),
-        "New password for {}: {password}\nAll of its sessions were ended. Change it from the dashboard after logging in.",
+        "New password for {}: {password}\nAll of its sessions were ended. The dashboard asks for a new password at the next login.",
         args.email.trim()
     )
     .context("print new password")?;

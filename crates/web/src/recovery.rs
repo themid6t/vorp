@@ -20,7 +20,7 @@ pub enum ResetError {
 
 /// Replaces the account's password with a fresh random one, ends all of its
 /// sessions, and returns the new password. The caller shows it once; it is
-/// never stored.
+/// never stored, and the dashboard makes the owner replace it at next login.
 pub async fn reset_password(repository: &Repository, email: &str) -> Result<String, ResetError> {
     let user = repository
         .user_by_email(email.trim())
@@ -30,7 +30,9 @@ pub async fn reset_password(repository: &Repository, email: &str) -> Result<Stri
     let hash = hash_password(&password)
         .await
         .map_err(|_: ApiError| ResetError::Hashing)?;
-    repository.update_password(user.id, &hash).await?;
+    // The printed password travels over a terminal; the owner replaces it at
+    // the next login.
+    repository.update_password(user.id, &hash, true).await?;
     Ok(password)
 }
 
@@ -58,6 +60,7 @@ mod tests {
                 email: "admin@example.test".into(),
                 password_hash: hash_password("forgotten password").await.expect("hash"),
                 is_admin: true,
+                must_change_password: false,
             })
             .await
             .expect("user");
@@ -83,6 +86,10 @@ mod tests {
         assert!(verify_password(&password, &stored.password_hash).await);
         assert!(!verify_password("forgotten password", &stored.password_hash).await);
         assert!(stored.is_admin, "reset must not change the role");
+        assert!(
+            stored.must_change_password,
+            "the printed password is temporary"
+        );
         assert!(
             repository
                 .session_by_id("live-session")

@@ -19,18 +19,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use vorp_store::{BindPolicy, NewSession, NewUser, Repository, RepositoryError, User};
+mod access;
 mod limits;
 mod quota;
 mod recovery;
+mod reservations;
+use access::set_user_access;
 use limits::{AuthLimiter, LimitError, MAX_TRAFFIC_STREAMS, traffic_stream_permit};
 use quota::{LimitsBody, default_limits, list_users, set_default_limits, set_user_limits};
 pub use recovery::{ResetError, reset_password};
+use reservations::{
+    approve_request, list_requests, list_reservations, reject_request, release, reserve,
+};
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignupMode {
     Open,
-    Invite,
     Closed,
 }
 #[derive(Debug, Clone)]
@@ -99,6 +104,10 @@ enum ApiError {
     Forbidden,
     Conflict,
     Invalid(&'static str),
+    /// A subdomain name is held by someone; the message says by whom.
+    Taken(&'static str),
+    /// The account must pick a new password before using anything else.
+    PasswordChangeRequired,
     Unavailable,
     TooManyRequests,
     Internal,
@@ -110,6 +119,8 @@ impl IntoResponse for ApiError {
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::Conflict => (StatusCode::CONFLICT, "conflict"),
             Self::Invalid(m) => (StatusCode::BAD_REQUEST, m),
+            Self::Taken(m) => (StatusCode::CONFLICT, m),
+            Self::PasswordChangeRequired => (StatusCode::FORBIDDEN, "password change required"),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "relay disconnect unavailable",
@@ -137,6 +148,7 @@ impl From<RepositoryError> for ApiError {
         match e {
             RepositoryError::Conflict => Self::Conflict,
             RepositoryError::Invalid(m) => Self::Invalid(m),
+            RepositoryError::NameTaken(conflict) => Self::Taken(conflict.message()),
             RepositoryError::NotFound => Self::Invalid("not found"),
             RepositoryError::Database(_) | RepositoryError::Random => Self::Internal,
         }
@@ -171,6 +183,7 @@ pub fn router_with_runtime(
         .route("/", get(index))
         .route("/dashboard.js", get(script))
         .route("/dashboard.css", get(stylesheet))
+        .route("/fonts/{name}", get(font))
         .route("/healthz", get(health))
         .route("/api/config", get(public_config))
         .route("/api/bootstrap", post(bootstrap))
@@ -180,7 +193,6 @@ pub fn router_with_runtime(
         .route("/api/me", get(me))
         .route("/api/password", post(change_password))
         .route("/api/users", post(create_user))
-        .route("/api/invites", post(mint_invite))
         .route("/api/tokens", get(list_tokens).post(mint_token))
         .route("/api/tokens/{id}/revoke", post(revoke_token))
         .route("/api/reservations", get(list_reservations).post(reserve))
@@ -194,6 +206,16 @@ pub fn router_with_runtime(
             get(default_limits).put(set_default_limits),
         )
         .route("/api/admin/users", get(list_users))
+        .route("/api/admin/users/{id}", axum::routing::put(set_user_access))
+        .route("/api/admin/reservation-requests", get(list_requests))
+        .route(
+            "/api/admin/reservation-requests/{name}/approve",
+            post(approve_request),
+        )
+        .route(
+            "/api/admin/reservation-requests/{name}/reject",
+            post(reject_request),
+        )
         .route(
             "/api/admin/users/{id}/limits",
             axum::routing::put(set_user_limits),
@@ -268,11 +290,12 @@ async fn stream_traffic(
     );
     Ok(Sse::new(stream))
 }
-/// Scripts and styles load only from this origin, so injected markup cannot run inline code.
+/// Scripts, styles and fonts load only from this origin, so injected markup
+/// cannot run inline code. `data:` images are the stylesheet's inline grain texture.
 const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-     connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \
-     frame-ancestors 'none'";
-fn asset(content_type: &'static str, body: &'static str) -> Response {
+     font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; \
+     form-action 'none'; frame-ancestors 'none'";
+fn asset(content_type: &'static str, body: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
@@ -286,16 +309,26 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
         .into_response()
 }
 async fn index() -> Response {
-    asset("text/html; charset=utf-8", include_str!("dashboard.html"))
+    asset("text/html; charset=utf-8", include_bytes!("dashboard.html"))
 }
 async fn script() -> Response {
     asset(
         "text/javascript; charset=utf-8",
-        include_str!("dashboard.js"),
+        include_bytes!("dashboard.js"),
     )
 }
 async fn stylesheet() -> Response {
-    asset("text/css; charset=utf-8", include_str!("dashboard.css"))
+    asset("text/css; charset=utf-8", include_bytes!("dashboard.css"))
+}
+/// The dashboard's embedded fonts (SIL OFL 1.1, see `fonts/OFL.txt`).
+async fn font(Path(name): Path<String>) -> Response {
+    let body: &'static [u8] = match name.as_str() {
+        "instrument-serif-400.woff2" => include_bytes!("fonts/instrument-serif-400.woff2"),
+        "ibm-plex-mono-400.woff2" => include_bytes!("fonts/ibm-plex-mono-400.woff2"),
+        "ibm-plex-mono-500.woff2" => include_bytes!("fonts/ibm-plex-mono-500.woff2"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    asset("font/woff2", body)
 }
 #[derive(Serialize)]
 struct ConfigBody {
@@ -313,7 +346,6 @@ async fn public_config(State(state): State<AppState>) -> Result<Json<ConfigBody>
     Ok(Json(ConfigBody {
         signup_mode: match state.config.signup_mode {
             SignupMode::Open => "open",
-            SignupMode::Invite => "invite",
             SignupMode::Closed => "closed",
         },
         needs_bootstrap: users == 0,
@@ -380,7 +412,17 @@ fn cookie_session(headers: &HeaderMap) -> Option<&str> {
         .split(';')
         .find_map(|pair| pair.trim().strip_prefix("vorp_session="))
 }
+/// The signed-in user, refusing an account that must first change its password.
 async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+    let user = session_user(state, headers).await?;
+    if user.must_change_password {
+        return Err(ApiError::PasswordChangeRequired);
+    }
+    Ok(user)
+}
+/// The signed-in user, even one that must change its password. Only `me` and
+/// the password change itself use this.
+async fn session_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let id = cookie_session(headers).ok_or(ApiError::Unauthorized)?;
     let session = state
         .repository
@@ -439,8 +481,6 @@ struct OkBody {
 struct Credentials {
     email: String,
     password: String,
-    #[serde(default)]
-    invite_code: Option<String>,
 }
 async fn bootstrap(
     State(state): State<AppState>,
@@ -469,36 +509,21 @@ async fn signup(
     if state.config.signup_mode == SignupMode::Closed {
         return Err(ApiError::Forbidden);
     }
-    if state.config.signup_mode == SignupMode::Invite && input.invite_code.is_none() {
-        return Err(ApiError::Invalid("invite code required"));
-    }
     let _auth_permit = state
         .auth_limiter
         .admit(&input.email)
         .map_err(ApiError::from)?;
     let hash = hash_password(&input.password).await?;
-    let user_input = NewUser {
-        email: input.email,
-        password_hash: hash,
-        is_admin: false,
-    };
-    let user = match state.config.signup_mode {
-        SignupMode::Open => state.repository.create_user(user_input).await,
-        SignupMode::Invite => {
-            state
-                .repository
-                .create_user_with_invite(
-                    user_input,
-                    input
-                        .invite_code
-                        .as_deref()
-                        .ok_or(ApiError::Invalid("invite code required"))?,
-                )
-                .await
-        }
-        SignupMode::Closed => return Err(ApiError::Forbidden),
-    }
-    .map_err(ApiError::from)?;
+    let user = state
+        .repository
+        .create_user(NewUser {
+            email: input.email,
+            password_hash: hash,
+            is_admin: false,
+            must_change_password: false,
+        })
+        .await
+        .map_err(ApiError::from)?;
     issue_session(&state, user.id).await
 }
 async fn login(
@@ -551,12 +576,14 @@ struct MeWithLimitsBody {
     user: MeBody,
     /// `null` for an admin, who is exempt from every quota.
     limits: Option<LimitsBody>,
+    must_change_password: bool,
+    can_reserve_directly: bool,
 }
 async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MeWithLimitsBody>, ApiError> {
-    let u = current_user(&state, &headers).await?;
+    let u = session_user(&state, &headers).await?;
     let limits = state
         .repository
         .effective_limits(u.id)
@@ -570,6 +597,8 @@ async fn me(
             assigned_subdomain: u.assigned_subdomain,
         },
         limits: limits.map(LimitsBody::from),
+        must_change_password: u.must_change_password,
+        can_reserve_directly: u.is_admin || u.can_reserve_directly,
     }))
 }
 #[derive(Deserialize)]
@@ -583,7 +612,7 @@ async fn change_password(
     Json(input): Json<PasswordInput>,
 ) -> Result<Response, ApiError> {
     mutating_request(&headers)?;
-    let u = current_user(&state, &headers).await?;
+    let u = session_user(&state, &headers).await?;
     let _auth_permit = state.auth_limiter.admit(&u.email).map_err(ApiError::from)?;
     if !verify_password(&input.old_password, &u.password_hash).await {
         return Err(ApiError::Unauthorized);
@@ -591,7 +620,7 @@ async fn change_password(
     let hash = hash_password(&input.new_password).await?;
     state
         .repository
-        .update_password(u.id, &hash)
+        .update_password(u.id, &hash, false)
         .await
         .map_err(ApiError::from)?;
     let mut response = Json(OkBody { ok: true }).into_response();
@@ -622,6 +651,8 @@ async fn create_user(
             email: input.email,
             password_hash: hash,
             is_admin: false,
+            // The admin chose this password, so the user replaces it first.
+            must_change_password: true,
         })
         .await
         .map_err(ApiError::from)?;
@@ -630,27 +661,6 @@ async fn create_user(
         email: u.email,
         is_admin: false,
         assigned_subdomain: None,
-    }))
-}
-#[derive(Serialize)]
-struct InviteBody {
-    invite_code: String,
-}
-async fn mint_invite(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<InviteBody>, ApiError> {
-    mutating_request(&headers)?;
-    let admin = current_user(&state, &headers).await?;
-    if !admin.is_admin {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(Json(InviteBody {
-        invite_code: state
-            .repository
-            .mint_invite(admin.id)
-            .await
-            .map_err(ApiError::from)?,
     }))
 }
 #[derive(Serialize)]
@@ -748,59 +758,6 @@ async fn revoke_token(
         .await
         .map_err(|_| ApiError::Unavailable)?;
     Ok(Json(OkBody { ok: true }))
-}
-#[derive(Serialize)]
-struct ReservationBody {
-    name: String,
-}
-async fn list_reservations(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ReservationBody>>, ApiError> {
-    let u = current_user(&state, &headers).await?;
-    Ok(Json(
-        state
-            .repository
-            .reservations_for_user(u.id)
-            .await
-            .map_err(ApiError::from)?
-            .into_iter()
-            .map(|r| ReservationBody { name: r.name })
-            .collect(),
-    ))
-}
-#[derive(Deserialize)]
-struct ReserveInput {
-    name: String,
-}
-async fn reserve(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<ReserveInput>,
-) -> Result<Json<ReservationBody>, ApiError> {
-    mutating_request(&headers)?;
-    let u = current_user(&state, &headers).await?;
-    let r = state
-        .repository
-        .reserve_subdomain(&input.name, u.id)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(ReservationBody { name: r.name }))
-}
-async fn release(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<Json<OkBody>, ApiError> {
-    mutating_request(&headers)?;
-    let u = current_user(&state, &headers).await?;
-    Ok(Json(OkBody {
-        ok: state
-            .repository
-            .release_subdomain(&name, u.id)
-            .await
-            .map_err(ApiError::from)?,
-    }))
 }
 
 #[cfg(test)]
@@ -913,7 +870,7 @@ mod tests {
     #[tokio::test]
     async fn api_requires_session_and_scopes_tokens_and_reservations() {
         let repository = repo().await;
-        let router = router(repository, config());
+        let router = router(repository.clone(), config());
         for path in [
             "/api/me",
             "/api/tokens",
@@ -929,6 +886,16 @@ mod tests {
         }
         let alice = account(&router, "alice@example.test").await;
         let bob = account(&router, "bob@example.test").await;
+        let alice_id = repository
+            .user_by_email("alice@example.test")
+            .await
+            .expect("lookup")
+            .expect("alice")
+            .id;
+        repository
+            .set_user_access(alice_id, false, true)
+            .await
+            .expect("direct reservation");
         let response = router
             .clone()
             .oneshot(req(
@@ -1074,17 +1041,9 @@ mod tests {
         }
         assert_eq!(counter.0.load(Ordering::SeqCst), 2);
     }
-    #[tokio::test]
-    async fn invite_signup_requires_admin_issued_single_use_code() {
-        let repository = repo().await;
-        let router = router(
-            repository,
-            WebConfig {
-                signup_mode: SignupMode::Invite,
-                ..config()
-            },
-        );
-        let bootstrap = router
+    /// Bootstraps an admin and returns its session cookie.
+    async fn admin(router: &Router) -> String {
+        let response = router
             .clone()
             .oneshot(req(
                 Method::POST,
@@ -1094,41 +1053,175 @@ mod tests {
             ))
             .await
             .expect("bootstrap");
-        assert_eq!(bootstrap.status(), StatusCode::OK);
-        let cookie = session_cookie_from(&bootstrap);
-        let denied = router
+        assert_eq!(response.status(), StatusCode::OK);
+        session_cookie_from(&response)
+    }
+    async fn login(router: &Router, email: &str, password: &str) -> String {
+        let body = serde_json::json!({"email":email,"password":password}).to_string();
+        let response = router
             .clone()
-            .oneshot(req(
+            .oneshot(req(Method::POST, "/api/login", &body, None))
+            .await
+            .expect("login");
+        assert_eq!(response.status(), StatusCode::OK);
+        session_cookie_from(&response)
+    }
+    #[tokio::test]
+    async fn closed_signup_is_refused() {
+        let router = router(
+            repo().await,
+            WebConfig {
+                signup_mode: SignupMode::Closed,
+                ..config()
+            },
+        );
+        let body = r#"{"email":"new@example.test","password":"long enough password"}"#;
+        let (status, _) = json(&router, req(Method::POST, "/api/signup", body, None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    #[tokio::test]
+    async fn admin_created_user_must_change_password_first() {
+        let router = router(repo().await, config());
+        let admin = admin(&router).await;
+        let body = r#"{"email":"bob@example.test","password":"chosen by admin"}"#;
+        let (status, _) = json(&router, req(Method::POST, "/api/users", body, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let bob = login(&router, "bob@example.test", "chosen by admin").await;
+        let (status, me) = json(&router, req(Method::GET, "/api/me", "", Some(&bob))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(me["must_change_password"], true);
+        for path in ["/api/tokens", "/api/reservations", "/api/tunnels"] {
+            let (status, body) = json(&router, req(Method::GET, path, "", Some(&bob))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["error"], "password change required", "{path}");
+        }
+        let change = r#"{"old_password":"chosen by admin","new_password":"bob's own password"}"#;
+        let (status, _) = json(
+            &router,
+            req(Method::POST, "/api/password", change, Some(&bob)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let bob = login(&router, "bob@example.test", "bob's own password").await;
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&bob))).await;
+        assert_eq!(me["must_change_password"], false);
+        let (status, _) = json(&router, req(Method::GET, "/api/tokens", "", Some(&bob))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn reservations_need_approval_unless_allowed_directly() {
+        let router = router(repo().await, config());
+        let admin = admin(&router).await;
+        let alice = account(&router, "alice@example.test").await;
+        let bob = account(&router, "bob@example.test").await;
+        let reserve = |cookie: &str, name: &str| {
+            req(
                 Method::POST,
-                "/api/signup",
-                r#"{"email":"new@example.test","password":"long enough password"}"#,
-                None,
-            ))
-            .await
-            .expect("signup");
-        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
-        let issued = router
-            .clone()
-            .oneshot(req(Method::POST, "/api/invites", "", Some(&cookie)))
-            .await
-            .expect("invite");
-        assert_eq!(issued.status(), StatusCode::OK);
-        let bytes = to_bytes(issued.into_body(), 16 * 1024).await.expect("body");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let code = value["invite_code"].as_str().expect("code");
-        let body=serde_json::json!({"email":"new@example.test","password":"long enough password","invite_code":code}).to_string();
-        let signup = router
-            .clone()
-            .oneshot(req(Method::POST, "/api/signup", &body, None))
-            .await
-            .expect("signup");
-        assert_eq!(signup.status(), StatusCode::OK);
-        let second = router
-            .clone()
-            .oneshot(req(Method::POST, "/api/signup", &body, None))
-            .await
-            .expect("second");
-        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+                "/api/reservations",
+                &serde_json::json!({ "name": name }).to_string(),
+                Some(cookie),
+            )
+        };
+        let (status, body) = json(&router, reserve(&alice, "Demo")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"name":"demo","status":"pending"}));
+        let (status, body) = json(&router, reserve(&bob, "demo")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "another user has already requested this name"
+        );
+        let (status, _) = json(
+            &router,
+            req(
+                Method::GET,
+                "/api/admin/reservation-requests",
+                "",
+                Some(&alice),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, pending) = json(
+            &router,
+            req(
+                Method::GET,
+                "/api/admin/reservation-requests",
+                "",
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(pending[0]["email"], "alice@example.test");
+        let approve = "/api/admin/reservation-requests/demo/approve";
+        let (status, _) = json(&router, req(Method::POST, approve, "", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, mine) = json(
+            &router,
+            req(Method::GET, "/api/reservations", "", Some(&alice)),
+        )
+        .await;
+        assert_eq!(
+            mine,
+            serde_json::json!([{"name":"demo","status":"reserved"}])
+        );
+        let (status, body) = json(&router, reserve(&bob, "demo")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "this name is already reserved by another user"
+        );
+
+        let (_, users) = json(
+            &router,
+            req(Method::GET, "/api/admin/users", "", Some(&admin)),
+        )
+        .await;
+        let bob_id = users
+            .as_array()
+            .expect("users")
+            .iter()
+            .find(|u| u["email"] == "bob@example.test")
+            .expect("bob")["id"]
+            .clone();
+        let access = format!("/api/admin/users/{bob_id}");
+        let body = r#"{"is_admin":false,"can_reserve_directly":true}"#;
+        let (status, _) = json(&router, req(Method::PUT, &access, body, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = json(&router, reserve(&bob, "fast")).await;
+        assert_eq!(body["status"], "reserved");
+    }
+    #[tokio::test]
+    async fn admin_promotes_users_but_not_demotes_self() {
+        let runtime = Arc::new(EmptyRuntime::default());
+        let router = router_with_runtime(repo().await, config(), None, Some(runtime.clone()));
+        let admin = admin(&router).await;
+        let bob = account(&router, "bob@example.test").await;
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&bob))).await;
+        let promote = format!("/api/admin/users/{}", me["id"]);
+        let body = r#"{"is_admin":true,"can_reserve_directly":false}"#;
+        let (status, _) = json(&router, req(Method::PUT, &promote, body, Some(&bob))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = json(&router, req(Method::PUT, &promote, body, Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            runtime.0.load(Ordering::SeqCst),
+            1,
+            "live limits re-applied"
+        );
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&bob))).await;
+        assert_eq!(
+            (me["is_admin"].clone(), me["limits"].clone()),
+            (true.into(), serde_json::Value::Null)
+        );
+        let (_, admin_me) = json(&router, req(Method::GET, "/api/me", "", Some(&admin))).await;
+        let demote_self = format!("/api/admin/users/{}", admin_me["id"]);
+        let body = r#"{"is_admin":false,"can_reserve_directly":false}"#;
+        let (status, _) = json(&router, req(Method::PUT, &demote_self, body, Some(&admin))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // The promoted admin may demote the first one.
+        let (status, _) = json(&router, req(Method::PUT, &demote_self, body, Some(&bob))).await;
+        assert_eq!(status, StatusCode::OK);
     }
     #[tokio::test]
     async fn login_rate_limit_returns_429() {
@@ -1323,6 +1416,7 @@ mod tests {
             ("/", "text/html"),
             ("/dashboard.js", "text/javascript"),
             ("/dashboard.css", "text/css"),
+            ("/fonts/ibm-plex-mono-400.woff2", "font/woff2"),
         ] {
             let response = router
                 .clone()
@@ -1352,5 +1446,16 @@ mod tests {
                 "{path}"
             );
         }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/fonts/missing.woff2")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
