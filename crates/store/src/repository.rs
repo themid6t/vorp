@@ -8,6 +8,8 @@ use std::{
 use subtle::ConstantTimeEq;
 use vorp_protocol::valid_subdomain;
 
+use crate::{LimitOverrides, UserLimitEntry, UserLimits};
+
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
     #[error("database operation failed: {0}")]
@@ -109,7 +111,14 @@ CREATE TABLE IF NOT EXISTS token_allowlist(token_id INTEGER NOT NULL REFERENCES 
 CREATE TABLE IF NOT EXISTS reserved_subdomains(name TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS reservations_user ON reserved_subdomains(user_id);
 CREATE TABLE IF NOT EXISTS signup_invites(id INTEGER PRIMARY KEY,created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,code_hash BLOB NOT NULL UNIQUE CHECK(length(code_hash)=32),created_at_ms INTEGER NOT NULL,used_at_ms INTEGER);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);";
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS user_limits(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,max_tunnels INTEGER CHECK(max_tunnels>0),bandwidth_bytes_per_sec INTEGER CHECK(bandwidth_bytes_per_sec>0),max_concurrent_requests INTEGER CHECK(max_concurrent_requests>0));";
+
+const LIMIT_KEYS: [&str; 3] = [
+    "limits.max_tunnels",
+    "limits.bandwidth_bytes_per_sec",
+    "limits.max_concurrent_requests",
+];
 
 fn map_db(e: rusqlite::Error) -> RepositoryError {
     match &e {
@@ -173,6 +182,49 @@ fn token_row(
         bind_policy: BindPolicy::parse(&row.3)?,
         allowlist,
         revoked_at_ms: row.4,
+    })
+}
+fn default_limits_in(c: &Connection) -> Result<UserLimits, RepositoryError> {
+    let mut limits = UserLimits::DEFAULT;
+    let mut s = c
+        .prepare("SELECT key,value FROM settings WHERE key IN (?,?,?)")
+        .map_err(map_db)?;
+    let rows = s
+        .query_map(LIMIT_KEYS, |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(map_db)?;
+    for row in rows {
+        let (key, value) = row.map_err(map_db)?;
+        let invalid = || RepositoryError::Invalid("stored default limit");
+        match key.as_str() {
+            "limits.max_tunnels" => limits.max_tunnels = value.parse().map_err(|_| invalid())?,
+            "limits.bandwidth_bytes_per_sec" => {
+                limits.bandwidth_bytes_per_sec = value.parse().map_err(|_| invalid())?;
+            }
+            _ => limits.max_concurrent_requests = value.parse().map_err(|_| invalid())?,
+        }
+    }
+    limits.validate()?;
+    Ok(limits)
+}
+fn overrides_in(c: &Connection, user_id: i64) -> Result<LimitOverrides, RepositoryError> {
+    c.query_row(
+        "SELECT max_tunnels,bandwidth_bytes_per_sec,max_concurrent_requests FROM user_limits WHERE user_id=?",
+        [user_id],
+        |r| overrides_at(r, 0),
+    )
+    .optional()
+    .map_err(map_db)
+    .map(Option::unwrap_or_default)
+}
+/// Reads the three `user_limits` value columns starting at column `first`.
+fn overrides_at(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<LimitOverrides> {
+    Ok(LimitOverrides {
+        max_tunnels: r.get(first)?,
+        // The column CHECK keeps stored bandwidth positive.
+        bandwidth_bytes_per_sec: r.get::<_, Option<i64>>(first + 1)?.map(i64::cast_unsigned),
+        max_concurrent_requests: r.get(first + 2)?,
     })
 }
 impl Repository {
@@ -651,6 +703,113 @@ impl Repository {
         })
         .await
     }
+    /// The deployment-wide defaults, falling back to `UserLimits::DEFAULT` for
+    /// any value an admin has not stored.
+    pub async fn default_limits(&self) -> Result<UserLimits, RepositoryError> {
+        self.run(|c| default_limits_in(c)).await
+    }
+    pub async fn set_default_limits(&self, limits: UserLimits) -> Result<(), RepositoryError> {
+        limits.validate()?;
+        self.run(move |c| {
+            let tx = c.transaction().map_err(map_db)?;
+            let values = [
+                limits.max_tunnels.to_string(),
+                limits.bandwidth_bytes_per_sec.to_string(),
+                limits.max_concurrent_requests.to_string(),
+            ];
+            for (key, value) in LIMIT_KEYS.iter().zip(values) {
+                tx.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![key, value],
+                )
+                .map_err(map_db)?;
+            }
+            tx.commit().map_err(map_db)
+        })
+        .await
+    }
+    /// Replaces a user's overrides; all-`None` removes them so the user
+    /// follows the defaults again.
+    pub async fn set_limit_overrides(
+        &self,
+        user_id: i64,
+        overrides: LimitOverrides,
+    ) -> Result<(), RepositoryError> {
+        overrides.validate()?;
+        self.run(move |c| {
+            let exists: bool = c
+                .query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?)", [user_id], |r| {
+                    r.get(0)
+                })
+                .map_err(map_db)?;
+            if !exists {
+                return Err(RepositoryError::NotFound);
+            }
+            if overrides.is_empty() {
+                c.execute("DELETE FROM user_limits WHERE user_id=?", [user_id])
+                    .map_err(map_db)?;
+                return Ok(());
+            }
+            // validate() bounded bandwidth to i64.
+            let bandwidth = overrides.bandwidth_bytes_per_sec.map(u64::cast_signed);
+            c.execute(
+                "INSERT INTO user_limits(user_id,max_tunnels,bandwidth_bytes_per_sec,max_concurrent_requests) VALUES(?,?,?,?)
+                 ON CONFLICT(user_id) DO UPDATE SET max_tunnels=excluded.max_tunnels,bandwidth_bytes_per_sec=excluded.bandwidth_bytes_per_sec,max_concurrent_requests=excluded.max_concurrent_requests",
+                params![user_id, overrides.max_tunnels, bandwidth, overrides.max_concurrent_requests],
+            )
+            .map_err(map_db)?;
+            Ok(())
+        })
+        .await
+    }
+    /// The limits that apply to a user, or `None` for an admin, who is exempt
+    /// from every quota.
+    pub async fn effective_limits(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<UserLimits>, RepositoryError> {
+        self.run(move |c| {
+            let is_admin: bool = c
+                .query_row("SELECT is_admin FROM users WHERE id=?", [user_id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(map_db)?
+                .ok_or(RepositoryError::NotFound)?;
+            if is_admin {
+                return Ok(None);
+            }
+            Ok(Some(
+                default_limits_in(c)?.with_overrides(&overrides_in(c, user_id)?),
+            ))
+        })
+        .await
+    }
+    /// Every user with their overrides, for the admin dashboard. The caller
+    /// must have checked that the requester is an admin.
+    pub async fn users_with_limits(&self) -> Result<Vec<UserLimitEntry>, RepositoryError> {
+        self.run(|c| {
+            let mut s = c
+                .prepare(
+                    "SELECT u.id,u.email,u.is_admin,u.created_at_ms,l.max_tunnels,l.bandwidth_bytes_per_sec,l.max_concurrent_requests
+                     FROM users u LEFT JOIN user_limits l ON l.user_id=u.id ORDER BY u.id",
+                )
+                .map_err(map_db)?;
+            s.query_map([], |r| {
+                Ok(UserLimitEntry {
+                    user_id: r.get(0)?,
+                    email: r.get(1)?,
+                    is_admin: r.get(2)?,
+                    created_at_ms: r.get(3)?,
+                    overrides: overrides_at(r, 4)?,
+                })
+            })
+            .map_err(map_db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_db)
+        })
+        .await
+    }
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), RepositoryError> {
         let (k, v) = (key.to_owned(), value.to_owned());
         self.run(move|c|{c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![k,v]).map_err(map_db)?;Ok(())}).await
@@ -819,5 +978,85 @@ mod tests {
             r.create_user_with_invite(user, &invite).await,
             Err(RepositoryError::Invalid(_))
         ));
+    }
+    #[tokio::test]
+    async fn limits_resolve_defaults_overrides_and_admin_exemption() {
+        let r = repo().await;
+        let a = user(&r, "a@x.test").await;
+        let admin = r.bootstrap_admin_for_test().await;
+        assert_eq!(
+            r.default_limits().await.expect("defaults"),
+            UserLimits::DEFAULT
+        );
+        assert_eq!(
+            r.effective_limits(a.id).await.expect("limits"),
+            Some(UserLimits::DEFAULT)
+        );
+        assert_eq!(r.effective_limits(admin).await.expect("admin"), None);
+        assert!(matches!(
+            r.effective_limits(9_999).await,
+            Err(RepositoryError::NotFound)
+        ));
+
+        let defaults = UserLimits {
+            max_tunnels: 5,
+            bandwidth_bytes_per_sec: 1_000,
+            max_concurrent_requests: 8,
+        };
+        r.set_default_limits(defaults).await.expect("set defaults");
+        let overrides = LimitOverrides {
+            max_tunnels: Some(1),
+            ..LimitOverrides::default()
+        };
+        r.set_limit_overrides(a.id, overrides)
+            .await
+            .expect("override");
+        assert_eq!(
+            r.effective_limits(a.id).await.expect("limits"),
+            Some(UserLimits {
+                max_tunnels: 1,
+                ..defaults
+            })
+        );
+        let listed = r.users_with_limits().await.expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!((listed[0].user_id, listed[0].overrides), (a.id, overrides));
+        assert!(listed[1].is_admin);
+        assert_eq!(listed[1].overrides, LimitOverrides::default());
+
+        r.set_limit_overrides(a.id, LimitOverrides::default())
+            .await
+            .expect("clear");
+        assert_eq!(
+            r.effective_limits(a.id).await.expect("limits"),
+            Some(defaults)
+        );
+        assert!(matches!(
+            r.set_limit_overrides(9_999, overrides).await,
+            Err(RepositoryError::NotFound)
+        ));
+        assert!(matches!(
+            r.set_limit_overrides(
+                a.id,
+                LimitOverrides {
+                    max_tunnels: Some(0),
+                    ..LimitOverrides::default()
+                }
+            )
+            .await,
+            Err(RepositoryError::Invalid(_))
+        ));
+    }
+    impl Repository {
+        async fn bootstrap_admin_for_test(&self) -> i64 {
+            self.create_user(NewUser {
+                email: "admin@x.test".into(),
+                password_hash: "hash".into(),
+                is_admin: true,
+            })
+            .await
+            .expect("admin")
+            .id
+        }
     }
 }

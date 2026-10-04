@@ -524,6 +524,20 @@ async fn tunnel_lifecycle(
                 }
             }
             Message::TunnelErr {
+                code: ErrorCode::TunnelLimit,
+                ..
+            } => {
+                tracing::error!(
+                    subdomain = requested.as_deref().unwrap_or(""),
+                    "relay rejected tunnel: your account's tunnel limit is reached; close another tunnel or ask an admin to raise it"
+                );
+                suppressed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(index);
+                return Ok(());
+            }
+            Message::TunnelErr {
                 code:
                     code @ (ErrorCode::SubdomainTaken
                     | ErrorCode::SubdomainInvalid

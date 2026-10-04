@@ -21,7 +21,7 @@ use yamux::{Connection, Mode, Stream};
 use crate::{
     Relay,
     authz::{self, BindContext},
-    registry::{Session, Tunnel, TunnelLimits},
+    registry::{Session, Tunnel, TunnelInsertError, TunnelLimits},
     subdomain,
 };
 
@@ -116,11 +116,13 @@ impl Relay {
                 return Err(SessionError::InvalidHandshake);
             }
         };
+        let limits = self.user_limits(credential.user_id).await?;
         let session = Arc::new(Session {
             id: random_session_id()?,
             key: (credential.user_id, machine_id),
             token_id: credential.token_id,
             user_id: credential.user_id,
+            budget: self.state.registry.budget(credential.user_id, limits),
             cancel: self.state.shutdown.child_token(),
             open,
             teardown_started: AtomicBool::new(false),
@@ -233,6 +235,18 @@ impl Relay {
             token_id: Some(record.id),
             record: Some(record),
         }))
+    }
+
+    /// The user's quota, or `None` when exempt: admins, and development-token
+    /// sessions, which have no account.
+    async fn user_limits(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<vorp_store::UserLimits>, SessionError> {
+        match &self.state.repository {
+            Some(repository) => Ok(repository.effective_limits(user_id).await?),
+            None => Ok(None),
+        }
     }
 
     /// Why a tunnel ends with its session. A relay shutdown (a deploy or
@@ -397,7 +411,7 @@ impl Relay {
                     TunnelLimits::from(&self.state.config.limits),
                     subdomain::generate_slug,
                 )
-                .map_err(|error| (ErrorCode::StreamError, error.to_string()));
+                .map_err(tunnel_rejection);
         }
         let tunnel = Arc::new(Tunnel::new(
             Arc::clone(session),
@@ -405,12 +419,21 @@ impl Relay {
             upstream_hint,
             TunnelLimits::from(&self.state.config.limits),
         ));
-        if self.state.registry.insert_named_tunnel(Arc::clone(&tunnel)) {
-            Ok(tunnel)
-        } else {
-            Err((ErrorCode::SubdomainTaken, "subdomain already in use".into()))
-        }
+        self.state
+            .registry
+            .insert_named_tunnel(Arc::clone(&tunnel))
+            .map(|()| tunnel)
+            .map_err(tunnel_rejection)
     }
+}
+
+fn tunnel_rejection(error: TunnelInsertError) -> (ErrorCode, String) {
+    let code = match error {
+        TunnelInsertError::Taken => ErrorCode::SubdomainTaken,
+        TunnelInsertError::LimitReached => ErrorCode::TunnelLimit,
+        TunnelInsertError::Slug(_) => ErrorCode::StreamError,
+    };
+    (code, error.to_string())
 }
 
 struct DriverTask {

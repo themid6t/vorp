@@ -17,6 +17,7 @@ and columns below are the contract; migration SQL is owned by the store crate.
 | `token_allowlist` | `token_id INTEGER NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `PRIMARY KEY (token_id,name)` |
 | `reserved_subdomains` | `name TEXT PRIMARY KEY`, `user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at_ms INTEGER NOT NULL`; index on `user_id` |
 | `settings` | `key TEXT PRIMARY KEY`, `value TEXT NOT NULL` for optional persisted deployment settings; signup mode currently comes from the relay CLI |
+| `user_limits` | `user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE`, nullable `max_tunnels`, `bandwidth_bytes_per_sec`, `max_concurrent_requests` (each `CHECK (>0)`); an admin's per-user quota overrides, where `NULL` inherits the default |
 | `signup_invites` | `id INTEGER PRIMARY KEY`, `created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `code_hash BLOB NOT NULL UNIQUE CHECK(length(code_hash)=32)`, `created_at_ms INTEGER NOT NULL`, `used_at_ms INTEGER`; one-time admin-created invite codes |
 
 Bind policy follows the legacy `decideBind` decision table: `any` permits
@@ -66,6 +67,16 @@ admin methods added in this module, never a fetch-then-filter in a handler.
 The store workstream may extend these signatures alongside a schema doc update.
 
 ## Implemented extensions
+
+Per-user quotas: `default_limits` returns the deployment-wide defaults, stored
+in `settings` under `limits.max_tunnels`, `limits.bandwidth_bytes_per_sec`
+and `limits.max_concurrent_requests`, falling back to `UserLimits::DEFAULT`
+(3 tunnels, 10 MiB/s, 64 requests). `set_default_limits` writes all three.
+`set_limit_overrides(user_id, overrides)` replaces a user's overrides, and
+all-`None` deletes the row. `effective_limits(user_id)` merges the two and
+returns `None` for an admin, who is exempt. `users_with_limits` lists every
+user with their overrides for the admin dashboard; the handler checks the
+caller is an admin. Every value must be at least 1.
 
 `user_by_id`, `user_count`, and transactional `bootstrap_admin` support local
 account setup. `update_password` changes the hash and deletes all of that user's

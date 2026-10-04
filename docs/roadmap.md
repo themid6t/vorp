@@ -192,6 +192,64 @@ remain.
 
 ---
 
+## Production cutover gates
+
+These gates are for replacing the running Go relay. They are ordered by what
+must be learned or built first. Passing staging smoke tests alone does not
+clear them.
+
+1. **No migration (decided).** The Go relay has a single user, so nothing is
+   imported. Production starts from an empty database: bootstrap a new admin,
+   mint new agent tokens, re-reserve any names, and switch agents to the
+   `vorp-agent/1` binary. No migration tooling is needed.
+2. **Fresh edge and protocol review.** Recheck the October 1 implementation
+   review in the local `review/` directory against current code: later commits
+   fixed several high-priority items, so the review is a starting list, not a
+   current defect count. Set an explicit request-body size policy, settle idle
+   WebSocket behavior and multiple agents sharing a machine identity, and
+   close any remaining protocol-state or resource-boundary gaps found in that
+   pass. Add focused regression tests for each confirmed defect.
+3. **Representative staging exercise.** Test large streamed uploads and
+   downloads, SSE, WebSocket upgrades and rejected handshakes, reconnects,
+   token revocation, slow or malformed requests, and sustained concurrency.
+   Record throughput, memory, connection counts, and failure behavior on a
+   host sized like production; the tiny staging instance and existing smoke
+   tests alone do not establish production capacity.
+4. **Data recovery and operations.** Put SQLite on persistent storage, take
+   scheduled consistent backups, and restore one into a fresh instance.
+   Define retention, integrity checks, monitoring/alerts, and the response to
+   a failed certificate renewal or unhealthy relay. Test schema migration and
+   rollback together: reverting only the binary may not undo a database
+   migration. See [certificate operations](certificates.md) for the current
+   external renewal path.
+5. **Production release automation.** Implement the annotated-version-tag
+   workflow in [releases.md](releases.md). Verify that the tagged commit passed
+   CI and staging, fetch the exact staged artifact, verify its checksum, and
+   deploy with production-only credentials. Add health verification and a
+   workflow to redeploy a previous released artifact. Account for the current
+   30-day staging-artifact retention period and restrict who can create or move
+   release tags before enabling automatic production deployment.
+6. **Switch.** Verify production host architecture, access, DNS, TLS,
+   storage, and observability. Keep the Go service available as the rollback
+   target until the new relay has run cleanly, then change production DNS and
+   enable the tag deployment.
+
+**First task for the next session:** use gate 2's fresh review to select the
+next code changes.
+
+### Open-source one-shot release after the cutover
+
+The current [Certbot and Cloudflare procedure](certificates.md) can provide a
+production certificate, so built-in ACME is not required to replace the Go
+relay. It *is* required for the intended one-shot self-hosted experience.
+Complete the remaining M3 integration work (built-in ACME DNS-01 renewal,
+agent sidecar probes where Kubernetes is supported, `install-service`, and
+`doctor`) and M4 distribution work (container image, Compose, Helm,
+multi-architecture binaries, signed release manifest, and installer) before
+calling the open-source distribution complete.
+
+---
+
 ## Parallelism map
 
 ```

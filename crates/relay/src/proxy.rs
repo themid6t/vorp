@@ -14,7 +14,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::{
-    io::AsyncWrite,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, mpsc, oneshot, watch},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -25,26 +25,32 @@ use vorp_protocol::{
 
 use crate::{
     Relay, State, httpnorm,
-    registry::TunnelPermit,
+    quota::{RequestSlot, UserBudget},
+    registry::{Session, TunnelPermit},
     server::{overloaded, status},
 };
 
 type RelayStream = tokio_util::compat::Compat<yamux::Stream>;
 type BodySender = mpsc::Sender<Result<Bytes, io::Error>>;
 
-struct WebSocketBudget {
+/// Buffer for one WebSocket read; a fixed small window, not a message buffer.
+const WEBSOCKET_COPY_BUFFER: usize = 16 * 1024;
+
+struct WebSocketPermits {
     request: TunnelPermit,
     global_request: OwnedSemaphorePermit,
+    user_request: RequestSlot,
     websocket_limit: Arc<tokio::sync::Semaphore>,
     tunnel: Arc<crate::registry::Tunnel>,
 }
 
-impl WebSocketBudget {
+impl WebSocketPermits {
     fn upgrade(self) -> Option<(OwnedSemaphorePermit, crate::registry::WebSocketPermit)> {
         let global = self.websocket_limit.try_acquire_owned().ok()?;
         let tunnel = self.tunnel.try_acquire_websocket()?;
         drop(self.request);
         drop(self.global_request);
+        drop(self.user_request);
         Some((global, tunnel))
     }
 }
@@ -53,6 +59,7 @@ impl WebSocketBudget {
 struct RequestPermits {
     _tunnel: TunnelPermit,
     _global: OwnedSemaphorePermit,
+    _user: RequestSlot,
 }
 
 struct TrafficMeta {
@@ -89,6 +96,11 @@ impl Relay {
     ) -> Response<Body> {
         let Some(tunnel) = self.state.registry.tunnel(subdomain) else {
             return status(StatusCode::NOT_FOUND);
+        };
+        // Taken before the global slot, so a user queued behind their own
+        // quota does not hold relay-wide capacity while waiting.
+        let Some(user_permit) = tunnel.session.budget.acquire_request().await else {
+            return overloaded(StatusCode::SERVICE_UNAVAILABLE);
         };
         let Ok(global_permit) = Arc::clone(&self.state.http_requests).try_acquire_owned() else {
             return overloaded(StatusCode::SERVICE_UNAVAILABLE);
@@ -152,13 +164,14 @@ impl Relay {
                 request,
                 stream,
                 head,
-                WebSocketBudget {
+                WebSocketPermits {
                     request: permit,
                     global_request: global_permit,
+                    user_request: user_permit,
                     websocket_limit: Arc::clone(&self.state.websockets),
                     tunnel: Arc::clone(&tunnel),
                 },
-                tunnel.session.cancel.clone(),
+                Arc::clone(&tunnel.session),
                 traffic,
                 self.state.config.limits.response_timeout,
             )
@@ -171,8 +184,9 @@ impl Relay {
             RequestPermits {
                 _tunnel: permit,
                 _global: global_permit,
+                _user: user_permit,
             },
-            tunnel.session.cancel.clone(),
+            Arc::clone(&tunnel.session),
             traffic,
             self.state.config.limits.response_timeout,
         )
@@ -185,7 +199,7 @@ async fn streaming_exchange(
     mut stream: RelayStream,
     head: RequestHead,
     permits: RequestPermits,
-    cancel: CancellationToken,
+    session: Arc<Session>,
     traffic: TrafficMeta,
     response_timeout: Duration,
 ) -> Response<Body> {
@@ -196,13 +210,22 @@ async fn streaming_exchange(
         return status(StatusCode::BAD_GATEWAY);
     }
     let (mut reader, mut writer) = vorp_protocol::split(stream);
+    let cancel = session.cancel.clone();
     let upload_cancel = cancel.clone();
     let bytes_in = Arc::new(AtomicU64::new(0));
     let upload_bytes = Arc::clone(&bytes_in);
+    let upload_budget = Arc::clone(&session.budget);
     let (progress, progress_rx) = watch::channel(());
     let upload = tokio::spawn(async move {
-        if let Err(error) =
-            upload_body(body, &mut writer, &upload_cancel, &upload_bytes, &progress).await
+        if let Err(error) = upload_body(
+            body,
+            &mut writer,
+            &upload_cancel,
+            &upload_budget,
+            &upload_bytes,
+            &progress,
+        )
+        .await
         {
             tracing::warn!(error = %error, "request body forwarding failed");
         }
@@ -230,7 +253,7 @@ async fn streaming_exchange(
         }
     };
     tokio::spawn(async move {
-        let bytes_out = pump_response(reader, sender, cancel).await;
+        let bytes_out = pump_response(reader, sender, &session.budget, cancel).await;
         upload.abort();
         traffic.record(head.status, bytes_in.load(Ordering::Acquire), bytes_out);
         drop(permits);
@@ -276,8 +299,8 @@ async fn websocket_exchange(
     mut request: Request<Incoming>,
     mut stream: RelayStream,
     head: RequestHead,
-    budget: WebSocketBudget,
-    cancel: CancellationToken,
+    permits: WebSocketPermits,
+    session: Arc<Session>,
     traffic: TrafficMeta,
     response_timeout: Duration,
 ) -> Response<Body> {
@@ -301,13 +324,14 @@ async fn websocket_exchange(
         };
         let (reader, _writer) = vorp_protocol::split(stream);
         tokio::spawn(async move {
-            let bytes_out = pump_response(reader, sender, cancel).await;
+            let bytes_out =
+                pump_response(reader, sender, &session.budget, session.cancel.clone()).await;
             traffic.record(response_head.status, 0, bytes_out);
-            drop(budget);
+            drop(permits);
         });
         return response;
     }
-    let Some((websocket_permit, tunnel_websocket_permit)) = budget.upgrade() else {
+    let Some((websocket_permit, tunnel_websocket_permit)) = permits.upgrade() else {
         return overloaded(StatusCode::SERVICE_UNAVAILABLE);
     };
     let upgraded = hyper::upgrade::on(&mut request);
@@ -319,14 +343,21 @@ async fn websocket_exchange(
     *response.body_mut() = Body::empty();
     tokio::spawn(async move {
         let upgraded = tokio::select! {
-            _ = cancel.cancelled() => return,
+            _ = session.cancel.cancelled() => return,
             result = upgraded => result,
         };
         let Ok(upgraded) = upgraded else { return };
-        let mut client = TokioIo::new(upgraded);
+        let (mut client_read, mut client_write) = vorp_protocol::split(TokioIo::new(upgraded));
+        let (mut tunnel_read, mut tunnel_write) = vorp_protocol::split(stream);
+        let copy = async {
+            tokio::try_join!(
+                throttled_copy(&mut client_read, &mut tunnel_write, &session.budget),
+                throttled_copy(&mut tunnel_read, &mut client_write, &session.budget),
+            )
+        };
         tokio::select! {
-            _ = cancel.cancelled() => {},
-            result = tokio::io::copy_bidirectional(&mut client, &mut stream) => {
+            _ = session.cancel.cancelled() => {},
+            result = copy => {
                 match result {
                     Ok((bytes_in, bytes_out)) => traffic.record(101, bytes_in, bytes_out),
                     Err(error) => tracing::warn!(error = %error, "WebSocket tunnel ended"),
@@ -380,10 +411,36 @@ fn build_response(
     Ok((response, sender))
 }
 
+/// Copies one WebSocket direction until EOF, charging each read to the
+/// user's bandwidth budget before forwarding it.
+async fn throttled_copy<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    budget: &UserBudget,
+) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0; WEBSOCKET_COPY_BUFFER];
+    let mut copied = 0;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(copied);
+        }
+        budget.throttle(read).await;
+        writer.write_all(&buffer[..read]).await?;
+        copied += read as u64;
+    }
+}
+
 async fn upload_body<W: AsyncWrite + Unpin>(
     mut body: Incoming,
     writer: &mut W,
     cancel: &CancellationToken,
+    budget: &UserBudget,
     bytes_in: &AtomicU64,
     progress: &watch::Sender<()>,
 ) -> Result<(), io::Error> {
@@ -406,6 +463,9 @@ async fn upload_body<W: AsyncWrite + Unpin>(
             Some(Ok(frame)) => {
                 if let Ok(bytes) = frame.into_data() {
                     for chunk in bytes.chunks(MAX_FRAME_PAYLOAD) {
+                        // Not raced with `cancel`: the exchange aborts this
+                        // task when the response ends or the session closes.
+                        budget.throttle(chunk.len()).await;
                         write_message(writer, &Message::BodyChunk(chunk.to_vec()))
                             .await
                             .map_err(io::Error::other)?;
@@ -439,6 +499,7 @@ async fn upload_body<W: AsyncWrite + Unpin>(
 async fn pump_response(
     mut reader: vorp_protocol::ReadHalf<RelayStream>,
     sender: BodySender,
+    budget: &UserBudget,
     cancel: CancellationToken,
 ) -> u64 {
     let mut bytes_out = 0;
@@ -449,6 +510,10 @@ async fn pump_response(
         };
         match frame {
             Ok(Ok(Message::BodyChunk(bytes))) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    () = budget.throttle(bytes.len()) => {}
+                }
                 bytes_out += bytes.len() as u64;
                 if sender.send(Ok(Bytes::from(bytes))).await.is_err() {
                     break;

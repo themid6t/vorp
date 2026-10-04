@@ -34,9 +34,12 @@ the PR description, not a drive-by commit.
   If you find yourself adding an `Access-Control-Allow-Origin` header, something
   upstream is wrong.
 - **No orgs / teams.** Users and an admin role, nothing above that.
-- **No per-user quotas yet.** Per-tunnel concurrency caps exist for survival, not
-  policy. Put the limit value on the tunnel session struct (not a global const) so
-  a future per-user policy can populate it without a refactor.
+- **Per-user quotas are policy, separate from survival caps.** Each non-admin
+  user may hold a limited number of live tunnels (default 3, set per user by an
+  admin). Traffic limits apply per user, across all of that user's tunnels.
+  Per-tunnel and global concurrency caps remain survival bounds and are not a
+  substitute for the user quota. Keep the limit values on the session/tunnel
+  structs, populated from the user's stored policy, not global consts.
 - **No protocol version-branching machinery.** Send the version, reject a
   mismatch. The Go docs described a `handleAgentV1`/`V2` split that never existed
   in code; build the branch when a V2 actually exists.

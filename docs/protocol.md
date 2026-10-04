@@ -401,6 +401,30 @@ counts agents and HTTP clients together, so a site behind one NAT shares it.
 Run the relay with an open-file limit above `--max-connections` (systemd
 defaults the soft limit to 1024): set `LimitNOFILE=65536` in its unit.
 
+**Per-user quotas.** On top of those survival bounds, each non-admin user has
+a quota shared across all of their agents and tunnels: live tunnels (default
+3), concurrent HTTP requests (default 64), and bandwidth (default 10 MiB/s,
+uploads and downloads combined, with one second of burst). Admins and
+development-token sessions are exempt. An admin changes the defaults and
+per-user overrides from the dashboard; changes apply to live sessions without
+a reconnect, except that lowering the tunnel cap blocks new registrations and
+leaves existing tunnels open.
+
+The quotas slow traffic before they refuse it:
+
+- **Bandwidth never drops.** Each body chunk (and each WebSocket read) is
+  charged before it is forwarded; an over-budget transfer pauses, and the
+  pause propagates through the yamux window and TCP to the sender.
+- **Requests queue.** A request over the user's concurrency limit waits up to
+  10s for a slot. At most four requests per slot may wait; beyond that, or
+  after the wait, the request receives `503` with `Retry-After: 1`. The user
+  slot is taken before the relay-wide slot, so a user queued behind their own
+  quota does not hold global capacity. The head timeout (§9) starts at
+  dispatch, so time spent queued does not count against it. An upgraded
+  WebSocket releases its request slot.
+- **Tunnels are refused.** A registration beyond the cap receives
+  `TUNNEL_LIMIT`; it never displaces a live tunnel.
+
 ---
 
 ## 9. Timeouts
@@ -449,6 +473,7 @@ astronomically unlikely and the bound only guards against a wedged map.
 | `SUBDOMAIN_TAKEN` | already registered, or reserved by another user | skip tunnel, continue |
 | `SUBDOMAIN_INVALID` | fails label validation | skip tunnel, continue |
 | `SUBDOMAIN_NOT_ALLOWED` | outside this token's bind ACL | skip tunnel, continue |
+| `TUNNEL_LIMIT` | user already holds their quota of live tunnels | skip tunnel, continue |
 | `STREAM_ERROR` | unexpected frame or stream state | skip tunnel, continue |
 
 Every code in this table is emitted by an implementation. **Do not define codes
