@@ -370,7 +370,10 @@ non-numeric length, or any transfer coding other than `chunked`. Redundant with
 `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, plus every header named in the
 sender's own `Connection` header (RFC 7230 §6.1). `Upgrade` survives **only** for
 a validated WebSocket handshake (`Upgrade: websocket` with an `upgrade` token in
-`Connection`); every other upgrade is dropped.
+`Connection`); every other upgrade is dropped. `Content-Length` is not
+hop-by-hop, but it is removed with them: the body length travels as
+`content_length` in the frame head (§5), and each side re-derives the
+outgoing framing itself.
 
 **Assert forwarding headers, never trust them.** The relay is the first hop
 (there is no nginx in front), so it overwrites rather than appends:
@@ -382,11 +385,20 @@ a validated WebSocket handshake (`Upgrade: websocket` with an `upgrade` token in
 
 A client cannot spoof the proxy chain or its own identity.
 
+There is deliberately no trusted-proxy setting. The relay cannot sit behind an
+HTTP-terminating proxy such as Cloudflare's orange cloud, because agent
+connections need the relay's own TLS listener and the `vorp-agent/1` ALPN, so
+the TLS peer is always the real client. DNS records for the relay must be
+DNS-only. If a TCP load balancer is ever placed in front, the fix is the PROXY
+protocol on the listener, not trusting `X-Forwarded-For`.
+
 **Size bounds.** A serialized `RequestHead` exceeding the 64 KiB frame cap is
-answered `431`. Body-size policy is not yet implemented; bodies currently have
-no configured byte limit. Streaming avoids whole-body allocation, but does not
-prevent bandwidth or upstream-disk exhaustion. A future limit must count bytes
-as they pass and reject oversized declared lengths early with `413`.
+answered `431`. Proxied bodies have **no byte limit, by policy**. Streaming
+means a body never costs relay memory, and the per-user bandwidth quota below
+bounds what a large body costs everyone else. Limiting the size of uploads a
+tunnelled application accepts is that application's decision, so the relay
+does not answer `413`. If a limit is ever added, it must count bytes as they
+pass and reject an oversized declared length early.
 
 **Edge connection bounds.** The relay accepts at most 1,024 concurrent TLS
 connections, including handshakes, and 64 from one peer IP. It allows 256
@@ -442,6 +454,15 @@ large uploads and SSE. Narrower bounds replace it.
 | HTTP/1 connection buffer | 64 KiB | bounds the parser buffer, including headers |
 | HTTP/2 stream limit | 128 | concurrent streams on one HTTP/2 connection |
 | HTTP/2 header list | 64 KiB | decoded request headers on one HTTP/2 stream |
+| TCP keepalive | 30s idle, then 10s probes | every accepted connection; ends a vanished peer's connection, which matters most for upgraded WebSockets since they have no idle timeout |
+
+**yamux windows** use the crate defaults on purpose: each stream starts with a
+256 KiB receive window that yamux 0.13 grows from measured round-trip time, so
+a fast transfer is not capped at window/RTT. Growth happens only while the
+reader keeps up, so a stream paused by backpressure or the bandwidth quota
+stays at its initial window. Total buffered data per session is capped at
+1 GiB, with at most 512 streams. Global request and WebSocket caps (§8) keep
+the live stream count below that.
 
 ---
 

@@ -11,6 +11,12 @@ use crate::{Relay, RelayError, limits::ConnectionLimiter};
 
 const HTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Idle time before the kernel probes a silent peer. An upgraded WebSocket
+/// has no idle timeout, so without probes a browser that vanished (sleep,
+/// network change) would hold its WebSocket slots until the 2-hour OS default.
+const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, PartialEq, Eq)]
 enum DispatchProtocol {
     Agent,
@@ -50,6 +56,9 @@ impl Relay {
                         tracing::debug!(peer = %peer, "connection limit reached");
                         continue;
                     };
+                    if let Err(error) = enable_keepalive(&socket) {
+                        tracing::warn!(peer = %peer, error = %error, "TCP keepalive not enabled");
+                    }
                     let acceptor = tls.acceptor();
                     let relay = self.clone();
                     connections.spawn(async move {
@@ -214,6 +223,13 @@ impl Relay {
     }
 }
 
+fn enable_keepalive(socket: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive)
+}
+
 pub(crate) fn status(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -247,6 +263,30 @@ mod tests {
             (Some(&b"unknown"[..]), DispatchProtocol::Unsupported),
         ] {
             assert_eq!(dispatch_protocol(alpn), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_sockets_get_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let _client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let (socket, _) = listener.accept().await.expect("accept");
+        enable_keepalive(&socket).expect("keepalive");
+        let socket = socket2::SockRef::from(&socket);
+        assert!(socket.keepalive().expect("read keepalive"));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                socket.tcp_keepalive_time().expect("time"),
+                TCP_KEEPALIVE_IDLE
+            );
+            assert_eq!(
+                socket.tcp_keepalive_interval().expect("interval"),
+                TCP_KEEPALIVE_INTERVAL
+            );
         }
     }
 }
