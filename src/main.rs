@@ -23,6 +23,26 @@ enum Command {
     Serve(Box<ServeArgs>),
     /// Save an agent token read from standard input.
     Authtoken(TokenArgs),
+    /// Account recovery, run on the relay host against its database.
+    #[command(subcommand)]
+    Admin(AdminCommand),
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Replace an account's password with a new random one and end its
+    /// sessions. Prints the new password once.
+    ResetPassword(ResetPasswordArgs),
+}
+
+#[derive(Args)]
+struct ResetPasswordArgs {
+    #[arg(long)]
+    email: String,
+
+    /// The relay's database; the relay may keep running.
+    #[arg(long, default_value = "vorp.sqlite3")]
+    database_path: PathBuf,
 }
 
 #[derive(Args)]
@@ -153,6 +173,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Serve(args)) => serve(*args).await,
         Some(Command::Authtoken(args)) => save_token(args),
+        Some(Command::Admin(AdminCommand::ResetPassword(args))) => reset_password(args).await,
         None => run_agent(cli.agent).await,
     }
 }
@@ -191,6 +212,30 @@ async fn serve(args: ServeArgs) -> Result<()> {
     vorp_relay::serve_until(config, shutdown_on_signal()?)
         .await
         .context("relay stopped")
+}
+
+async fn reset_password(args: ResetPasswordArgs) -> Result<()> {
+    use std::io::Write;
+    // Opening creates a missing file; refuse instead, since a typo in the
+    // path would otherwise report "no account" against a fresh empty database.
+    if !args.database_path.exists() {
+        bail!("database {} does not exist", args.database_path.display());
+    }
+    let repository = vorp_store::Repository::open(&args.database_path)
+        .await
+        .with_context(|| format!("open database {}", args.database_path.display()))?;
+    let password = vorp_web::reset_password(&repository, &args.email)
+        .await
+        .context("reset password")?;
+    // The password is the command's output, so it goes to stdout, never to
+    // the tracing log.
+    writeln!(
+        std::io::stdout().lock(),
+        "New password for {}: {password}\nAll of its sessions were ended. Change it from the dashboard after logging in.",
+        args.email.trim()
+    )
+    .context("print new password")?;
+    Ok(())
 }
 
 async fn run_agent(args: AgentArgs) -> Result<()> {

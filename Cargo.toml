@@ -37,3 +37,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vorp-agent = { path = "crates/agent" }
 vorp-relay = { path = "crates/relay" }
+vorp-store = { path = "crates/store" }
+vorp-web = { path = "crates/web" }
