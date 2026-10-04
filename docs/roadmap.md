@@ -202,13 +202,17 @@ clear them.
    imported. Production starts from an empty database: bootstrap a new admin,
    mint new agent tokens, re-reserve any names, and switch agents to the
    `vorp-agent/1` binary. No migration tooling is needed.
-2. **Fresh edge and protocol review.** Recheck the October 1 implementation
-   review in the local `review/` directory against current code: later commits
-   fixed several high-priority items, so the review is a starting list, not a
-   current defect count. Set an explicit request-body size policy, settle idle
-   WebSocket behavior and multiple agents sharing a machine identity, and
-   close any remaining protocol-state or resource-boundary gaps found in that
-   pass. Add focused regression tests for each confirmed defect.
+2. **Fresh edge and protocol review (done 2026-10-05).** Every October 1
+   review finding was rechecked against current code. Most were already fixed
+   by later commits (rate and connection limits, slow-client timers, WebSocket
+   slot release, revocation race, machine-identity collisions, ALPN fallback,
+   chunked responses, single-write frames, a single subdomain validator).
+   This pass adds TCP keepalive so vanished WebSocket clients release their
+   slots, and per-user traffic history. It also writes down the remaining
+   policies: no body byte limit (streaming plus the bandwidth quota), no
+   trusted-proxy setting (the relay must be DNS-only), and yamux default
+   windows. Rejected as not worth churning: moving the dashboard runtime
+   traits out of `vorp-web`.
 3. **Representative staging exercise.** Test large streamed uploads and
    downloads, SSE, WebSocket upgrades and rejected handshakes, reconnects,
    token revocation, slow or malformed requests, and sustained concurrency.
@@ -234,8 +238,7 @@ clear them.
    target until the new relay has run cleanly, then change production DNS and
    enable the tag deployment.
 
-**First task for the next session:** use gate 2's fresh review to select the
-next code changes.
+**Next:** gate 3, a representative load exercise on a production-sized host.
 
 ### Open-source one-shot release after the cutover
 

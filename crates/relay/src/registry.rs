@@ -15,6 +15,8 @@ use crate::{quota::UserBudget, subdomain::SlugError};
 
 pub(crate) type SessionKey = (i64, String);
 
+const TRAFFIC_EVENTS_PER_USER: usize = 256;
+
 pub(crate) struct Session {
     pub id: String,
     pub key: SessionKey,
@@ -94,7 +96,9 @@ pub(crate) struct Registry {
     budgets: Mutex<HashMap<i64, Arc<UserBudget>>>,
     revoked_tokens: Mutex<HashSet<i64>>,
     tunnels: Mutex<HashMap<String, Arc<Tunnel>>>,
-    traffic: Mutex<VecDeque<(i64, vorp_web::TrafficEvent)>>,
+    /// Recent events per user, so a busy user cannot evict a quiet user's
+    /// history from a shared ring.
+    traffic: Mutex<HashMap<i64, VecDeque<vorp_web::TrafficEvent>>>,
 }
 
 impl Registry {
@@ -224,24 +228,24 @@ impl Registry {
     }
 
     pub fn record_traffic(&self, user_id: i64, event: vorp_web::TrafficEvent) {
-        let mut events = self
+        let mut traffic = self
             .traffic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if events.len() == 256 {
+        let events = traffic.entry(user_id).or_default();
+        if events.len() == TRAFFIC_EVENTS_PER_USER {
             events.pop_front();
         }
-        events.push_back((user_id, event));
+        events.push_back(event);
     }
 
     pub fn recent_traffic(&self, user_id: i64) -> Vec<vorp_web::TrafficEvent> {
         self.traffic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(owner, _)| *owner == user_id)
-            .map(|(_, event)| event.clone())
-            .collect()
+            .get(&user_id)
+            .map(|events| events.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn remove_tunnel_if_same(&self, tunnel: &Arc<Tunnel>) -> bool {
@@ -570,5 +574,27 @@ mod tests {
             .insert_named_tunnel(named(&server, "seven"))
             .unwrap();
         assert_eq!(registry.tunnels_for_user(1).len(), 3);
+    }
+
+    #[test]
+    fn busy_user_does_not_evict_another_users_traffic() {
+        let registry = Registry::default();
+        let event = |subdomain: &str| vorp_web::TrafficEvent {
+            subdomain: subdomain.into(),
+            timestamp_ms: 0,
+            method: "GET".into(),
+            status: 200,
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        registry.record_traffic(1, event("quiet"));
+        for _ in 0..TRAFFIC_EVENTS_PER_USER + 10 {
+            registry.record_traffic(2, event("busy"));
+        }
+        let quiet = registry.recent_traffic(1);
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(quiet[0].subdomain, "quiet");
+        assert_eq!(registry.recent_traffic(2).len(), TRAFFIC_EVENTS_PER_USER);
+        assert!(registry.recent_traffic(3).is_empty());
     }
 }

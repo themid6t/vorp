@@ -191,7 +191,9 @@ replacing what it defends.
   - **Strip hop-by-hop headers** (`Connection`, `Proxy-Connection`, `Keep-Alive`,
     `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`,
     `Transfer-Encoding`, `Upgrade`) **plus every header named in the sender's own
-    `Connection` header** (RFC 7230 §6.1), in **both** directions. `Upgrade`
+    `Connection` header** (RFC 7230 §6.1), in **both** directions. Remove
+    `Content-Length` too: the body length travels in the frame head, and
+    each side derives its own outgoing framing. `Upgrade`
     survives **only** for a validated WebSocket handshake (`Upgrade: websocket`
     plus an `upgrade` token in `Connection`); every other upgrade is dropped.
   - **Assert forwarding headers, never trust them.** Overwrite
