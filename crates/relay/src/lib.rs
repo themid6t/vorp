@@ -3,6 +3,7 @@ mod config;
 mod httpnorm;
 mod limits;
 mod proxy;
+mod quota;
 mod registry;
 mod server;
 mod session;
@@ -107,6 +108,42 @@ impl vorp_web::DashboardRuntime for WebHooks {
                 .ok_or_else(|| "relay is shutting down".to_owned())?;
             Ok(state.registry.recent_traffic(user_id))
         })
+    }
+
+    fn limits_changed(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let state = self
+                .0
+                .upgrade()
+                .ok_or_else(|| "relay is shutting down".to_owned())?;
+            state
+                .reload_user_limits()
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl State {
+    /// Re-reads the limits of every user the relay holds a budget for, so an
+    /// admin's change applies to live tunnels without a reconnect. A lowered
+    /// tunnel cap blocks new registrations but does not close live tunnels.
+    async fn reload_user_limits(&self) -> Result<(), vorp_store::RepositoryError> {
+        let Some(repository) = &self.repository else {
+            return Ok(());
+        };
+        for user_id in self.registry.budget_user_ids() {
+            match repository.effective_limits(user_id).await {
+                Ok(limits) => {
+                    self.registry.budget(user_id, limits);
+                }
+                // No user-deletion path exists yet; a vanished user has no
+                // sessions to limit.
+                Err(vorp_store::RepositoryError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 

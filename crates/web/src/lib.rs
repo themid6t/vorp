@@ -20,7 +20,9 @@ use std::{
 };
 use vorp_store::{BindPolicy, NewSession, NewUser, Repository, RepositoryError, User};
 mod limits;
+mod quota;
 use limits::{AuthLimiter, LimitError, MAX_TRAFFIC_STREAMS, traffic_stream_permit};
+use quota::{LimitsBody, default_limits, list_users, set_default_limits, set_user_limits};
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,8 @@ pub trait DashboardRuntime: Send + Sync {
         &self,
         user_id: i64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TrafficEvent>, String>> + Send + '_>>;
+    /// Stored limits changed; re-apply them to live sessions.
+    fn limits_changed(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 #[derive(Clone)]
 struct AppState {
@@ -178,6 +182,15 @@ pub fn router_with_runtime(
         .route("/api/tunnels/{name}/close", post(force_close_tunnel))
         .route("/api/traffic/recent", get(recent_traffic))
         .route("/api/traffic/stream", get(stream_traffic))
+        .route(
+            "/api/admin/limits",
+            get(default_limits).put(set_default_limits),
+        )
+        .route("/api/admin/users", get(list_users))
+        .route(
+            "/api/admin/users/{id}/limits",
+            axum::routing::put(set_user_limits),
+        )
         .with_state(state)
 }
 async fn list_tunnels(
@@ -476,13 +489,31 @@ struct MeBody {
     is_admin: bool,
     assigned_subdomain: Option<String>,
 }
-async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<MeBody>, ApiError> {
+#[derive(Serialize)]
+struct MeWithLimitsBody {
+    #[serde(flatten)]
+    user: MeBody,
+    /// `null` for an admin, who is exempt from every quota.
+    limits: Option<LimitsBody>,
+}
+async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MeWithLimitsBody>, ApiError> {
     let u = current_user(&state, &headers).await?;
-    Ok(Json(MeBody {
-        id: u.id,
-        email: u.email,
-        is_admin: u.is_admin,
-        assigned_subdomain: u.assigned_subdomain,
+    let limits = state
+        .repository
+        .effective_limits(u.id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(MeWithLimitsBody {
+        user: MeBody {
+            id: u.id,
+            email: u.email,
+            is_admin: u.is_admin,
+            assigned_subdomain: u.assigned_subdomain,
+        },
+        limits: limits.map(LimitsBody::from),
     }))
 }
 #[derive(Deserialize)]
@@ -780,8 +811,14 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
-    struct EmptyRuntime;
+    /// Counts `limits_changed` calls; every other hook is empty.
+    #[derive(Default)]
+    struct EmptyRuntime(AtomicUsize);
     impl DashboardRuntime for EmptyRuntime {
+        fn limits_changed(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
         fn tunnels(
             &self,
             _user_id: i64,
@@ -1076,8 +1113,12 @@ mod tests {
     }
     #[tokio::test]
     async fn traffic_stream_cap_releases_on_disconnect() {
-        let router =
-            router_with_runtime(repo().await, config(), None, Some(Arc::new(EmptyRuntime)));
+        let router = router_with_runtime(
+            repo().await,
+            config(),
+            None,
+            Some(Arc::new(EmptyRuntime::default())),
+        );
         let cookie = account(&router, "viewer@example.test").await;
         let mut streams = Vec::new();
         for _ in 0..MAX_TRAFFIC_STREAMS {
@@ -1102,5 +1143,101 @@ mod tests {
             .await
             .expect("reopened");
         assert_eq!(reopened.status(), StatusCode::OK);
+    }
+    async fn json(router: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = router.clone().oneshot(request).await.expect("request");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+    #[tokio::test]
+    async fn admin_sets_limits_and_users_see_them() {
+        let runtime = Arc::new(EmptyRuntime::default());
+        let router = router_with_runtime(repo().await, config(), None, Some(runtime.clone()));
+        let credentials =
+            serde_json::json!({"email":"admin@example.test","password":"long enough password"})
+                .to_string();
+        let response = router
+            .clone()
+            .oneshot(req(Method::POST, "/api/bootstrap", &credentials, None))
+            .await
+            .expect("bootstrap");
+        assert_eq!(response.status(), StatusCode::OK);
+        let admin = session_cookie_from(&response);
+        let alice = account(&router, "alice@example.test").await;
+
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&alice))).await;
+        assert_eq!(me["limits"]["max_tunnels"], 3);
+        let alice_id = me["id"].as_i64().expect("id");
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&admin))).await;
+        assert!(me["limits"].is_null(), "admins are exempt");
+
+        let defaults =
+            r#"{"max_tunnels":5,"bandwidth_bytes_per_sec":1000,"max_concurrent_requests":8}"#;
+        let overrides_path = format!("/api/admin/users/{alice_id}/limits");
+        for (method, path, body) in [
+            (Method::GET, "/api/admin/limits", ""),
+            (Method::PUT, "/api/admin/limits", defaults),
+            (Method::GET, "/api/admin/users", ""),
+            (Method::PUT, overrides_path.as_str(), r#"{"max_tunnels":9}"#),
+        ] {
+            let (status, _) = json(&router, req(method, path, body, Some(&alice))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let mut no_csrf = req(Method::PUT, "/api/admin/limits", defaults, Some(&admin));
+        no_csrf.headers_mut().remove("x-vorp-csrf");
+        let (status, _) = json(&router, no_csrf).await;
+        assert_ne!(status, StatusCode::OK);
+        assert_eq!(runtime.0.load(Ordering::SeqCst), 0);
+
+        let (status, _) = json(
+            &router,
+            req(Method::PUT, "/api/admin/limits", defaults, Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = json(
+            &router,
+            req(
+                Method::PUT,
+                &overrides_path,
+                r#"{"max_tunnels":1}"#,
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            runtime.0.load(Ordering::SeqCst),
+            2,
+            "live sessions are refreshed"
+        );
+
+        let (_, me) = json(&router, req(Method::GET, "/api/me", "", Some(&alice))).await;
+        assert_eq!(me["limits"]["max_tunnels"], 1);
+        assert_eq!(me["limits"]["max_concurrent_requests"], 8);
+        let (_, users) = json(
+            &router,
+            req(Method::GET, "/api/admin/users", "", Some(&admin)),
+        )
+        .await;
+        assert!(users[0]["effective"].is_null());
+        assert_eq!(users[1]["overrides"]["max_tunnels"], 1);
+        assert!(users[1]["overrides"]["bandwidth_bytes_per_sec"].is_null());
+        assert_eq!(users[1]["effective"]["bandwidth_bytes_per_sec"], 1000);
+
+        for (path, body) in [
+            (overrides_path.as_str(), r#"{"max_tunnels":0}"#),
+            ("/api/admin/users/9999/limits", r#"{"max_tunnels":2}"#),
+            (
+                "/api/admin/limits",
+                r#"{"max_tunnels":1,"bandwidth_bytes_per_sec":0,"max_concurrent_requests":1}"#,
+            ),
+        ] {
+            let (status, _) = json(&router, req(Method::PUT, path, body, Some(&admin))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+        }
     }
 }

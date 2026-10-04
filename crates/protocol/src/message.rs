@@ -29,6 +29,8 @@ pub enum ErrorCode {
     SubdomainTaken,
     SubdomainInvalid,
     SubdomainNotAllowed,
+    /// The user already holds as many live tunnels as their quota allows.
+    TunnelLimit,
     StreamError,
 }
 

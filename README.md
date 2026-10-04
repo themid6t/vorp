@@ -8,7 +8,9 @@ traffic. Tunnel bodies stream through yamux in bounded frames.
 The [roadmap](docs/roadmap.md) records M0–M2 as done, M3 as partial, and the
 staging portion of M4 as active. Today the binary provides tunnels, a
 SQLite-backed dashboard, users, sessions, agent tokens, bind policies, a
-per-user traffic feed, and live token revocation.
+per-user traffic feed, live token revocation, and admin-set per-user quotas
+(tunnels, concurrent requests, bandwidth) that slow traffic before refusing it.
+The dashboard's HTTP API is listed in [docs/api.md](docs/api.md).
 Supplied certificate files are checked every 30 seconds and reloaded for new
 TLS handshakes without interrupting existing connections; an invalid
 replacement leaves the last valid certificate in use. ACME DNS-01 and renewal,

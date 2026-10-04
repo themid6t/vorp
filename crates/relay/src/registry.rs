@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use vorp_protocol::CloseReason;
 use yamux::Stream;
 
-use crate::subdomain::SlugError;
+use crate::{quota::UserBudget, subdomain::SlugError};
 
 pub(crate) type SessionKey = (i64, String);
 
@@ -20,6 +20,8 @@ pub(crate) struct Session {
     pub key: SessionKey,
     pub token_id: Option<i64>,
     pub user_id: i64,
+    /// Shared with every other live session of the same user.
+    pub budget: Arc<UserBudget>,
     pub cancel: CancellationToken,
     pub open: mpsc::Sender<oneshot::Sender<Result<Stream, yamux::ConnectionError>>>,
     pub(crate) teardown_started: AtomicBool,
@@ -74,9 +76,22 @@ impl Tunnel {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TunnelInsertError {
+    #[error("subdomain already in use")]
+    Taken,
+    #[error("user tunnel limit reached")]
+    LimitReached,
+    #[error(transparent)]
+    Slug(#[from] SlugError),
+}
+
 #[derive(Default)]
 pub(crate) struct Registry {
     sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
+    // ponytail: entries outlive their user's sessions; bounded by the number
+    // of accounts, so not worth evicting.
+    budgets: Mutex<HashMap<i64, Arc<UserBudget>>>,
     revoked_tokens: Mutex<HashSet<i64>>,
     tunnels: Mutex<HashMap<String, Arc<Tunnel>>>,
     traffic: Mutex<VecDeque<(i64, vorp_web::TrafficEvent)>>,
@@ -101,16 +116,44 @@ impl Registry {
             .insert(session.key.clone(), session))
     }
 
-    pub fn insert_named_tunnel(&self, tunnel: Arc<Tunnel>) -> bool {
+    /// The user's budget with `limits` applied, created on first use. Every
+    /// session of one user shares it, so quotas span all of their agents.
+    pub fn budget(&self, user_id: i64, limits: Option<vorp_store::UserLimits>) -> Arc<UserBudget> {
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(budget) = budgets.get(&user_id) {
+            budget.set_limits(limits);
+            return Arc::clone(budget);
+        }
+        let budget = Arc::new(UserBudget::new(limits));
+        budgets.insert(user_id, Arc::clone(&budget));
+        budget
+    }
+
+    pub fn budget_user_ids(&self) -> Vec<i64> {
+        self.budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub fn insert_named_tunnel(&self, tunnel: Arc<Tunnel>) -> Result<(), TunnelInsertError> {
         let mut map = self
             .tunnels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if tunnel.session.cancel.is_cancelled() || map.contains_key(&tunnel.subdomain) {
-            return false;
+            return Err(TunnelInsertError::Taken);
+        }
+        if at_tunnel_limit(&map, &tunnel.session) {
+            return Err(TunnelInsertError::LimitReached);
         }
         map.insert(tunnel.subdomain.clone(), tunnel);
-        true
+        Ok(())
     }
 
     pub fn allocate_tunnel(
@@ -119,14 +162,17 @@ impl Registry {
         upstream_hint: Option<String>,
         limits: TunnelLimits,
         mut generate: impl FnMut() -> Result<String, SlugError>,
-    ) -> Result<Arc<Tunnel>, SlugError> {
+    ) -> Result<Arc<Tunnel>, TunnelInsertError> {
         let mut map = self
             .tunnels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at_tunnel_limit(&map, &session) {
+            return Err(TunnelInsertError::LimitReached);
+        }
         for _ in 0..8 {
             if session.cancel.is_cancelled() {
-                return Err(SlugError::Collisions);
+                return Err(SlugError::Collisions.into());
             }
             let slug = generate()?;
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(slug.clone()) {
@@ -135,7 +181,7 @@ impl Registry {
                 return Ok(tunnel);
             }
         }
-        Err(SlugError::Collisions)
+        Err(SlugError::Collisions.into())
     }
 
     pub fn tunnel(&self, subdomain: &str) -> Option<Arc<Tunnel>> {
@@ -276,6 +322,20 @@ impl Registry {
     }
 }
 
+/// Checked under the tunnel-map lock, so concurrent registrations cannot
+/// both take the last slot.
+// ponytail: scans every live tunnel; keep a per-user count if the map grows
+// to many thousands.
+fn at_tunnel_limit(map: &HashMap<String, Arc<Tunnel>>, session: &Session) -> bool {
+    let Some(max) = session.budget.max_tunnels() else {
+        return false;
+    };
+    map.values()
+        .filter(|t| t.session.user_id == session.user_id)
+        .count()
+        >= max
+}
+
 impl Tunnel {
     pub fn try_acquire(self: &Arc<Self>) -> Option<TunnelPermit> {
         let previous = self
@@ -322,12 +382,17 @@ mod tests {
     };
 
     fn session(id: &str) -> Arc<Session> {
+        user_session(id, 1, Arc::new(UserBudget::new(None)))
+    }
+
+    fn user_session(id: &str, user_id: i64, budget: Arc<UserBudget>) -> Arc<Session> {
         let (open, _) = mpsc::channel(1);
         Arc::new(Session {
             id: id.into(),
-            key: (1, "machine".into()),
+            key: (user_id, "machine".into()),
             token_id: Some(10),
-            user_id: 1,
+            user_id,
+            budget,
             cancel: CancellationToken::new(),
             open,
             teardown_started: AtomicBool::new(false),
@@ -363,7 +428,7 @@ mod tests {
         let make = |s: Arc<Session>| Arc::new(Tunnel::new(s, "app".into(), None, ONE));
         let old = make(Arc::clone(&old_session));
         let new = make(Arc::clone(&new_session));
-        registry.insert_named_tunnel(Arc::clone(&old));
+        registry.insert_named_tunnel(Arc::clone(&old)).unwrap();
         registry
             .tunnels
             .lock()
@@ -397,13 +462,13 @@ mod tests {
         assert_eq!(attempts, 2);
         assert!(matches!(
             registry.allocate_tunnel(session("third"), None, ONE, || Ok("collision".into())),
-            Err(SlugError::Collisions)
+            Err(TunnelInsertError::Slug(SlugError::Collisions))
         ));
         assert!(matches!(
             registry.allocate_tunnel(session("fourth"), None, ONE, || Err(SlugError::Random(
                 getrandom::Error::UNSUPPORTED
             ))),
-            Err(SlugError::Random(_))
+            Err(TunnelInsertError::Slug(SlugError::Random(_)))
         ));
     }
 
@@ -456,5 +521,54 @@ mod tests {
         assert_eq!(tunnel.websocket_active.load(Ordering::Acquire), 1);
         drop(websocket);
         assert_eq!(tunnel.websocket_active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn tunnel_limit_spans_a_users_sessions_and_spares_others() {
+        let registry = Registry::default();
+        let limits = vorp_store::UserLimits {
+            max_tunnels: 2,
+            ..vorp_store::UserLimits::DEFAULT
+        };
+        let budget = registry.budget(1, Some(limits));
+        let laptop = user_session("laptop", 1, Arc::clone(&budget));
+        let server = user_session("server", 1, Arc::clone(&budget));
+        let named = |s: &Arc<Session>, name: &str| {
+            Arc::new(Tunnel::new(Arc::clone(s), name.into(), None, ONE))
+        };
+        registry.insert_named_tunnel(named(&laptop, "one")).unwrap();
+        registry
+            .allocate_tunnel(Arc::clone(&server), None, ONE, || Ok("two".into()))
+            .unwrap();
+        assert!(matches!(
+            registry.insert_named_tunnel(named(&server, "three")),
+            Err(TunnelInsertError::LimitReached)
+        ));
+        assert!(matches!(
+            registry.allocate_tunnel(Arc::clone(&laptop), None, ONE, || Ok("four".into())),
+            Err(TunnelInsertError::LimitReached)
+        ));
+
+        let other = user_session("other", 2, registry.budget(2, Some(limits)));
+        registry.insert_named_tunnel(named(&other, "five")).unwrap();
+        let admin = user_session("admin", 3, registry.budget(3, None));
+        for name in ["a1", "a2", "a3", "a4"] {
+            registry.insert_named_tunnel(named(&admin, name)).unwrap();
+        }
+
+        // Closing one frees a slot; raising the limit live frees another.
+        registry.teardown(&laptop);
+        registry.insert_named_tunnel(named(&server, "six")).unwrap();
+        registry.budget(
+            1,
+            Some(vorp_store::UserLimits {
+                max_tunnels: 3,
+                ..limits
+            }),
+        );
+        registry
+            .insert_named_tunnel(named(&server, "seven"))
+            .unwrap();
+        assert_eq!(registry.tunnels_for_user(1).len(), 3);
     }
 }
