@@ -16,7 +16,7 @@ externally with Certbot and Cloudflare DNS-01, as described in
 |---|---|---|
 | M0 — scaffold | Done | Five-crate workspace, pinned toolchain, CI gates, protocol and schema contracts. |
 | M1 — tunnels | Done | TLS/ALPN relay, outbound agent over yamux, streamed HTTP bodies, WebSocket forwarding, tunnel lifecycle. |
-| M2 — auth and state | Done | SQLite repository, local users and opaque sessions, dashboard/API, bind ACL, scoped traffic feed, live token revocation. |
+| M2 — auth and state | Done | SQLite repository, local users and opaque sessions, dashboard/API (Svelte app embedded in the binary since 2026-10-05), bind ACL, scoped traffic feed, live token revocation. |
 | M3 — production surface | Partial | Supplied certificate files reload without dropping existing connections. ACME DNS-01 and renewal, agent sidecar probes, `install-service`, and `doctor` remain. |
 | M4 — distribution | Partial | GitHub Actions builds a static Linux amd64 binary and deploys passing `main` commits to staging. Container image, Compose, Helm, production release workflow, signed manifest, and installer remain. |
 
@@ -213,43 +213,94 @@ clear them.
    trusted-proxy setting (the relay must be DNS-only), and yamux default
    windows. Rejected as not worth churning: moving the dashboard runtime
    traits out of `vorp-web`.
-3. **Representative staging exercise.** Test large streamed uploads and
-   downloads, SSE, WebSocket upgrades and rejected handshakes, reconnects,
-   token revocation, slow or malformed requests, and sustained concurrency.
-   Record throughput, memory, connection counts, and failure behavior on a
-   host sized like production; the tiny staging instance and existing smoke
-   tests alone do not establish production capacity.
-4. **Data recovery and operations.** Put SQLite on persistent storage, take
-   scheduled consistent backups, and restore one into a fresh instance.
-   Define retention, integrity checks, monitoring/alerts, and the response to
-   a failed certificate renewal or unhealthy relay. Test schema migration and
-   rollback together: reverting only the binary may not undo a database
-   migration. See [certificate operations](certificates.md) for the current
-   external renewal path.
-5. **Production release automation.** Implement the annotated-version-tag
-   workflow in [releases.md](releases.md). Verify that the tagged commit passed
-   CI and staging, fetch the exact staged artifact, verify its checksum, and
-   deploy with production-only credentials. Add health verification and a
-   workflow to redeploy a previous released artifact. Account for the current
-   30-day staging-artifact retention period and restrict who can create or move
-   release tags before enabling automatic production deployment.
-6. **Switch.** Verify production host architecture, access, DNS, TLS,
-   storage, and observability. Keep the Go service available as the rollback
-   target until the new relay has run cleanly, then change production DNS and
-   enable the tag deployment.
+3. **Smoke test on the new production host (scoped down, decided
+   2026-10-05).** Production runs on a **new host** alongside the Go relay;
+   the cutover is a DNS switch. Since the operator is the only user, the full
+   load exercise is replaced by a check on the real host, through its own
+   hostname before DNS moves: a large streamed upload and download, SSE, a
+   WebSocket, an agent reconnect, and token revocation. Record memory and
+   connection counts while doing it.
+4. **Minimal data safety.** SQLite on the host's persistent disk plus a
+   nightly `sqlite3 .backup` systemd timer, with one restore tried. Retention
+   policy, monitoring and alerting stay deferred until there are other users.
+5. **Manual promotion.** Copy the artifact that passed staging for the same
+   commit, verify its checksum, install it with a production unit derived from
+   [`deploy/vorp-staging.service`](../deploy/vorp-staging.service), and obtain
+   the production wildcard certificate with the [Certbot procedure](certificates.md).
+   The tag-triggered release workflow moves to v0.1 below.
+6. **Switch.** Mint new agent tokens and move your agents to the new `vorp`
+   binary, change the production DNS records, and keep the Go host running as
+   the rollback target until the new relay has run cleanly for a few days.
 
-**Next:** gate 3, a representative load exercise on a production-sized host.
+**Next:** gates 3–6. Needs the new host's provider, OS, architecture and SSH
+access. The work is host setup, not code.
 
-### Open-source one-shot release after the cutover
+---
 
-The current [Certbot and Cloudflare procedure](certificates.md) can provide a
-production certificate, so built-in ACME is not required to replace the Go
-relay. It *is* required for the intended one-shot self-hosted experience.
-Complete the remaining M3 integration work (built-in ACME DNS-01 renewal,
-agent sidecar probes where Kubernetes is supported, `install-service`, and
-`doctor`) and M4 distribution work (container image, Compose, Helm,
-multi-architecture binaries, signed release manifest, and installer) before
-calling the open-source distribution complete.
+## v0.1 — open-source release
+
+Goal: a stranger (or an AI agent acting for them) goes from nothing to a
+working relay with one install command and one setup command, and from a fresh
+laptop to a live tunnel with two commands. Decisions taken 2026-10-05: **MIT
+license**, **built-in ACME is in v0.1**, and **native services are the default**
+for keeping things running, with pm2 and containers as cookbooks.
+
+Order matters: ACME first, because `setup` and `doctor` sit on top of it.
+
+1. **Project basics.** `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`,
+   `CHANGELOG.md`. Publishing is blocked until the license exists.
+2. **Built-in ACME DNS-01** (`crates/relay/src/acme/`, `instant-acme`):
+   wildcard issuance for `domain` + `*.domain`, a renewal task, hot
+   replacement through the existing certificate-reload path, an `AcmeDns`
+   trait with Cloudflare first. Supplied cert files remain the alternative.
+   A wildcard is required because tunnel names are random; per-name
+   TLS-ALPN-01 certificates would hit Let's Encrypt's 50-per-week limit.
+3. **Settings from the environment.** Every `serve` flag also reads a
+   `VORP_*` variable (clap `env`), so systemd, Docker and agents share one
+   `/etc/vorp/vorp.env`. No new config-file format.
+4. **`vorp doctor [--json]`.** Checks DNS for the root and wildcard, that :443
+   is free or held by vorp, the DNS-provider token, certificate validity, and
+   database access. Machine-readable output with stable check ids so an agent
+   can act on failures.
+5. **`vorp setup`.** Non-interactive with flags (`--domain`,
+   `--cloudflare-token-file`, `--admin-email`, `--yes`): runs `doctor`, gets
+   the certificate, writes `/etc/vorp/vorp.env`, installs and starts the
+   service, creates the admin, and prints the dashboard URL.
+6. **Close the bootstrap race.** Today the first visitor to the dashboard
+   becomes admin. On a public install, the admin is created from the command
+   line by `setup` (or the relay prints a one-time setup code that the
+   bootstrap page requires).
+7. **`vorp service install`** for the relay (system unit, hardened like the
+   staging unit) and the agent (systemd user unit with linger on Linux,
+   launchd on macOS).
+8. **Agent first-run experience.** `vorp login <relay>` stores the token and
+   the relay host once (the token is read from a prompt or standard input,
+   never an argument). `vorp http <port> [--name <reserved>]` opens a tunnel
+   to `127.0.0.1:<port>`. The existing flags keep working.
+9. **Release workflow.** On an annotated `vX.Y.Z` tag: static binaries for
+   Linux and macOS on amd64 and arm64, checksums, and a signed manifest
+   (minisign or cosign, not GPG). Then the production promotion described in
+   [releases.md](releases.md).
+10. **`install.sh`.** Detects OS and architecture, verifies the signature and
+    checksum, installs to `/usr/local/bin`. Same script for the relay and the
+    agent.
+11. **Docs.** A README quickstart; `docs/setup.md`, written as a runbook with
+    exact commands, expected output and what to do for each `doctor` failure,
+    for people and AI agents alike; and cookbooks in `docs/cookbook/`:
+    systemd, launchd, pm2 (token file only: a `--token` argument shows in `ps`
+    and in pm2's saved process list), Docker Compose sidecar
+    (`--allow-remote-targets --upstream http://app:3000`). User-facing docs
+    must say a tunnel URL is not access control.
+
+### v0.2
+
+- Several named tunnels from one agent process (`tunnels.toml`, `vorp start
+  [name]`); today one agent process serves one upstream.
+- Container image and Compose file for the relay; Homebrew tap.
+- CLI login approved in the dashboard instead of copying a token.
+- Kubernetes: agent sidecar probes (outbound-only) and a Helm chart.
+- API tokens and an agent-facing API description (deferred 2026-10-05 until
+  the dashboard work settled; the flow is still to be designed).
 
 ---
 
