@@ -13,6 +13,7 @@ argon2 = "0.5"
 getrandom = "0.3"
 tokio = { workspace = true, features = ["sync"] }
 futures-util = "0.3"
+rust-embed = { version = "8", features = ["mime-guess"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

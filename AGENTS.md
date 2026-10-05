@@ -286,11 +286,13 @@ replacing what it defends.
 
 ## Tooling and CI gates
 
-All four must pass for changes beyond Markdown; CI enforces them and a red gate
-is not merged. Markdown-only changes keep a successful lightweight check and
-skip the Rust gates and staging deployment:
+All of these must pass for changes beyond Markdown; CI enforces them and a red
+gate is not merged. Markdown-only changes keep a successful lightweight check
+and skip the Rust gates and staging deployment. The dashboard is built first,
+because the binary embeds it:
 
 ```sh
+(cd crates/web/ui && npm ci && npm run check && npm run build)
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
@@ -305,6 +307,28 @@ cargo deny check          # or, at minimum, cargo audit
   acceptable.
 - Release binaries build with `CARGO_PROFILE_RELEASE_*` set for a static,
   trimmed, reproducible artifact — the agent ships as a single file.
+
+## Dashboard
+
+- **Svelte 5 + Vite + TypeScript in `crates/web/ui`, embedded with
+  `rust-embed`.** Node is a build-time tool only; the relay still ships as one
+  binary and serves everything itself. Debug builds read `ui/dist` from disk,
+  so `npm run dev` (proxying `/api` to a local relay) or a rebuilt `dist`
+  shows up without recompiling.
+- **Nothing loads from the internet.** Fonts and every other asset are bundled
+  by Vite; no CDN, no analytics, no remote images.
+- **The CSP stays strict** (`script-src 'self'; style-src 'self'`). No inline
+  `<script>`, no `style="..."` attributes, no `{@html}` — API data is rendered
+  through Svelte interpolation only, so it cannot inject markup.
+- **All API calls go through `src/lib/api.ts`**, which sets the CSRF header
+  and turns relay errors into messages. Shared state, notices, confirmations
+  and routing live in `src/lib/app.svelte.ts`; pure helpers in
+  `src/lib/format.ts`.
+- **Neumorphism with guardrails.** Colours and shadows are tokens in
+  `src/theme.css`, defined for light and dark. Keep text contrast at 4.5:1 or
+  better, give the primary action a solid accent fill, keep focus rings
+  visible, and pair every status colour with text; embossed-only controls are
+  indistinguishable for many users.
 
 ## Release and certificate operations
 
