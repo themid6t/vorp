@@ -5,7 +5,7 @@ already passed staging. There is no permanent `dev` branch.
 
 | Event | Checks | Deployment |
 | --- | --- | --- |
-| Pull request with non-Markdown changes | Format, Clippy, all-feature tests, dependency policy | None |
+| Pull request with non-Markdown changes | Dashboard type check and build, then format, Clippy, all-feature tests, dependency policy | None |
 | Push/merge to `main` with non-Markdown changes | The same checks, then a Linux amd64 release build | Automatically deploy that build to staging and check `/healthz` |
 | Markdown-only pull request or push | Lightweight successful check | None |
 | Annotated `vX.Y.Z` tag on a validated `main` commit (planned) | Verify the exact commit passed CI and staging; use its existing build | Create a GitHub Release and automatically deploy that build to production |
@@ -29,7 +29,7 @@ rollback workflow should redeploy a previously released artifact by checksum.
 
 ## Current staging deployment
 
-The `CI` workflow runs all four Rust gates for pull requests and pushes to
+The `CI` workflow builds and type-checks the embedded dashboard, then runs all four Rust gates for pull requests and pushes to
 `main` when a non-Markdown file changes. A Markdown-only change keeps a green
 `rust` check but skips compilation and deployment. This allows the check to be
 required by future branch protection without leaving documentation PRs

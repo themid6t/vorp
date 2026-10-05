@@ -44,6 +44,16 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        if: steps.changes.outputs.run_ci == 'true'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/web/ui/package-lock.json
+      # The dashboard is embedded into the binary, so it is built before any cargo step.
+      - if: steps.changes.outputs.run_ci == 'true'
+        working-directory: crates/web/ui
+        run: npm ci && npm run check && npm run build
       - uses: EmbarkStudios/cargo-deny-action@v2
         if: steps.changes.outputs.run_ci == 'true'
         with:
@@ -72,6 +82,14 @@ jobs:
         with:
           toolchain: 1.94.1
           targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/web/ui/package-lock.json
+      - working-directory: crates/web/ui
+        run: npm ci && npm run build
+      - run: test -f crates/web/ui/dist/index.html
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - uses: actions/upload-artifact@v4

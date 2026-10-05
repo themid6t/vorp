@@ -10,7 +10,11 @@ staging portion of M4 as active. Today the binary provides tunnels, a
 SQLite-backed dashboard, users, sessions, agent tokens, bind policies, a
 per-user traffic feed, live token revocation, and admin-set per-user quotas
 (tunnels, concurrent requests, bandwidth) that slow traffic before refusing it.
-The dashboard's HTTP API is listed in [docs/api.md](docs/api.md).
+The dashboard's HTTP API is listed in [docs/api.md](docs/api.md). The dashboard
+itself is a Svelte app in `crates/web/ui`, embedded into the binary: run
+`npm ci && npm run build` there before `cargo build`. For live reload, start a
+local relay and run `npm run dev`, which proxies `/api` to
+`https://127.0.0.1:8443` (override with `VORP_RELAY`).
 Supplied certificate files are checked every 30 seconds and reloaded for new
 TLS handshakes without interrupting existing connections; an invalid
 replacement leaves the last valid certificate in use. ACME DNS-01 and renewal,

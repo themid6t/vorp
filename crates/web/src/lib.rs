@@ -20,6 +20,7 @@ use std::{
 };
 use vorp_store::{BindPolicy, NewSession, NewUser, Repository, RepositoryError, User};
 mod access;
+mod assets;
 mod limits;
 mod quota;
 mod recovery;
@@ -180,10 +181,8 @@ pub fn router_with_runtime(
         traffic_stream_slots: Arc::new(Semaphore::new(MAX_TRAFFIC_STREAMS)),
     };
     Router::new()
-        .route("/", get(index))
-        .route("/dashboard.js", get(script))
-        .route("/dashboard.css", get(stylesheet))
-        .route("/fonts/{name}", get(font))
+        .route("/", get(assets::index))
+        .route("/{*path}", get(assets::file))
         .route("/healthz", get(health))
         .route("/api/config", get(public_config))
         .route("/api/bootstrap", post(bootstrap))
@@ -289,46 +288,6 @@ async fn stream_traffic(
         },
     );
     Ok(Sse::new(stream))
-}
-/// Scripts, styles and fonts load only from this origin, so injected markup
-/// cannot run inline code. `data:` images are the stylesheet's inline grain texture.
-const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-     font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; \
-     form-action 'none'; frame-ancestors 'none'";
-fn asset(content_type: &'static str, body: &'static [u8]) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::REFERRER_POLICY, "no-referrer"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
-}
-async fn index() -> Response {
-    asset("text/html; charset=utf-8", include_bytes!("dashboard.html"))
-}
-async fn script() -> Response {
-    asset(
-        "text/javascript; charset=utf-8",
-        include_bytes!("dashboard.js"),
-    )
-}
-async fn stylesheet() -> Response {
-    asset("text/css; charset=utf-8", include_bytes!("dashboard.css"))
-}
-/// The dashboard's embedded fonts (SIL OFL 1.1, see `fonts/OFL.txt`).
-async fn font(Path(name): Path<String>) -> Response {
-    let body: &'static [u8] = match name.as_str() {
-        "instrument-serif-400.woff2" => include_bytes!("fonts/instrument-serif-400.woff2"),
-        "ibm-plex-mono-400.woff2" => include_bytes!("fonts/ibm-plex-mono-400.woff2"),
-        "ibm-plex-mono-500.woff2" => include_bytes!("fonts/ibm-plex-mono-500.woff2"),
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    asset("font/woff2", body)
 }
 #[derive(Serialize)]
 struct ConfigBody {
@@ -1408,54 +1367,5 @@ mod tests {
         account(&router, "alice@example.test").await;
         let (_, body) = json(&router, get("/api/config")).await;
         assert_eq!(body["needs_bootstrap"], false);
-    }
-    #[tokio::test]
-    async fn dashboard_assets_carry_csp() {
-        let router = router(repo().await, config());
-        for (path, content_type) in [
-            ("/", "text/html"),
-            ("/dashboard.js", "text/javascript"),
-            ("/dashboard.css", "text/css"),
-            ("/fonts/ibm-plex-mono-400.woff2", "font/woff2"),
-        ] {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let header = |name| {
-                response
-                    .headers()
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            assert!(
-                header(header::CONTENT_TYPE).starts_with(content_type),
-                "{path}"
-            );
-            assert!(
-                header(header::CONTENT_SECURITY_POLICY).contains("script-src 'self'"),
-                "{path}"
-            );
-        }
-        let response = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/fonts/missing.woff2")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
