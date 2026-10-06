@@ -65,6 +65,42 @@ jobs:
       - if: steps.changes.outputs.run_ci == 'true'
         run: cargo test --all-features
 
+  # Built beside staging so a release tag can publish this commit's binaries
+  # without rebuilding. Staging itself runs amd64 only.
+  build-arm64:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.rust.outputs.run_ci == 'true'
+    needs: rust
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+          targets: aarch64-unknown-linux-musl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/web/ui/package-lock.json
+      - working-directory: crates/web/ui
+        run: npm ci && npm run build
+      - run: test -f crates/web/ui/dist/index.html
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - run: cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vorp-linux-arm64-${{ github.sha }}
+          path: target/aarch64-unknown-linux-musl/release/vorp
+          if-no-files-found: error
+          retention-days: 30
+
   staging:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.rust.outputs.run_ci == 'true'
     needs: rust

@@ -8,7 +8,7 @@ use vorp_agent::AgentConfig;
 use vorp_relay::{EdgeLimits, RelayConfig, SignupMode, TlsConfig};
 
 #[derive(Parser)]
-#[command(name = "vorp", about = "Self-hosted reverse tunnels")]
+#[command(name = "vorp", version, about = "Self-hosted reverse tunnels")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

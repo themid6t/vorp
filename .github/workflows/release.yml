@@ -1,0 +1,119 @@
+name: Release
+
+# Publishes the binaries CI built and staging ran for the tagged commit. It
+# never rebuilds: an annotated vX.Y.Z tag promotes an existing artifact.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  S3_BUCKET: get-vorp
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag
+        run: |
+          set -eu
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          [ "$(git cat-file -t "refs/tags/$TAG")" = tag ] || { echo "$TAG is not an annotated tag" >&2; exit 1; }
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "tag must be vX.Y.Z" >&2; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag is not on main" >&2; exit 1; }
+          version=${TAG#v}
+          crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "$crate_version" = "$version" ] || { echo "Cargo.toml is $crate_version, tag is $version" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Fetch the staged binaries
+        run: |
+          set -eu
+          run_id=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --event push \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          [ -n "$run_id" ] || { echo "no successful CI run on main for $GITHUB_SHA" >&2; exit 1; }
+          for arch in amd64 arm64; do
+            gh run download "$run_id" --name "vorp-linux-$arch-$GITHUB_SHA" --dir "bin/$arch"
+            chmod 755 "bin/$arch/vorp"
+          done
+          reported=$(bin/amd64/vorp --version)
+          [ "$reported" = "vorp $VERSION" ] || { echo "binary reports '$reported'" >&2; exit 1; }
+
+      - name: Package and write the manifest
+        run: |
+          set -eu
+          mkdir dist
+          for arch in amd64 arm64; do
+            tar -czf "dist/vorp_${VERSION}_linux_${arch}.tar.gz" -C "bin/$arch" vorp
+          done
+          artifact() {
+            file="dist/vorp_${VERSION}_linux_$1.tar.gz"
+            jq -n --arg filename "$(basename "$file")" --arg arch "$1" \
+              --arg sha256 "$(sha256sum "$file" | cut -d ' ' -f 1)" \
+              --argjson size "$(stat -c %s "$file")" \
+              '{filename: $filename, os: "linux", arch: $arch, sha256: $sha256, size: $size}'
+          }
+          jq -n --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
+            --argjson amd64 "$(artifact amd64)" --argjson arm64 "$(artifact arm64)" \
+            '{version: $version, commit: $commit, artifacts: [$amd64, $arm64]}' \
+            > dist/release-manifest.json
+          (cd dist && sha256sum vorp_*.tar.gz > SHA256SUMS)
+
+      - name: Sign the manifest
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          set -eu
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --armor --detach-sign --local-user "$GPG_KEY_ID" \
+            --output dist/release-manifest.json.asc dist/release-manifest.json
+          gpg --batch --verify dist/release-manifest.json.asc dist/release-manifest.json
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Archives have immutable names, so they go first. The signature goes
+      # before the manifest: a client racing the two writes may fail
+      # verification and retry, but can never accept mixed metadata. The
+      # installer goes last, once everything it trusts is in place. The bucket
+      # policy makes objects public; ACLs are disabled.
+      - name: Publish to S3
+        run: |
+          set -eu
+          s3="s3://$S3_BUCKET"
+          for archive in dist/vorp_*.tar.gz; do
+            aws s3 cp "$archive" "$s3/$(basename "$archive")"
+          done
+          aws s3 cp vorp.asc "$s3/vorp.asc" --content-type application/pgp-keys
+          aws s3 cp dist/release-manifest.json.asc "$s3/release-manifest.json.asc" \
+            --content-type application/pgp-signature --cache-control no-cache
+          aws s3 cp dist/release-manifest.json "$s3/release-manifest.json" \
+            --content-type application/json --cache-control no-cache
+          aws s3 cp install.sh "$s3/install.sh" --content-type text/x-shellscript --cache-control no-cache
+          printf '%s' "$VERSION" | aws s3 cp - "$s3/version.txt" \
+            --content-type text/plain --cache-control no-cache
+
+      - name: Create the GitHub release
+        run: |
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag \
+            dist/vorp_*.tar.gz dist/SHA256SUMS dist/release-manifest.json dist/release-manifest.json.asc
