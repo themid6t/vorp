@@ -7,8 +7,8 @@ up ([setup.md](setup.md)) and that you have a dashboard account on it.
 Commands use `example.com` as the relay's base domain, `myapp` as a reserved
 name, and a local service on `http://127.0.0.1:3000`. Substitute your own.
 
-v0.0.1 has no `vorp login`, `vorp http` or `vorp service install`. They are
-planned. Everything below uses the agent's flags.
+vorp does not have `vorp login`, `vorp http` or `vorp service install` yet.
+They are planned. Everything below uses the agent's flags.
 
 > **A tunnel URL is not access control.** Anyone who has the URL can reach the
 > service. Random names stop guessing, not sharing. Put authentication in the
@@ -256,6 +256,50 @@ Expected: `active`, `Linger=yes`, and a `tunnel registered ... url=https://myapp
 shows up as `agent authentication failed` in the journal every few seconds.
 Fix the cause, then `systemctl --user restart vorp-myapp`.
 
+### launchd agent (macOS)
+
+```sh
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
+cat > ~/Library/LaunchAgents/com.example.vorp-myapp.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.vorp-myapp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/vorp</string>
+    <string>--relay-host</string><string>example.com</string>
+    <string>--upstream</string><string>http://127.0.0.1:3000</string>
+    <string>--subdomain</string><string>myapp</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>NO_COLOR</key><string>1</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/vorp-myapp.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/vorp-myapp.log</string>
+</dict>
+</plist>
+EOF
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.example.vorp-myapp.plist
+```
+
+It starts at login and restarts if it exits. The token comes from
+`~/.config/vorp/authtoken` (step 4). The heredoc is unquoted on purpose, so
+`$HOME` is written into the log paths; launchd does not expand it.
+
+Check:
+
+```sh
+launchctl print "gui/$(id -u)/com.example.vorp-myapp" | grep 'state ='
+grep 'tunnel registered' ~/Library/Logs/vorp-myapp.log
+```
+
+Expected: `state = running`, and a `tunnel registered ... url=https://myapp.example.com` line.
+
+To stop it: `launchctl bootout "gui/$(id -u)/com.example.vorp-myapp"`.
+
 ### pm2
 
 Pass the token as a file only. pm2 shows a process's arguments and
@@ -288,7 +332,7 @@ The agent runs as a second container in the application's Pod. Containers in
 one Pod share the network namespace, so the upstream is loopback and
 `--allow-remote-targets` is not needed.
 
-There is no official image in v0.0.1. Build a small one from the verified
+There is no official image yet. Build a small one from the verified
 release binary. On a machine where the installer has put the binary at
 `/usr/local/bin/vorp`, with the same CPU architecture as the cluster nodes:
 
@@ -302,12 +346,12 @@ COPY vorp /usr/local/bin/vorp
 USER 65534:65534
 ENTRYPOINT ["/usr/local/bin/vorp"]
 EOF
-docker build -t registry.example.com/vorp-agent:0.0.1 .
-docker run --rm registry.example.com/vorp-agent:0.0.1 --version
-docker push registry.example.com/vorp-agent:0.0.1
+docker build -t registry.example.com/vorp-agent:0.0.2 .
+docker run --rm registry.example.com/vorp-agent:0.0.2 --version
+docker push registry.example.com/vorp-agent:0.0.2
 ```
 
-Expected: `vorp 0.0.1`. The binary is static; `ca-certificates` lets it verify
+Expected: `vorp 0.0.2`. The binary is static; `ca-certificates` lets it verify
 the relay's Let's Encrypt certificate.
 
 Store the token as a Secret, created from the file (not `--from-literal`,
@@ -344,7 +388,7 @@ spec:
           ports:
             - containerPort: 3000
         - name: vorp
-          image: registry.example.com/vorp-agent:0.0.1
+          image: registry.example.com/vorp-agent:0.0.2
           args:
             - --relay-host=example.com
             - --upstream=http://127.0.0.1:3000
@@ -399,7 +443,8 @@ protocol version 1. A mismatch makes the agent exit with
 `relay protocol version is unsupported`.
 
 - Host install: rerun the installer, then restart the agent
-  (`systemctl --user restart vorp-myapp` or `pm2 restart vorp-myapp`). The
+  (`systemctl --user restart vorp-myapp`, `pm2 restart vorp-myapp`, or on
+  macOS `launchctl kickstart -k "gui/$(id -u)/com.example.vorp-myapp"`). The
   installer keeps the previous binary as `/usr/local/bin/vorp.rollback`.
 - Container: rebuild the image from the new binary with a new tag, and update
   the Deployment.

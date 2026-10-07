@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs the vorp relay and agent binary on Linux (amd64, arm64).
+# Installs the vorp relay and agent binary on Linux and macOS (amd64, arm64).
 #
 #   curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
 set -eu
@@ -9,16 +9,17 @@ INSTALL_DIR="/usr/local/bin"
 SIGNING_KEY_FINGERPRINT="8D623B104588BCF08D40CD85A90F7A794E9AC93F" # gitleaks:allow -- public OpenPGP fingerprint
 
 detect_os() {
-    if [ "$(uname -s)" != "Linux" ]; then
-        echo "unsupported operating system: $(uname -s) (Linux only for now)" >&2
-        exit 1
-    fi
+    case "$(uname -s)" in
+        Linux)  echo "linux" ;;
+        Darwin) echo "darwin" ;;
+        *) echo "unsupported operating system: $(uname -s)" >&2; exit 1 ;;
+    esac
 }
 
 detect_arch() {
     case "$(uname -m)" in
-        x86_64)  echo "amd64" ;;
-        aarch64) echo "arm64" ;;
+        x86_64)        echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
         *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
     esac
 }
@@ -57,15 +58,35 @@ download_release_metadata() {
         "${metadata_dir}/release-manifest.json"
 }
 
+# Verifies "<sha256>  <file>" lines on standard input. macOS has shasum but
+# not always sha256sum.
+sha256_check() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c -
+    else
+        shasum -a 256 -c -
+    fi
+}
+
 install_binary_dependencies() {
     missing=""
-    for command in curl gpg jq sha256sum tar; do
+    for command in curl gpg jq tar; do
         if ! command -v "$command" >/dev/null 2>&1; then
             missing="${missing} ${command}"
         fi
     done
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        missing="${missing} sha256sum"
+    fi
     if [ -z "$missing" ]; then
         return
+    fi
+
+    if [ "$os" = "darwin" ]; then
+        # Homebrew refuses to run as root, so ask instead of installing.
+        echo "missing required commands:${missing}" >&2
+        echo "install them with: brew install gnupg jq   then rerun this installer" >&2
+        exit 1
     fi
 
     echo "Installing vorp verification prerequisites:${missing}"
@@ -88,18 +109,21 @@ install_binary_dependencies() {
 }
 
 install_binary() {
+    os=$(detect_os)
+    arch=$(detect_arch)
+    if [ "$os" = "darwin" ]; then
+        # sudo may drop Homebrew's directories from PATH.
+        PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+    fi
     install_binary_dependencies
     require_command jq
-    require_command sha256sum
     require_command tar
 
-    detect_os
-    arch=$(detect_arch)
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
     download_release_metadata "$tmpdir"
 
-    artifact=$(jq -er --arg os linux --arg arch "$arch" '
+    artifact=$(jq -er --arg os "$os" --arg arch "$arch" '
         [.artifacts[] | select(.os == $os and .arch == $arch)] |
         if length == 1 then .[0] else error("expected exactly one matching artifact") end
     ' "${tmpdir}/release-manifest.json")
@@ -109,14 +133,14 @@ install_binary() {
     checksum=$(printf '%s' "$artifact" | jq -er '.sha256 | select(test("^[0-9a-fA-F]{64}$"))')
     size=$(printf '%s' "$artifact" | jq -er '.size | select(type == "number" and . > 0 and . <= 52428800 and floor == .)')
 
-    echo "Downloading vorp ${version} (${arch})..."
+    echo "Downloading vorp ${version} (${os} ${arch})..."
     curl -fsSL "${S3_BASE}/${filename}" -o "${tmpdir}/vorp.tar.gz"
     actual_size=$(wc -c < "${tmpdir}/vorp.tar.gz" | tr -d ' ')
     if [ "$actual_size" != "$size" ]; then
         echo "archive size mismatch: got ${actual_size}, want ${size}" >&2
         exit 1
     fi
-    printf '%s  %s\n' "$checksum" "${tmpdir}/vorp.tar.gz" | sha256sum -c -
+    printf '%s  %s\n' "$checksum" "${tmpdir}/vorp.tar.gz" | sha256_check
 
     mkdir "${tmpdir}/extract"
     tar -xzf "${tmpdir}/vorp.tar.gz" -C "${tmpdir}/extract" vorp

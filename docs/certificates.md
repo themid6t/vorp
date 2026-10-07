@@ -1,6 +1,6 @@
 # TLS certificates with Cloudflare DNS and Certbot
 
-In `serve` mode, vorp v0.0.1 needs a certificate and private key supplied as
+In `serve` mode, vorp needs a certificate and private key supplied as
 files (`--tls-cert`, `--tls-key`). Built-in ACME is planned
 but not implemented. This page is the reference for
 the procedure in [README step 4](../README.md#4-get-a-wildcard-certificate):

@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Find the symptom, check the cause, apply the fix. Log lines and error texts
-below are quoted from vorp v0.0.1. Commands use `example.com` for the relay's
+below are quoted from the vorp source. Commands use `example.com` for the relay's
 base domain and `myapp` for a tunnel name.
 
 ## Reading logs
