@@ -1,100 +1,119 @@
 # vorp
 
-`vorp` is a self-hosted reverse tunnel relay. The same Rust binary runs the
-relay (`vorp serve`) and an outbound-only agent (`vorp`). A single TLS listener
-uses ALPN to separate agent sessions from the dashboard and public tunnel
-traffic. Tunnel bodies stream through yamux in bounded frames.
+`vorp` is a self-hosted reverse tunnel relay, like ngrok, that you run on your
+own server. One Rust binary does both jobs: `vorp serve` runs the relay, and
+`vorp` runs the agent next to the service you want to expose. The agent only
+makes outbound connections, so it works behind NAT and firewalls.
 
-The [roadmap](docs/roadmap.md) records M0–M2 as done, M3 as partial, and the
-staging portion of M4 as active. Today the binary provides tunnels, a
-SQLite-backed dashboard, users, sessions, agent tokens, bind policies, a
-per-user traffic feed, live token revocation, and admin-set per-user quotas
-(tunnels, concurrent requests, bandwidth) that slow traffic before refusing it.
-The dashboard's HTTP API is listed in [docs/api.md](docs/api.md). The dashboard
-itself is a Svelte app in `crates/web/ui`, embedded into the binary: run
-`npm ci && npm run build` there before `cargo build`. For live reload, start a
-local relay and run `npm run dev`, which proxies `/api` to
-`https://127.0.0.1:8443` (override with `VORP_RELAY`).
-Supplied certificate files are checked every 30 seconds and reloaded for new
-TLS handshakes without interrupting existing connections; an invalid
-replacement leaves the last valid certificate in use. ACME DNS-01 and renewal,
-agent sidecar probes, `install-service`, and `doctor` are still to build. M4
-container and installer artifacts remain. See the [wire contract](docs/protocol.md)
-for protocol details.
+- **One process, no external services.** The relay terminates TLS on `:443`
+  and routes on ALPN: agent sessions on one side, the dashboard and public
+  tunnels on the other. There is no nginx. State lives in an embedded SQLite
+  database.
+- **Bodies stream.** Request and response bodies pass through in bounded
+  frames with backpressure, so large uploads, downloads, SSE and WebSockets
+  work.
+- **Multi-user.** The embedded dashboard has accounts, agent tokens, reserved
+  names with admin approval, per-user quotas, live token revocation and a
+  per-user traffic feed.
 
-## Run with an existing wildcard certificate
+Status: v0.0.1, Linux amd64 and arm64. Setup is still manual. One-command
+setup with built-in ACME is planned for v0.1; see the [roadmap](docs/roadmap.md).
 
-Point the root and wildcard DNS names at the relay, and provide a certificate
-valid for both `example.com` and `*.example.com`:
+## Install
+
+```sh
+curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
+```
+
+The installer checks the release signature and the archive checksum, then
+installs `/usr/local/bin/vorp`. The same binary is the relay and the agent.
+
+## Run a relay
+
+You need a server with a public IP and TCP/443 open, a domain such as
+`example.com` with DNS records for `example.com` and `*.example.com` pointing at
+the server, and a wildcard certificate covering both names. With Cloudflare DNS
+and Let's Encrypt, follow the [certificate procedure](docs/certificates.md).
 
 ```sh
 vorp serve \
   --base-domain example.com \
-  --tls-cert /path/to/fullchain.pem \
-  --tls-key /path/to/privkey.pem \
+  --tls-cert /etc/vorp/fullchain.pem \
+  --tls-key /etc/vorp/privkey.pem \
   --database-path /var/lib/vorp/vorp.sqlite3
 ```
 
-For Cloudflare DNS and Let's Encrypt, follow the current
-[certificate setup and renewal procedure](docs/certificates.md). The relay
-currently reads supplied files; its built-in ACME issuer remains planned.
+To serve the dashboard from a name other than the base domain, add
+`--dashboard-host dashboard.example.com`. That name must also resolve to the
+relay. [`deploy/vorp-staging.service`](deploy/vorp-staging.service) is a
+hardened systemd unit you can adapt.
 
-The relay listens on `0.0.0.0:443` by default. Open `https://example.com/`
-right away: on an empty database the dashboard asks you to **create the admin
-account**, which works exactly once. Until you do, anyone who reaches the URL
-could claim it. Signup defaults to `closed`, so the admin adds users, who must
-choose their own password at first login; `--signup open` lets anyone
-register. Users request reserved subdomains and an admin approves them, unless
-the admin allows a user to reserve directly. Mint an agent token in the dashboard and copy it when shown; the raw
-value cannot be retrieved later.
+**Create the admin account right away.** On an empty database the dashboard
+asks for one, and whoever gets there first gets it. Signup is `closed` by
+default: the admin adds users, who choose their own password at first login.
+`--signup open` lets anyone register. Users request reserved names and an
+admin approves them, unless the admin lets a user reserve directly.
 
-If an account's password is lost, reset it on the relay host as the user that
-owns the database. The relay can keep running:
+Supplied certificate files are re-read every 30 seconds and used for new
+connections without dropping existing ones. An invalid replacement leaves the
+last valid certificate in use.
+
+To recover a lost password, run this on the relay host as the user that owns
+the database. The relay can keep running:
 
 ```sh
 sudo -u vorp vorp admin reset-password --email you@example.com \
   --database-path /var/lib/vorp/vorp.sqlite3
 ```
 
-It prints a new random password once and ends that account's sessions. The
-dashboard asks for a new password at the next login.
+## Run an agent
 
-Store the token locally by passing it on standard input, then start the agent:
+Create an agent token in the dashboard and copy it; it is shown only once.
+Save it, then start a tunnel:
 
 ```sh
-vorp authtoken < /path/to/token.txt
+vorp authtoken < token.txt
 vorp --relay-host example.com --upstream http://127.0.0.1:3000
+vorp --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp
 ```
 
-The agent resolves `--relay-host` on port 443; `--relay-addr 203.0.113.10:443`
-dials a fixed address instead while still verifying the certificate for the
-relay host.
+Without `--subdomain`, the tunnel gets a random name. A reserved name needs a
+token that allows it: `any` allows the user's reserved names, and `reserved`
+allows only the names in the token's allowlist.
 
-The token file defaults to `$XDG_CONFIG_HOME/vorp/authtoken`, or
-`$HOME/.config/vorp/authtoken` where XDG is unset. `--token-file` chooses another
-path; `VORP_TOKEN` can supply the token without a file. The agent rejects a
-non-loopback upstream unless `--allow-remote-targets` is explicit.
+- The token is read from `$XDG_CONFIG_HOME/vorp/authtoken` (or
+  `~/.config/vorp/authtoken`); `--token-file` or `VORP_TOKEN` override it.
+- Upstreams other than loopback are rejected unless `--allow-remote-targets`
+  is set, for example in a sidecar container pointing at `http://app:3000`.
+- `--relay-addr 203.0.113.10:443` dials a fixed address while still checking
+  the certificate for `--relay-host`.
 
-For local development, `--listen 127.0.0.1:8443` with `VORP_DEV_TOKEN` lets the
-relay run without the dashboard. Use `--dev-self-signed --dev-cert-out
-./vorp-dev.crt` to create a temporary certificate, and point the agent's
-`--ca-cert` at that file. Give the agent the same development token. The token
-is accepted only when **both** self-signed TLS and a loopback listener are
-configured. To test supplied certificate files instead, use the normal
-SQLite-backed account and token flow.
+**A tunnel URL is not access control.** Random names stop casual guessing, but
+anyone holding the URL can reach the service. Protect sensitive upstreams with
+their own authentication.
 
-A high-entropy tunnel URL prevents casual guessing; it is not access control.
-Anyone holding the URL can reach the tunneled application. Protect sensitive
-upstreams with their own authentication.
+## Develop
 
-## CI and staging
+The dashboard is a Svelte app in `crates/web/ui` that is embedded into the
+binary, so build it before Cargo:
 
-Pull requests with non-Markdown changes run formatting, Clippy, all-feature
-tests, and `cargo deny`. Markdown-only changes keep a lightweight green check
-and skip the Rust gates and deployment. After the checks pass on `main`,
-GitHub Actions builds a static Linux amd64 binary and deploys it to staging at
-`https://vorp-staging.themidst.xyz/`. The deployment checks the binary hash,
-restarts the service, verifies `/healthz`, and restores the previous binary
-if it fails. The [release plan](docs/releases.md) records the agreed single
-`main` branch and future tag-triggered production deployment. Production
-automation is not configured yet.
+```sh
+(cd crates/web/ui && npm ci && npm run build)
+cargo build
+```
+
+For live reload, start a local relay and run `npm run dev` in `crates/web/ui`.
+It proxies `/api` to `https://127.0.0.1:8443` (override with `VORP_RELAY`).
+
+For a local relay without the dashboard, run `vorp serve` with `--listen
+127.0.0.1:8443`, `--dev-self-signed --dev-cert-out ./vorp-dev.crt` and
+`VORP_DEV_TOKEN`. Point the agent's `--ca-cert` at that file and give it the
+same token. The relay accepts the development token only with **both** a
+self-signed certificate and a loopback listener.
+
+Contributor rules are in [AGENTS.md](AGENTS.md). The design is documented in:
+
+- [Wire protocol](docs/protocol.md)
+- [Dashboard API](docs/api.md)
+- [SQLite schema](docs/schema.md)
+- [CI and releases](docs/releases.md)

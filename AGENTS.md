@@ -336,11 +336,16 @@ cargo deny check          # or, at minimum, cargo audit
   the four CI gates; a passing push to `main` with such changes builds and
   deploys to staging automatically. The current pipeline is documented in
   `docs/releases.md`.
-- Production deployment on an annotated version tag is the agreed release
-  design, **not yet configured**. When it is implemented, promote the exact
-  artifact that passed staging for the same commit; do not rebuild on the tag.
-  Keep production credentials separate from staging and verify the Go relay
-  cutover plan before enabling the production deploy.
+- An annotated `vX.Y.Z` tag publishes a release (`release.yml`): it promotes
+  the binaries CI built for that commit, which staging already ran, and never
+  rebuilds on the tag. It signs the manifest and uploads the release to the
+  `get-vorp` S3 bucket and a GitHub Release. `install.sh` installs from there.
+  Bump `version` in the root `Cargo.toml` before tagging; the workflow rejects
+  a mismatch.
+- Production replaced the Go relay on 2026-10-07 and is upgraded by hand with
+  the installer. Automatic production deploys are not configured; if added,
+  they need credentials separate from staging. Operator details for specific
+  hosts stay out of this repo.
 - Until Vorp implements its own ACME DNS-01 issuer, deployed relays use
   supplied certificate files. Staging obtains and renews its wildcard cert
   through Certbot and the Cloudflare DNS plugin. Preserve the renewal hook and
