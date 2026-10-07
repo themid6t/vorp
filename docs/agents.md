@@ -137,6 +137,11 @@ recovered; create a new one and revoke the old one.
 
 ## 4. Save the token
 
+On Windows, install by hand from the latest GitHub Release (see the README),
+then pipe the token in: `Get-Content token.txt | vorp.exe authtoken`. It is
+saved to `%APPDATA%\vorp\authtoken`. The rest of this section is for Linux
+and macOS.
+
 On the machine that runs the agent:
 
 ```sh

@@ -23,8 +23,8 @@ routers, corporate firewalls and Kubernetes clusters.
                     *.example.com                  any network
 ```
 
-> **Status: v0.0.2.** The agent runs on Linux and macOS, the relay on Linux
-> (amd64 and arm64). Setting up a relay takes about
+> **Status: v0.0.3.** The agent runs on Linux and macOS (amd64 and arm64)
+> and Windows (amd64); the relay runs on Linux. Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
 > certificates is planned for v0.1.
 
@@ -173,6 +173,19 @@ vorp authtoken          # paste the token, then press Ctrl-D
 
 On macOS the installer needs GnuPG and jq to verify the download:
 `brew install gnupg jq` first.
+
+On Windows there is no installer yet. Download `vorp_<version>_windows_amd64.zip`
+and `SHA256SUMS` from the [latest release](https://github.com/themid6t/vorp/releases/latest),
+check the hash, and put `vorp.exe` somewhere on your `PATH`. In PowerShell:
+
+```powershell
+(Get-FileHash .\vorp_0.0.3_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+Select-String windows_amd64 .\SHA256SUMS      # the two hashes must match
+Expand-Archive .\vorp_0.0.3_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
+Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" authtoken
+```
+
+The token is saved to `%APPDATA%\vorp\authtoken`.
 
 This saves it to `~/.config/vorp/authtoken`, readable only by you. Prefer this,
 or `--token-file`, over passing the token as an argument, where `ps` and shell

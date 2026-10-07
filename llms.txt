@@ -2,7 +2,7 @@
 
 > vorp is a self-hosted reverse tunnel relay, like ngrok, written in Rust. One binary has two modes: `vorp serve` runs the relay on a server with a public IP and terminates TLS itself on port 443; plain `vorp` runs the agent next to a local HTTP service and gives it a public HTTPS URL such as `https://myapp.example.com`. The agent only makes outbound connections, so it works behind NAT and in Kubernetes. State is an embedded SQLite file; a built-in dashboard manages accounts, agent tokens, reserved names, quotas and revocation.
 
-Current release: v0.0.2. The agent runs on Linux and macOS, the relay on Linux (amd64 and arm64). Windows is not supported yet. The relay needs a supplied wildcard certificate (Certbot with the Cloudflare DNS plugin) and DNS-only records for the base domain and its wildcard. These do not exist yet and must not be used: `vorp setup`, `vorp doctor`, `vorp login`, `vorp http`, `vorp service install`, built-in ACME, an official container image. A tunnel URL is not access control: anyone with the URL can reach the service.
+Current release: v0.0.2. The agent runs on Linux and macOS (amd64, arm64) and Windows (amd64, manual install from GitHub Releases); the relay runs on Linux. The relay needs a supplied wildcard certificate (Certbot with the Cloudflare DNS plugin) and DNS-only records for the base domain and its wildcard. These do not exist yet and must not be used: `vorp setup`, `vorp doctor`, `vorp login`, `vorp http`, `vorp service install`, built-in ACME, an official container image. A tunnel URL is not access control: anyone with the URL can reach the service.
 
 ## Tasks
 
