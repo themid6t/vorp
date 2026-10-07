@@ -1,282 +1,110 @@
-# vorp build roadmap
+# vorp roadmap
 
-How this gets built, split so several agents can work at once without colliding.
+## Where it stands (v0.0.1)
 
-Current state: M0, M1, and M2 are implemented; M3 is partial; M4 has a working
-staging build/deployment pipeline but other distribution work remains. Local
-smoke checks cover a streamed HTTP upload and response, a WebSocket echo,
-SQLite-backed agent authentication, live token revocation,
-and certificate-file hot reload. Production TLS currently requires supplied
-certificate files; the development mode generates a self-signed certificate
-that the agent can explicitly trust. Staging obtains its wildcard certificate
-externally with Certbot and Cloudflare DNS-01, as described in
-[certificates.md](certificates.md). Built-in ACME issuance is not implemented.
+The rewrite is complete and in production: it replaced the Go relay on
+2026-10-07. A release has:
 
-| Milestone | Status | Delivered / remaining |
-|---|---|---|
-| M0 — scaffold | Done | Five-crate workspace, pinned toolchain, CI gates, protocol and schema contracts. |
-| M1 — tunnels | Done | TLS/ALPN relay, outbound agent over yamux, streamed HTTP bodies, WebSocket forwarding, tunnel lifecycle. |
-| M2 — auth and state | Done | SQLite repository, local users and opaque sessions, dashboard/API, bind ACL, scoped traffic feed, live token revocation. |
-| M3 — production surface | Partial | Supplied certificate files reload without dropping existing connections. ACME DNS-01 and renewal, agent sidecar probes, `install-service`, and `doctor` remain. |
-| M4 — distribution | Partial | GitHub Actions builds a static Linux amd64 binary and deploys passing `main` commits to staging. Container image, Compose, Helm, production release workflow, signed manifest, and installer remain. |
+- A TLS relay on one `:443` listener that routes on ALPN: agent sessions over
+  yamux, and the dashboard plus public tunnels over HTTP/1.1 and HTTP/2.
+- An outbound-only agent. Request and response bodies stream in both
+  directions with backpressure; SSE and WebSocket work through a tunnel.
+- SQLite state: users with argon2id passwords, opaque server-side sessions,
+  agent tokens stored as SHA-256 hashes, bind policies, reserved names with
+  admin approval, and live revocation that closes the token's sessions.
+- Per-user quotas (tunnels, concurrent requests, bandwidth) that slow traffic
+  before refusing it, plus edge limits on connections, request rate, slow
+  headers and WebSockets.
+- An embedded Svelte dashboard, with a per-user traffic feed.
+- Supplied certificate files, re-read every 30 seconds without dropping
+  connections.
+- Signed static Linux amd64 and arm64 builds with an installer
+  ([releases.md](releases.md)).
 
-Two rules make the parallelism actually work:
-
-1. **Every workstream owns a disjoint set of paths.** No two agents edit the same
-   file. Where a boundary is shared, one workstream owns it and the others
-   consume it.
-2. **Seams are agreed before the work starts, not during.** M0 lands the types,
-   signatures and schema as compiling stubs. After that, a workstream can be
-   written against a `todo!()` it does not own.
-
----
+Not yet: built-in ACME, a setup command, service installation, macOS builds,
+and a container image. The relay still gets its certificate from Certbot
+([certificates.md](certificates.md)).
 
 ## Crate layout
 
 ```
 vorp/
-├── Cargo.toml              workspace
-├── rust-toolchain.toml     pinned toolchain
 ├── AGENTS.md               ground rules (CLAUDE.md is a symlink to it)
-├── docs/
-│   ├── protocol.md         the wire contract
-│   ├── roadmap.md          this file
-│   └── schema.md           SQLite schema + repository signatures
+├── docs/                   protocol, API, schema, releases, certificates, this file
 ├── crates/
 │   ├── protocol/           frames, message types, codec. No I/O except AsyncRead/Write.
 │   ├── store/              SQLite: migrations, models, every SQL statement.
-│   ├── relay/              serve mode: ALPN listener, sessions, tunnel map, proxy, ACME.
+│   ├── relay/              serve mode: ALPN listener, sessions, tunnel map, proxy.
 │   ├── agent/              agent mode: dial, register, forward to upstream.
-│   └── web/                axum: dashboard, /api, auth, embedded assets.
-└── src/main.rs             the single binary; wires modes together. Thin.
+│   └── web/                axum: dashboard, /api, auth; the Svelte UI in web/ui.
+├── deploy/                 staging unit, deploy and certificate hook scripts
+├── install.sh              verified installer, published with each release
+└── src/main.rs             the single binary; wires the modes together. Thin.
 ```
 
-`acme` is a module inside `relay`, not a crate — it is a few hundred lines and
-has exactly one consumer.
+ACME will be a module inside `relay` (`crates/relay/src/acme/`), not a crate.
 
----
+## v0.1: open-source release
 
-## Workstreams
+Goal: someone (or an AI agent acting for them) goes from nothing to a working
+relay with one install command and one setup command, and from a fresh laptop
+to a live tunnel with two commands. Decided 2026-10-05: **MIT license**,
+**built-in ACME is in v0.1**, and **native services are the default** for
+keeping things running, with pm2 and containers as cookbooks.
 
-| # | Workstream | Owns | Depends on |
-|---|---|---|---|
-| **1** | Wire protocol + agent | `crates/protocol`, `crates/agent`, `docs/protocol.md` | — |
-| **2** | Dashboard, auth, persistence | `crates/web`, `crates/store`, `docs/schema.md` | M0 seams |
-| **3** | Relay / tunnel control plane | `crates/relay` | `protocol` types, `store` signatures |
-| **4** | Integrations | `crates/relay/src/acme/`, `crates/agent/src/health.rs`, `src/main.rs` subcommands | M1 working tunnel |
-| **5** | Deployment | `deploy/`, `Dockerfile`, `.github/workflows/`, `install.sh` | M1 buildable binary |
+Order matters: ACME comes first, because `setup` and `doctor` depend on it.
 
-### 1 — Wire protocol + agent
+1. **Project basics.** `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`,
+   `CHANGELOG.md`. The repository stays private until the license exists.
+2. **Built-in ACME DNS-01** (`instant-acme`): wildcard issuance for `domain` +
+   `*.domain`, a renewal task, hot replacement through the existing
+   certificate-reload path, and an `AcmeDns` trait with Cloudflare first.
+   Supplied certificate files remain an alternative. The certificate has to be
+   a wildcard because tunnel names are random; per-name TLS-ALPN-01
+   certificates would hit Let's Encrypt's limit of 50 per week.
+3. **Settings from the environment.** Every `serve` flag also reads a
+   `VORP_*` variable (clap `env`), so systemd, Docker and agents share one
+   `/etc/vorp/vorp.env`. No new config-file format.
+4. **`vorp doctor [--json]`.** Checks DNS for the root and wildcard, that :443
+   is free or held by vorp, the DNS-provider token, certificate validity, and
+   database access. Output is machine-readable, with stable check ids so an
+   agent can act on failures.
+5. **`vorp setup`.** Runs non-interactively with flags (`--domain`,
+   `--cloudflare-token-file`, `--admin-email`, `--yes`). It runs `doctor`,
+   creates missing DNS records, gets the certificate, writes
+   `/etc/vorp/vorp.env`, installs and starts the service, creates the admin,
+   and prints the dashboard URL.
+6. **Close the bootstrap race.** Today the first visitor to the dashboard
+   becomes admin. On a public install the admin is created from the command
+   line by `setup`, or the relay prints a one-time setup code that the
+   bootstrap page requires.
+7. **`vorp service install`** for the relay (a system unit, hardened like the
+   staging unit) and the agent (a systemd user unit with linger on Linux,
+   launchd on macOS).
+8. **Agent first run.** `vorp login <relay>` stores the relay host and the
+   token once; the token comes from a prompt or standard input, never an
+   argument. `vorp http <port> [--name <reserved>]` opens a tunnel to
+   `127.0.0.1:<port>`. The existing flags keep working.
+9. **"Connect an agent" in the dashboard.** After a token is created, the
+   dashboard shows the install command, `vorp login`, `vorp http` and a
+   Compose sidecar snippet, filled in with this relay's domain and version so
+   the agent always matches the relay's protocol.
+10. **Releases for every platform.** Add macOS amd64 and arm64 to the existing
+    Linux builds, and teach `install.sh` to install them.
+11. **Docs.** A README quickstart and `docs/setup.md`, written as a runbook
+    with exact commands, the expected output, and the fix for each `doctor`
+    failure, for people and AI agents alike. Cookbooks in `docs/cookbook/` for
+    systemd, launchd, pm2 (token file only: a `--token` argument shows in `ps`
+    and in pm2's saved process list), and a Docker Compose sidecar
+    (`--allow-remote-targets --upstream http://app:3000`). User-facing docs must
+    say that a tunnel URL is not access control.
 
-The protocol crate and the agent are one workstream because they are two halves
-of the same contract, and the agent is the protocol's first real consumer and its
-best test.
+## v0.2
 
-- `protocol`: frame codec (`encode`/`decode` over `AsyncRead`/`AsyncWrite`), the
-  message enum, payload types, error codes, close reasons, `PROTOCOL_VERSION`.
-  Table-driven tests are **required**: round-trip, truncated frame, oversized
-  declared length, unknown type, chunk/end sequencing.
-- `agent`: TLS dial with ALPN verification, register, heartbeat sender, tunnel
-  registration + recoverable re-register with backoff, request-stream handler
-  that streams to and from the configured upstream, upstream validation (fail
-  closed, loopback-only unless `--allow-remote-targets`), persisted authtoken.
-
-Done when: the agent can register against a stub relay and stream a request both
-ways, with the body never collected.
-
-### 2 — Dashboard, auth, persistence
-
-Owns the schema outright, because auth is its core and split ownership of
-migrations is how two agents corrupt each other's work.
-
-- `store`: migrations, `users`, `sessions`, `tokens`, `reserved_subdomains`,
-  `profiles`-equivalent fields; every SQL statement in this crate and nowhere
-  else.
-- `web`: argon2id registration/login, opaque server-side sessions
-  (`HttpOnly; Secure; SameSite=Lax`), first-run bootstrap admin, admin-creates-user,
-  `signup: open | closed`, token CRUD (raw value shown once), reserved
-  subdomain CRUD, tunnel list/force-close, per-user traffic feed, embedded assets.
-
-**Deliver the token and subdomain repository methods first**, ahead of the
-dashboard UI — workstream 3 is blocked on them and on nothing else here.
-
-Done when: a user can register, log in, mint a token, see their tunnels, and
-revoke a token — and revoking kills the live session.
-
-### 3 — Relay / tunnel control plane
-
-- Single `:443` rustls acceptor, ALPN dispatch, `Host`-based split between
-  dashboard and tunnel proxy.
-- Agent session lifecycle: register, token resolution, `(user_id, machine_id)`
-  slot displacement, heartbeat reader, teardown-once, `Arc::ptr_eq`-guarded map
-  removal.
-- Tunnel map, auto-slug assignment (CSPRNG, no fallback), atomic check-and-set.
-- `decide_bind` — the bind ACL as a pure function with a table-driven test,
-  ported from the Go `decideBind`.
-- The proxy path: normalization (§8 of the protocol spec), streaming both
-  directions, WebSocket upgrade, concurrency caps, idle/head timeouts.
-- `disconnect_token(token_id)` so revocation terminates live sessions.
-
-Done when: a browser request reaches a local service through the relay and
-streams back, and the bind ACL is enforced.
-
-### 4 — Integrations
-
-- ACME DNS-01 via `instant-acme`: wildcard issuance, renewal task, hot cert
-  reload into rustls without dropping connections.
-- An `AcmeDns` trait with Cloudflare as the first implementation.
-- Bring-your-own-cert path: if `tls.cert`/`tls.key` are configured, skip ACME and
-  watch the files for changes.
-- Agent sidecar liveness/readiness probes. Keep the agent outbound-only; use
-  exec probes or local state instead of adding an inbound HTTP listener.
-- `vorp install-service` (emit a systemd unit) and `vorp doctor` (diagnose DNS,
-  cert, port binding, and connectivity in machine-readable output, so an agent
-  setting this up can act on the result).
-
-### 5 — Deployment
-
-- Multi-arch distroless container image, non-root, read-only rootfs compatible.
-- `docker-compose.yml` for the relay, one-command local bring-up.
-- Helm chart: relay Deployment/Service/Ingress-free (it owns :443), plus an agent
-  sidecar example.
-- Release workflow: cross-compiled binaries, checksums, signed manifest.
-- `install.sh` honouring the signed manifest.
-
-Mostly not Rust, so it runs in parallel with everything from M1 onward.
-
----
-
-## Milestones
-
-### M0 — Scaffold *(done)*
-
-Workspace, five crates, `rust-toolchain.toml`, CI with all four gates
-(`fmt`, `clippy -D warnings`, `test`, `deny`), `docs/schema.md`, and **stubs for
-every shared seam**: protocol message types and codec signatures, store
-repository method signatures, config struct. Everything compiles; bodies are
-`todo!()`.
-
-Nothing else may start until the seams exist, and nothing in M0 implements
-behaviour — it exists purely so four agents can then work without blocking.
-
-### M1 — It tunnels *(done; WS1 ∥ WS3)*
-
-Hardcoded token, in-memory tunnel map, self-signed cert, no dashboard, no
-database. `curl https://<slug>.localhost` reaches a local service and streams
-back. WebSocket works.
-
-This is proof of life and the highest-value milestone — everything after it is
-addition rather than discovery.
-
-### M2 — Real auth and state *(done; WS2, then WS3 swaps in)*
-
-SQLite, users, sessions, login, token CRUD, dashboard pages. WS3 replaces the
-hardcoded token with a store lookup plus the bind ACL, and wires revocation to
-session termination.
-
-### M3 — Production surface *(partial; WS4)*
-
-ACME DNS-01 with hot reload, BYO cert, health probes, `install-service`,
-`doctor`, per-user traffic feed.
-
-Done: BYO certificate loading and 30-second file-change checks for new TLS
-handshakes, plus the per-user traffic feed delivered with M2. Still needed:
-ACME DNS-01 wildcard issuance and renewal with hot certificate replacement;
-outbound-only agent sidecar probes; `install-service`; and `doctor`.
-
-### M4 — Distribution *(partial; WS5)*
-
-The [staging pipeline](releases.md) is live. Image, compose, chart,
-tag-triggered production deployment, signed manifest, and install script
-remain.
-
----
-
-## Production cutover gates
-
-These gates are for replacing the running Go relay. They are ordered by what
-must be learned or built first. Passing staging smoke tests alone does not
-clear them.
-
-1. **No migration (decided).** The Go relay has a single user, so nothing is
-   imported. Production starts from an empty database: bootstrap a new admin,
-   mint new agent tokens, re-reserve any names, and switch agents to the
-   `vorp-agent/1` binary. No migration tooling is needed.
-2. **Fresh edge and protocol review (done 2026-10-05).** Every October 1
-   review finding was rechecked against current code. Most were already fixed
-   by later commits (rate and connection limits, slow-client timers, WebSocket
-   slot release, revocation race, machine-identity collisions, ALPN fallback,
-   chunked responses, single-write frames, a single subdomain validator).
-   This pass adds TCP keepalive so vanished WebSocket clients release their
-   slots, and per-user traffic history. It also writes down the remaining
-   policies: no body byte limit (streaming plus the bandwidth quota), no
-   trusted-proxy setting (the relay must be DNS-only), and yamux default
-   windows. Rejected as not worth churning: moving the dashboard runtime
-   traits out of `vorp-web`.
-3. **Representative staging exercise.** Test large streamed uploads and
-   downloads, SSE, WebSocket upgrades and rejected handshakes, reconnects,
-   token revocation, slow or malformed requests, and sustained concurrency.
-   Record throughput, memory, connection counts, and failure behavior on a
-   host sized like production; the tiny staging instance and existing smoke
-   tests alone do not establish production capacity.
-4. **Data recovery and operations.** Put SQLite on persistent storage, take
-   scheduled consistent backups, and restore one into a fresh instance.
-   Define retention, integrity checks, monitoring/alerts, and the response to
-   a failed certificate renewal or unhealthy relay. Test schema migration and
-   rollback together: reverting only the binary may not undo a database
-   migration. See [certificate operations](certificates.md) for the current
-   external renewal path.
-5. **Production release automation.** Implement the annotated-version-tag
-   workflow in [releases.md](releases.md). Verify that the tagged commit passed
-   CI and staging, fetch the exact staged artifact, verify its checksum, and
-   deploy with production-only credentials. Add health verification and a
-   workflow to redeploy a previous released artifact. Account for the current
-   30-day staging-artifact retention period and restrict who can create or move
-   release tags before enabling automatic production deployment.
-6. **Switch.** Verify production host architecture, access, DNS, TLS,
-   storage, and observability. Keep the Go service available as the rollback
-   target until the new relay has run cleanly, then change production DNS and
-   enable the tag deployment.
-
-**Next:** gate 3, a representative load exercise on a production-sized host.
-
-### Open-source one-shot release after the cutover
-
-The current [Certbot and Cloudflare procedure](certificates.md) can provide a
-production certificate, so built-in ACME is not required to replace the Go
-relay. It *is* required for the intended one-shot self-hosted experience.
-Complete the remaining M3 integration work (built-in ACME DNS-01 renewal,
-agent sidecar probes where Kubernetes is supported, `install-service`, and
-`doctor`) and M4 distribution work (container image, Compose, Helm,
-multi-architecture binaries, signed release manifest, and installer) before
-calling the open-source distribution complete.
-
----
-
-## Parallelism map
-
-```
-M0 ─┬──> WS1 (protocol + agent) ─┬──> M1 ─┬──> WS4 (integrations) ──> M3 ─┐
-    │                            │        │                               ├──> M4
-    ├──> WS3 (relay) ────────────┘        └──> WS5 (deployment) ──────────┘
-    │
-    └──> WS2 (store + web) ──────────────────> M2
-```
-
-- WS1 and WS3 both consume `protocol`; **WS1 owns it**, WS3 only imports.
-- WS3 consumes `store`; **WS2 owns it**, WS3 only imports. WS2's first deliverable
-  is the token/subdomain methods so WS3 is never waiting.
-- WS2 is independent of M1 entirely — it can run from M0 to completion in
-  parallel with the tunnel work.
-- `src/main.rs` is touched by WS4 only. WS1/WS3 expose library entry points and
-  do not wire the CLI.
-
-## Conflict rules
-
-- Touching a path another workstream owns: don't. Ask for the change instead.
-- Changing a shared seam (protocol type, store signature): it is a spec change —
-  update `docs/protocol.md` or `docs/schema.md` in the same commit and say so, so
-  the other workstreams see it.
-- Adding a dependency: it passes `cargo deny`, or it does not go in.
-- A workstream is done when its gates pass **and** its tests cover the branches
-  `AGENTS.md` requires, not when the happy path works.
+- Several named tunnels from one agent process (`tunnels.toml`, `vorp start
+  [name]`). Today one agent process serves one upstream.
+- A container image and Compose file for the relay; a Homebrew tap.
+- CLI login approved in the dashboard instead of copying a token.
+- Kubernetes: outbound-only agent sidecar probes and a Helm chart.
+- API tokens and an agent-facing API description. The flow is still to be
+  designed.

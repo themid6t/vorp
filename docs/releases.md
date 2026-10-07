@@ -10,16 +10,13 @@ already passed staging. There is no permanent `dev` branch.
 | Markdown-only pull request or push | Lightweight successful check | None |
 | Annotated `vX.Y.Z` tag on a validated `main` commit | Verify the exact commit passed CI and staging; use its existing builds | Publish them to the `get-vorp` bucket and a GitHub Release. Production deployment is still manual |
 
-The tag is the human production release decision. The production workflow must
-not rebuild from the tag: it should fetch the artifact produced for the same
-commit that ran on staging, verify its checksum, and deploy it. Record the
-commit, artifact checksum, deployment result, and previous version. Reject tags
-pointing outside `main`, tags without a successful staging deployment, and tags
-whose artifact has expired. Staging artifacts currently expire after 30 days.
-Markdown-only commits do not produce an artifact, so tag the latest commit that
-actually passed staging; it may be an ancestor of the current `main` tip.
-Tags should not be moved or deleted. Use GitHub tag
-rulesets and deployment environments when the repository plan permits them.
+The tag is the release decision. The release workflow never rebuilds: it
+publishes the binaries CI built for the same commit, which staging already ran.
+It rejects tags that are not annotated, not on `main`, or do not match the
+crate version. Staging artifacts expire after 30 days, so tag within that
+window. Markdown-only commits produce no artifact, so tag the latest commit
+that actually passed staging; it may be an ancestor of the `main` tip. Never
+move or delete a tag.
 
 ## Publishing a release
 
@@ -57,11 +54,12 @@ Repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 
 ## Production
 
-Production deployment is **not configured yet**. Before replacing the running
-Go relay, verify the production host architecture, SSH access, cert paths,
-database migration/backup plan, health check, and rollback. Then add a
-production deploy credential and workflow; do not reuse the staging key. A
-rollback workflow should redeploy a previously released artifact by checksum.
+The maintainer's production relay is upgraded by hand: rerun the installer on
+the host, then `sudo systemctl restart vorp`. The installer keeps the previous
+binary as `/usr/local/bin/vorp.rollback`. A nightly systemd timer takes a
+`sqlite3 .backup` of the database, checks its integrity, and keeps 14 days.
+Automatic production deployment on a tag is not planned before v0.1. If it is
+added, it must use credentials separate from staging.
 
 ## Current staging deployment
 
@@ -69,8 +67,8 @@ The `CI` workflow builds and type-checks the embedded dashboard, then runs all f
 `main` when a non-Markdown file changes. A Markdown-only change keeps a green
 `rust` check but skips compilation and deployment. This allows the check to be
 required by future branch protection without leaving documentation PRs
-pending. A successful code push to `main` builds a static Linux amd64 binary on a
-GitHub-hosted runner. It copies the binary to a dedicated `vorp-deploy` account
+pending. A successful code push to `main` builds static Linux amd64 and arm64 binaries
+on GitHub-hosted runners and keeps both as artifacts. Only amd64 is deployed. It copies the binary to a dedicated `vorp-deploy` account
 over SSH and
 invokes `/usr/local/sbin/vorp-deploy-staging` through a narrowly scoped sudo
 rule. The server verifies the checksum, replaces `/opt/vorp/vorp`, restarts
@@ -89,11 +87,11 @@ sudo systemctl daemon-reload && sudo systemctl restart vorp
 Repository configuration:
 
 - `STAGING_SSH_KEY` (secret): private key for the dedicated deploy account.
-- `STAGING_SSH_HOST` (variable): `vorp-staging.themidst.xyz`.
+- `STAGING_SSH_HOST` (variable): the staging hostname.
 - `STAGING_SSH_KNOWN_HOSTS` (variable): pinned ED25519 host key, checked against
   the staging host before adding it.
 
 The matching public key is restricted from forwarding and interactive TTY use.
-Only the deploy script is permitted through sudo. If the EC2 public address
+Only the deploy script is permitted through sudo. If the host's public address
 changes, update DNS; the workflow connects by hostname. GitHub-hosted runner
 source IPs change, so staging SSH must be reachable from those runners.

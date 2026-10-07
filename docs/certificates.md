@@ -2,24 +2,24 @@
 
 Vorp currently needs a supplied certificate and private key in `serve` mode.
 The built-in ACME DNS-01 issuer in the roadmap is not implemented yet. This
-procedure matches the staging host as of October 2026. It uses Let's Encrypt,
+procedure is the one staging and production use today. It uses Let's Encrypt,
 Certbot, and the Cloudflare DNS plugin; Vorp itself still terminates TLS on
 port 443. No nginx or Cloudflare proxy sits in the agent connection path.
 
 ## 1. DNS and Cloudflare token
 
-For a relay at `vorp-staging.themidst.xyz`, make **DNS-only** Cloudflare A
-records for `vorp-staging` and `*.vorp-staging`, both pointing at the relay's
-public address. For another installation, substitute its relay domain and
-create records for both that domain and its wildcard. DNS-only is necessary
+For a relay at `example.com`, make **DNS-only** Cloudflare A records for
+`example.com` and `*.example.com`, both pointing at the relay's public address.
+A subdomain works the same way: a relay at `tunnels.example.com` needs
+`tunnels` and `*.tunnels`. DNS-only is necessary
 for the agent's `vorp-agent/1` TLS ALPN connection to reach Vorp directly.
 Open TCP/443 on the server. DNS-01 issuance itself does not require inbound
 HTTP traffic.
 
-Create a Cloudflare API token scoped to the DNS zone (`themidst.xyz` for this
-staging host) with **Zone → DNS → Edit** permission. Certbot creates and removes
-the `_acme-challenge` TXT records. Use a zone-scoped API token, not the Global
-API Key. The [Certbot Cloudflare plugin documentation](https://certbot-dns-cloudflare.readthedocs.io/en/stable/)
+Create a Cloudflare API token scoped to the DNS zone (`example.com`) with
+**Zone → DNS → Edit** permission. Certbot creates and removes the
+`_acme-challenge` TXT records. Use a zone-scoped API token, not the Global API
+Key. The [Certbot Cloudflare plugin documentation](https://certbot-dns-cloudflare.readthedocs.io/en/stable/)
 describes this permission and credentials format.
 
 ## 2. Install Certbot and protect the token
@@ -59,14 +59,13 @@ sudo certbot certonly \
   --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
   --dns-cloudflare-propagation-seconds 30 \
   --key-type ecdsa \
-  --cert-name vorp-staging.themidst.xyz \
+  --cert-name example.com \
   --deploy-hook /usr/local/libexec/vorp-cert-deploy \
-  -d vorp-staging.themidst.xyz \
-  -d '*.vorp-staging.themidst.xyz'
+  -d example.com \
+  -d '*.example.com'
 ```
 
 Replace the example email with your own address before running the command.
-For another installation, replace every occurrence of the staging domain.
 The explicit `--cert-name` gives the renewal lineage a predictable name.
 The hook copies Certbot's renewed files into `/etc/vorp` as `root:vorp 0640`;
 the Vorp service user can read them while Certbot's private archive remains
@@ -76,15 +75,14 @@ Point Vorp at the copied files:
 
 ```sh
 vorp serve \
-  --base-domain vorp-staging.themidst.xyz \
-  --dashboard-host vorp-staging.themidst.xyz \
+  --base-domain example.com \
+  --dashboard-host example.com \
   --tls-cert /etc/vorp/fullchain.pem \
   --tls-key /etc/vorp/privkey.pem \
   --database-path /var/lib/vorp/vorp.sqlite3
 ```
 
-This is the staging service's effective configuration; use your own domain
-and database path elsewhere. Vorp checks the certificate files every 30
+Vorp checks the certificate files every 30
 seconds and uses a valid replacement for new TLS handshakes without a service
 restart. Existing connections keep running.
 
@@ -97,7 +95,7 @@ sudo systemctl status certbot.timer
 sudo certbot renew --dry-run
 sudo stat -c '%U %G %a %n' /etc/vorp/fullchain.pem /etc/vorp/privkey.pem
 curl -fsS -o /dev/null -w '%{http_code} TLS=%{ssl_verify_result}\n' \
-  https://vorp-staging.themidst.xyz/healthz
+  https://example.com/healthz
 ```
 
 Expect both the base and wildcard names in `certbot certificates`, an active
@@ -111,7 +109,6 @@ explains how renewal reuses the saved plugin settings and deploy hook.
 Certbot may add a random delay before a noninteractive dry run; wait for its
 final success or failure message.
 
-Staging currently uses Certbot 4.0.0 and an ECDSA certificate for
-`vorp-staging.themidst.xyz` and `*.vorp-staging.themidst.xyz`. The Cloudflare
-token stays only on the host at `/etc/letsencrypt/cloudflare.ini`. GitHub
-Actions deploys only the Vorp binary; it does not manage the token or TLS files.
+The Cloudflare token stays only on the host, at
+`/etc/letsencrypt/cloudflare.ini`. CI deploys only the Vorp binary; it never
+handles the token or the TLS files.
