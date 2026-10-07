@@ -14,9 +14,8 @@ SQLite in-process. Auth is local email/password with argon2id and opaque
 server-side sessions. The agent **only dials outbound** — it never accepts an
 inbound connection, which is what lets it run behind NAT.
 
-This is a rewrite of a Go implementation. Rules below that exist because of a
-specific bug or decision in that version say so; that "why" is what stops them
-being undone.
+Rules below that exist because of a specific bug or decision say so; that
+"why" is what stops them being undone.
 
 ---
 
@@ -28,8 +27,8 @@ the PR description, not a drive-by commit.
 - **No Postgres.** The tunnel and session maps are in-memory, so a second relay
   instance cannot route to the first's agents — there is no horizontal scaling
   story for Postgres to enable yet. SQLite only until a multi-node design exists.
-- **No JWT / JWKS.** Opaque server-side sessions. The Go version verified
-  Supabase ES256 JWTs against a JWKS; that entire layer is gone.
+- **No JWT / JWKS.** Opaque server-side sessions, killable from the server.
+  No external identity provider.
 - **No CORS, no `dashboard_origin`.** The dashboard is same-origin and embedded.
   If you find yourself adding an `Access-Control-Allow-Origin` header, something
   upstream is wrong.
@@ -41,8 +40,7 @@ the PR description, not a drive-by commit.
   substitute for the user quota. Keep the limit values on the session/tunnel
   structs, populated from the user's stored policy, not global consts.
 - **No protocol version-branching machinery.** Send the version, reject a
-  mismatch. The Go docs described a `handleAgentV1`/`V2` split that never existed
-  in code; build the branch when a V2 actually exists.
+  mismatch. Build a branch when a V2 actually exists, not before.
 - **No QUIC.** UDP/443 is blocked on enough networks that it needs a TCP
   fallback, i.e. two transports to maintain. yamux-over-TLS is proven here.
 - **No nginx, no pm2, no separate dashboard deploy.** One binary, one process.
@@ -70,14 +68,14 @@ the PR description, not a drive-by commit.
   wakes both halves on any inner wake.
 - **Guard every map removal with `Arc::ptr_eq`.** Session and tunnel maps hold
   `Arc<T>`; remove an entry only when the stored `Arc` is still *the same
-  allocation* you are tearing down. This is the Go `DeleteIfMatch` pattern, and it
-  exists because of a real bug class: an agent reconnects (or a tunnel
+  allocation* you are tearing down (delete-if-match). It exists because of a
+  real bug class: an agent reconnects (or a tunnel
   re-registers after a recoverable close) and stores a replacement under the same
   key *before* the old session's teardown runs — an unguarded `remove` then
   deletes the live replacement.
 - **Teardown runs exactly once** per session, from whichever task gets there
   first (`OnceCell` / `AtomicBool` / `tokio::sync::OnceCell`), and is safe to call
-  concurrently. Ported from the Go `sync.Once` teardown.
+  concurrently.
 - Prefer `Arc<Mutex<HashMap<..>>>` (or `dashmap`) over hand-rolled sharding until
   a profile says otherwise.
 
@@ -96,13 +94,10 @@ the PR description, not a drive-by commit.
 - **Backpressure must propagate** browser ↔ relay ↔ agent through yamux's stream
   window. The rule in practice: pass the stream through, never drain it into an
   intermediate buffer. A slow reader must slow the writer, not grow a buffer.
-- Why this is a rule and not a preference: the Go version serialized each whole
-  HTTP message with `httputil.DumpRequest`/`DumpResponse` and buffered it in a
-  `make([]byte, content_length)` on both sides, capped at 64 MiB. That cost a full
-  in-memory copy of every body, made SSE-through-tunnel unusable (responses sat in
-  a buffer until the 30s deadline fired), and made the body cap a
-  memory-exhaustion survival knob rather than a policy choice. Not carrying it
-  forward is the single biggest reason this rewrite exists.
+- Why this is a rule and not a preference: buffering each whole message costs
+  a full in-memory copy of every body, makes SSE through a tunnel unusable
+  (responses sit in a buffer until a deadline fires), and turns the body-size
+  cap into a memory-exhaustion survival knob instead of a policy choice.
 - Body size limits remain, but as **policy** (reject early with 413), not as the
   thing standing between the relay and OOM.
 - WebSocket (HTTP 101) is the exception to the request/response shape, not to this
@@ -151,9 +146,8 @@ the PR description, not a drive-by commit.
 
 ## Security
 
-These are load-bearing and most are ported from the Go implementation, where they
-were each written in response to a specific hole. Do not relax one without
-replacing what it defends.
+These are load-bearing; each one closes a specific hole. Do not relax one
+without replacing what it defends.
 
 ### Credentials
 
@@ -172,8 +166,8 @@ replacing what it defends.
 - Revoking or rotating an agent token must **terminate the live agent sessions
   already authenticated with it**, not just future ones. Each session records its
   authenticating token id; revoke → close that token's sessions' tunnels with a
-  permanent reason → tear the sessions down. The Go version shipped without this
-  and a revoked token kept a live tunnel.
+  permanent reason → tear the sessions down. Without this, a revoked token
+  keeps a live tunnel.
 
 ### Proxy boundary
 
@@ -181,8 +175,7 @@ replacing what it defends.
   connections, slow request headers, and expensive authentication attempts
   itself. Streaming prevents body buffering, not bandwidth or CPU exhaustion.
 
-- **HTTP normalization is mandatory** and must be ported from the Go
-  `internal/server/httpnorm.go`:
+- **HTTP normalization is mandatory** (`crates/relay/src/httpnorm.rs`):
   - **Reject ambiguous body framing with `400`** — a message carrying both a
     `Content-Length` and a `Transfer-Encoding`, multiple disagreeing
     `Content-Length` values, a non-numeric length, or any transfer coding other
@@ -201,8 +194,8 @@ replacing what it defends.
     `X-Forwarded-Proto`. A client must not be able to spoof the proxy chain or its
     own identity.
 - **Subdomain slugs come from a CSPRNG with no weak fallback.** A CSPRNG failure
-  **fails the tunnel registration** — never fall back to a non-crypto RNG (the Go
-  version originally used `math/rand/v2` here and it was a tracked hole).
+  **fails the tunnel registration** — never fall back to a non-crypto RNG; a
+  predictable slug generator is a hardening hole.
   **A high-entropy URL is not access control:** a live tunnel is reachable by
   anyone holding the URL, so it is never a substitute for authentication in the
   tunneled application. Say this in user-facing docs too.
@@ -212,16 +205,13 @@ replacing what it defends.
 
 ### Authorization
 
-- **The bind ACL decision stays a pure function** — the port of Go's
-  `decideBind`: it takes a fully-resolved context value (requested name, user id,
+- **The bind ACL decision stays a pure function** (`decide_bind`): it takes a fully-resolved context value (requested name, user id,
   token policy, allowlist, assigned name, reservation owner) and returns
   allow-or-typed-rejection. **No I/O inside it.** The caller resolves state, the
-  function decides. This is what makes the policy table testable, and it is the
-  part of the old code most worth porting verbatim.
-- **The live traffic feed is authenticated and scoped per-user.** The Go version
-  shipped `/api/traffic/recent` and `/api/traffic/stream` **unauthenticated and
-  global across all users** — a known leak, especially for a company hosting this
-  internally. Do not reproduce it. Every `/api/*` route requires a session
+  function decides. This is what makes the policy table testable.
+- **The live traffic feed is authenticated and scoped per-user.** A feed that
+  is unauthenticated or global across users leaks every user's traffic,
+  especially for a company hosting this internally. Every `/api/*` route requires a session
   except the necessary entry points (`/api/bootstrap`, `/api/signup`, and
   `/api/login`); bootstrap is one-shot and signup follows the configured mode.
   `/healthz` is public and sits outside `/api`.
@@ -271,16 +261,15 @@ replacing what it defends.
   1. **Protocol framing** — round-trip, truncated frame, oversized declared
      length, unknown message type, chunk/end-marker sequencing.
   2. **The bind ACL decision table** — every (policy × requested-name ×
-     reservation-owner) combination with its expected rejection code. The Go
-     version's `authz_test.go` is the template.
+     reservation-owner) combination with its expected rejection code
+     (`crates/relay/src/authz.rs` is the template).
 - Tests run under `--all-features`; a feature that is never compiled in CI is
   dead code.
 - Concurrency-sensitive code (the session/tunnel maps, teardown) gets a test that
   exercises the race — the reconnect-displaces-session path in particular.
 - No mocking frameworks. Inject a function or a small trait where a seam is
   genuinely needed (e.g. the slug generator, so CSPRNG failure and collision
-  retry are testable) — the Go version injected `gen func() (string, error)` for
-  exactly this.
+  retry are testable).
 
 ---
 
@@ -342,8 +331,7 @@ cargo deny check          # or, at minimum, cargo audit
   `get-vorp` S3 bucket and a GitHub Release. `install.sh` installs from there.
   Bump `version` in the root `Cargo.toml` before tagging; the workflow rejects
   a mismatch.
-- Production replaced the Go relay on 2026-10-07 and is upgraded by hand with
-  the installer. Automatic production deploys are not configured; if added,
+- Production is upgraded by hand with the installer. Automatic production deploys are not configured; if added,
   they need credentials separate from staging. Operator details for specific
   hosts stay out of this repo.
 - Until Vorp implements its own ACME DNS-01 issuer, deployed relays use

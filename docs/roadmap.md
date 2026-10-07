@@ -2,8 +2,7 @@
 
 ## Where it stands (v0.0.1)
 
-The rewrite is complete and in production: it replaced the Go relay on
-2026-10-07. A release has:
+vorp has run in production since 2026-10-07. A release has:
 
 - A TLS relay on one `:443` listener that routes on ALPN: agent sessions over
   yamux, and the dashboard plus public tunnels over HTTP/1.1 and HTTP/2.
@@ -54,8 +53,8 @@ keeping things running, with pm2 and containers as cookbooks.
 
 Order matters: ACME comes first, because `setup` and `doctor` depend on it.
 
-1. **Project basics.** `LICENSE` (MIT), `SECURITY.md`, `CONTRIBUTING.md`,
-   `CHANGELOG.md`. The repository stays private until the license exists.
+1. **Project basics.** `LICENSE` (MIT) is in place. Still to add:
+   `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`.
 2. **Built-in ACME DNS-01** (`instant-acme`): wildcard issuance for `domain` +
    `*.domain`, a renewal task, hot replacement through the existing
    certificate-reload path, and an `AcmeDns` trait with Cloudflare first.

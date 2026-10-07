@@ -166,10 +166,6 @@ Consequences of getting this right, and the reasons it is a rule:
 - Body size limits become *policy* (reject with `413`) rather than the thing
   standing between the relay and an OOM.
 
-The Go implementation this replaces serialized each whole HTTP message with
-`httputil.DumpRequest`/`DumpResponse` and buffered it at 64 MiB on both sides.
-That is the specific design being discarded.
-
 ---
 
 ## 5. Body framing is protocol metadata, not a header
@@ -357,8 +353,8 @@ long as its session is healthy.
 
 ## 8. Proxy-boundary normalization
 
-The relay normalizes at the edge, before anything is forwarded. Ported from the
-Go `internal/server/httpnorm.go`; all of it is load-bearing.
+The relay normalizes at the edge, before anything is forwarded
+(`crates/relay/src/httpnorm.rs`); all of it is load-bearing.
 
 **Reject ambiguous framing with `400`** — both `Content-Length` and
 `Transfer-Encoding` present, multiple disagreeing `Content-Length` values, a
@@ -473,7 +469,7 @@ of lowercase base32 (`[a-z2-7]`) from 80 bits of CSPRNG entropy**, unbiased
 (every character is exactly 5 random bits), DNS-label safe.
 
 A CSPRNG failure **fails the registration**. There is no non-cryptographic
-fallback — the Go version's `math/rand` slug generator was a real hardening gap.
+fallback: a predictable slug generator is a hardening gap.
 
 Insertion is an atomic check-and-set against the tunnel map; auto-slug generation
 retries a bounded number of times on collision, which the entropy makes
@@ -498,8 +494,7 @@ astronomically unlikely and the bound only guards against a wedged map.
 | `STREAM_ERROR` | unexpected frame or stream state | skip tunnel, continue |
 
 Every code in this table is emitted by an implementation. **Do not define codes
-nothing sends** — the Go version carried three (`SESSION_NOT_FOUND`,
-`LOCAL_UNREACHABLE`, `TIMEOUT`) that no code path ever produced.
+nothing sends**: a code no path produces misleads every reader of this table.
 
 `AUTH_FAILED` and `UNSUPPORTED_VERSION` are permanent: the agent reports and
 exits. Everything else is transient. Backoff applies only when establishing a

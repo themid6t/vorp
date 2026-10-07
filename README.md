@@ -16,7 +16,7 @@ makes outbound connections, so it works behind NAT and firewalls.
   names with admin approval, per-user quotas, live token revocation and a
   per-user traffic feed.
 
-Status: v0.0.1, Linux amd64 and arm64. Setup is still manual. One-command
+Status: v0.0.1, Linux amd64 and arm64, MIT licensed. Setup is still manual. One-command
 setup with built-in ACME is planned for v0.1; see the [roadmap](docs/roadmap.md).
 
 ## Install

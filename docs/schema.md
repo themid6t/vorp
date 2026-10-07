@@ -25,7 +25,7 @@ older table as it was, then adds any `users` column listed in
 `ADDED_USER_COLUMNS` that is missing. New columns therefore need a default.
 Invite codes were removed; `open` drops the old `signup_invites` table.
 
-Bind policy follows the legacy `decideBind` decision table: `any` permits
+Bind policy follows the `decide_bind` decision table: `any` permits
 temporary tunnels, the user's assigned name, and reserved names they own;
 `temporary` permits only temporary tunnels; `reserved` permits only owned
 reserved names listed in that token's `token_allowlist`. Only `reserved` tokens
