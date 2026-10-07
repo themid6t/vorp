@@ -5,8 +5,8 @@ Status: SQLite repository implemented. The persistence workstream owns migration
 
 ## Tables
 
-All timestamps are Unix milliseconds. Foreign keys are enabled on each SQLite
-connection. The migration must enable WAL mode and a busy timeout. Table names
+All timestamps are Unix milliseconds. Opening the database enables foreign
+keys, WAL mode and a 5-second busy timeout on the connection. Table names
 and columns below are the contract; migration SQL is owned by the store crate.
 
 | Table | Columns and constraints |

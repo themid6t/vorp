@@ -15,6 +15,8 @@ Type=simple
 User=vorp
 Group=vorp
 WorkingDirectory=/var/lib/vorp
+# Plain log lines in the journal, without terminal colour codes.
+Environment=NO_COLOR=1
 ExecStart=/usr/local/bin/vorp serve --base-domain example.com --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem --database-path /var/lib/vorp/vorp.sqlite3
 Restart=on-failure
 # Restarting faster than reconnecting agents spread out (0-5s) re-forms the herd.

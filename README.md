@@ -36,6 +36,11 @@ routers, corporate firewalls and Kubernetes clusters.
 - [Command reference](#command-reference)
 - [Develop](#develop)
 
+Detailed guides, written so an AI agent can follow them step by step:
+[relay setup runbook](docs/setup.md), [connecting services](docs/agents.md)
+and [troubleshooting](docs/troubleshooting.md). [llms.txt](llms.txt) indexes
+them.
+
 ## Set up a relay
 
 ### 1. What you need
@@ -132,6 +137,9 @@ sandbox. To put the dashboard on its own name, add
 Open `https://example.com` (or your dashboard host). On a fresh install the
 dashboard asks you to create the first account, which becomes the admin.
 **Whoever opens it first gets it,** so do this as soon as the service starts.
+To avoid that window entirely, create the admin through a loopback-only relay
+before starting the service, as in
+[setup.md step 6](docs/setup.md#step-6-create-the-admin-account-before-going-public).
 
 Signup is closed by default: the admin creates accounts in the dashboard, and
 each new user picks their own password at first login. Start the relay with
@@ -150,7 +158,7 @@ shown only once. Pick a bind policy:
 | `temporary` | random names only |
 | `reserved` | only the reserved names you list in the token's allowlist |
 
-To use a fixed name such as `myapp`, reserve it under **Names** first. An admin
+To use a fixed name such as `myapp`, reserve it under **Subdomains** first. An admin
 approves reservations unless your account may reserve directly.
 
 ### 2. Install and save the token
@@ -207,9 +215,10 @@ sudo loginctl enable-linger "$USER"   # keep it running after you log out
 
 ### In a container or Kubernetes
 
-Run the agent as a sidecar, pointing at the app by its service name. Because
-that upstream is not loopback, add `--allow-remote-targets`, and mount the
-token as a file:
+In a Kubernetes Pod sidecar the app is on `127.0.0.1`, so no extra flag is
+needed. When the agent runs in its own container and reaches the app by a
+service name, such as a Compose service, add `--allow-remote-targets`, and
+mount the token as a file:
 
 ```sh
 vorp --relay-host example.com --token-file /etc/vorp/token \
@@ -217,7 +226,8 @@ vorp --relay-host example.com --token-file /etc/vorp/token \
 ```
 
 The binary is static, so any small image with CA certificates works, such as
-`alpine` with `ca-certificates`.
+`alpine` with `ca-certificates`. [docs/agents.md](docs/agents.md) has a
+Dockerfile, a Deployment and pm2 instructions.
 
 ## Operate the relay
 
@@ -331,6 +341,10 @@ proxies `/api` to `https://127.0.0.1:8443` (override with `VORP_RELAY`).
 Contributor rules are in [AGENTS.md](AGENTS.md). Design documents:
 [wire protocol](docs/protocol.md), [dashboard API](docs/api.md),
 [SQLite schema](docs/schema.md), [CI and releases](docs/releases.md).
+
+Guides: [setup runbook](docs/setup.md), [connecting services](docs/agents.md),
+[troubleshooting](docs/troubleshooting.md), [certificates](docs/certificates.md).
+AI agents can start from [llms.txt](llms.txt).
 
 ## License
 

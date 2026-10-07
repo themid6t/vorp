@@ -1,8 +1,11 @@
 # Dashboard API
 
 The embedded dashboard is same-origin with this API; there is no CORS. All
-bodies are JSON. Authentication is the `vorp_session` cookie
-(`HttpOnly; Secure; SameSite=Lax`), set by bootstrap, signup and login.
+bodies are JSON; send `Content-Type: application/json` with a body.
+Authentication is the `vorp_session` cookie
+(`HttpOnly; Secure; SameSite=Lax`), set by bootstrap, signup and login. A
+session lasts 24 hours. `GET /healthz` (outside `/api`) is public and returns
+an empty `200`.
 
 - Every `/api/*` route needs a session except `config`, `bootstrap`,
   `signup` and `login`. Missing or expired sessions get `401`.
@@ -10,8 +13,12 @@ bodies are JSON. Authentication is the `vorp_session` cookie
   `X-Vorp-Csrf: 1`, or it is rejected with `403`.
 - Admin-only routes return `403` to a non-admin.
 - Errors are `{"error": "<message>"}` with `400` (invalid input, unknown
-  record), `401`, `403`, `409` (conflict), `429` (rate limited), or `503`
-  (relay hook unavailable).
+  record), `401`, `403`, `409` (conflict), `429` (rate limited), `500`
+  (internal error), or `503` (relay hook unavailable).
+- `bootstrap`, `signup`, `login`, `password` and admin user creation are
+  rate-limited before password hashing: 10 attempts per account and 120 in
+  total per minute, at most 4 at once; beyond that they return `429`.
+  Passwords must have 12 to 1024 characters (`400` otherwise).
 - An account whose `must_change_password` is set gets `403`
   `{"error": "password change required"}` from every route except `me`,
   `password` and `logout`. Admin-created accounts and host resets
@@ -22,7 +29,7 @@ bodies are JSON. Authentication is the `vorp_session` cookie
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/api/config` | — | `{signup_mode: "open"\|"closed", needs_bootstrap, base_domain}`; public, read-only |
-| POST | `/api/bootstrap` | `{email, password}` | `{ok}`; creates the first admin, once |
+| POST | `/api/bootstrap` | `{email, password}` | `{ok}`; creates the first admin, once; `409` once any account exists |
 | POST | `/api/signup` | `{email, password}` | `{ok}`; `403` unless `--signup open` |
 | POST | `/api/login` | `{email, password}` | `{ok}` |
 | POST | `/api/logout` | — | `{ok}` |
@@ -53,6 +60,14 @@ an admin.
 | POST | `/api/tunnels/{name}/close` | — | `{ok}` |
 | GET | `/api/traffic/recent` | — | `[{subdomain, timestamp_ms, method, status, bytes_in, bytes_out}]` |
 | GET | `/api/traffic/stream` | — | SSE; each event is the recent-traffic array |
+
+Names must have 3–63 lowercase ASCII letters, digits or hyphens with an
+alphanumeric first and last character, and must not be a system name (`www`,
+`api`, `mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorpd`);
+otherwise `POST /api/reservations` returns `400 {"error":"subdomain name"}`.
+A token `allowlist` is allowed only with `bind_policy: "reserved"`, and every
+name in it must be a reservation the caller owns (`400` otherwise). The raw
+token has the form `vorp_<id>_<64 hex>`.
 
 Reservation requests: a user with `can_reserve_directly` (and every admin)
 gets `status: "reserved"` at once. Anyone else gets `status: "pending"` until an

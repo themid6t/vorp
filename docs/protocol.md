@@ -359,7 +359,11 @@ The relay normalizes at the edge, before anything is forwarded
 **Reject ambiguous framing with `400`** — both `Content-Length` and
 `Transfer-Encoding` present, multiple disagreeing `Content-Length` values, a
 non-numeric length, or any transfer coding other than `chunked`. Redundant with
-§5 by construction, kept as defence in depth at the entry point.
+§5 by construction, kept as defence in depth at the entry point. In practice
+the HTTP/1 parser (hyper) handles `Content-Length` plus `Transfer-Encoding:
+chunked` before this check: it ignores the length and reads the body as
+chunked, which is equally safe, so that case is forwarded instead of answered
+with `400`.
 
 **Strip hop-by-hop headers**, in both directions: `Connection`,
 `Proxy-Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`,
@@ -491,14 +495,18 @@ astronomically unlikely and the bound only guards against a wedged map.
 | `SUBDOMAIN_INVALID` | fails label validation | skip tunnel, continue |
 | `SUBDOMAIN_NOT_ALLOWED` | outside this token's bind ACL | skip tunnel, continue |
 | `TUNNEL_LIMIT` | user already holds their quota of live tunnels | skip tunnel, continue |
-| `STREAM_ERROR` | unexpected frame or stream state | skip tunnel, continue |
+| `STREAM_ERROR` | unexpected frame or stream state | drop the session and reconnect |
 
 Every code in this table is emitted by an implementation. **Do not define codes
 nothing sends**: a code no path produces misleads every reader of this table.
 
-`AUTH_FAILED` and `UNSUPPORTED_VERSION` are permanent: the agent reports and
-exits. Everything else is transient. Backoff applies only when establishing a
-*new* session fails (`1s → 2s → 4s → 8s → 16s → 30s → 60s`, each randomized to
+`AUTH_FAILED` and `UNSUPPORTED_VERSION` are permanent in `AgentErr`: the agent
+reports and exits. The three `SUBDOMAIN_*` codes and `TUNNEL_LIMIT` in
+`TunnelErr` suppress only that tunnel. Any other `TunnelErr`, including
+`STREAM_ERROR` and the `AUTH_FAILED` sent when the token record is gone at
+registration, ends the session; the agent reconnects, and a revoked token then
+fails `RegisterAgent`. Everything else is transient. Backoff applies only when
+establishing a *new* session fails (`1s → 2s → 4s → 8s → 16s → 30s → 60s`, each randomized to
 between half and the full step); a live session that drops reconnects after a
 random 0–5s wait. The wait is short because the link was just working, and
 random so that every agent of a restarted relay does not redial at once — on a

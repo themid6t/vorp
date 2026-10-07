@@ -29,7 +29,7 @@ and a container image. The relay still gets its certificate from Certbot
 ```
 vorp/
 ├── AGENTS.md               ground rules (CLAUDE.md is a symlink to it)
-├── docs/                   protocol, API, schema, releases, certificates, this file
+├── docs/                   setup, agents, troubleshooting, certificates, protocol, API, schema, releases, this file
 ├── crates/
 │   ├── protocol/           frames, message types, codec. No I/O except AsyncRead/Write.
 │   ├── store/              SQLite: migrations, models, every SQL statement.
@@ -90,9 +90,11 @@ Order matters: ACME comes first, because `setup` and `doctor` depend on it.
    the agent always matches the relay's protocol.
 10. **Releases for every platform.** Add macOS amd64 and arm64 to the existing
     Linux builds, and teach `install.sh` to install them.
-11. **Docs.** A README quickstart and `docs/setup.md`, written as a runbook
-    with exact commands, the expected output, and the fix for each `doctor`
-    failure, for people and AI agents alike. Cookbooks in `docs/cookbook/` for
+11. **Docs.** The README quickstart, the `docs/setup.md` runbook,
+    `docs/agents.md` and `docs/troubleshooting.md` exist for the manual v0.0.1
+    procedure. Update them for `setup` and `doctor`, with the expected output
+    and the fix for each `doctor` failure, for people and AI agents alike.
+    Cookbooks in `docs/cookbook/` for
     systemd, launchd, pm2 (token file only: a `--token` argument shows in `ps`
     and in pm2's saved process list), and a Docker Compose sidecar
     (`--allow-remote-targets --upstream http://app:3000`). User-facing docs must

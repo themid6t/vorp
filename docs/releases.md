@@ -33,11 +33,12 @@ The workflow packs the binaries as `vorp_<version>_linux_<arch>.tar.gz` and
 writes `release-manifest.json` with each archive's sha256 and size. It signs
 the manifest with the release GPG key (fingerprint
 `8D623B104588BCF08D40CD85A90F7A794E9AC93F`, public half in `vorp.asc`) and
-uploads it to `s3://get-vorp` (`ap-south-1`). The archives go first, then the
-signature, then the manifest, then `install.sh` and `version.txt`. A bucket
-policy makes objects public, and ACLs are disabled. The `vorp-release-ci` IAM
-user can only read, write and delete objects in that bucket. The same files go
-to a GitHub Release.
+uploads it to `s3://get-vorp` (`ap-south-1`). The archives go first, then
+`vorp.asc`, the signature, the manifest, and last `install.sh` and
+`version.txt`. A bucket policy makes objects public, and ACLs are disabled.
+The `vorp-release-ci` IAM user can only read, write and delete objects in that
+bucket. The GitHub Release gets the archives, a `SHA256SUMS` file, the
+manifest and its signature.
 
 Repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `GPG_PRIVATE_KEY` and `GPG_KEY_ID`.

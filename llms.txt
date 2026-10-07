@@ -1,0 +1,26 @@
+# vorp
+
+> vorp is a self-hosted reverse tunnel relay, like ngrok, written in Rust. One static Linux binary has two modes: `vorp serve` runs the relay on a server with a public IP and terminates TLS itself on port 443; plain `vorp` runs the agent next to a local HTTP service and gives it a public HTTPS URL such as `https://myapp.example.com`. The agent only makes outbound connections, so it works behind NAT and in Kubernetes. State is an embedded SQLite file; a built-in dashboard manages accounts, agent tokens, reserved names, quotas and revocation.
+
+Current release: v0.0.1, Linux amd64 and arm64 only. The relay needs a supplied wildcard certificate (Certbot with the Cloudflare DNS plugin) and DNS-only records for the base domain and its wildcard. These do not exist yet and must not be used: `vorp setup`, `vorp doctor`, `vorp login`, `vorp http`, `vorp service install`, built-in ACME, macOS builds, an official container image. A tunnel URL is not access control: anyone with the URL can reach the service.
+
+## Tasks
+
+- [Relay setup runbook](https://raw.githubusercontent.com/themid6t/vorp/main/docs/setup.md): read first when asked to install a relay; inputs to collect, preflight checks, each step with a verification, closing the first-admin race, and when to stop and ask the human.
+- [Connecting services](https://raw.githubusercontent.com/themid6t/vorp/main/docs/agents.md): bind policies, reserving names, creating and saving tokens, running the agent under systemd, pm2 or as a Kubernetes sidecar, upgrading and revoking.
+- [Troubleshooting](https://raw.githubusercontent.com/themid6t/vorp/main/docs/troubleshooting.md): symptom, cause and fix for agent errors, relay errors, HTTP status codes visitors see, and where to read logs.
+- [README](https://raw.githubusercontent.com/themid6t/vorp/main/README.md): the human quickstart and the full command-line flag reference.
+
+## Reference
+
+- [TLS certificates](https://raw.githubusercontent.com/themid6t/vorp/main/docs/certificates.md): the Certbot and Cloudflare procedure in detail, the deploy hook, renewal checks.
+- [Dashboard API](https://raw.githubusercontent.com/themid6t/vorp/main/docs/api.md): every `/api` route, the session cookie and the required `X-Vorp-Csrf: 1` header; use it to script accounts, names and tokens.
+- [Wire protocol](https://raw.githubusercontent.com/themid6t/vorp/main/docs/protocol.md): agent and relay frames, error codes, timeouts, edge limits and quotas.
+- [Systemd unit](https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.service): the hardened relay service file the setup runbook installs.
+
+## Optional
+
+- [Roadmap](https://raw.githubusercontent.com/themid6t/vorp/main/docs/roadmap.md): what v0.0.1 includes and what is planned.
+- [SQLite schema](https://raw.githubusercontent.com/themid6t/vorp/main/docs/schema.md): tables and repository methods, for contributors.
+- [CI and releases](https://raw.githubusercontent.com/themid6t/vorp/main/docs/releases.md): how signed releases are built and published.
+- [Contributor rules](https://raw.githubusercontent.com/themid6t/vorp/main/AGENTS.md): read before changing code in this repository.
