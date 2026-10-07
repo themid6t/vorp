@@ -63,26 +63,24 @@ added, it must use credentials separate from staging.
 
 ## Current staging deployment
 
-The `CI` workflow builds and type-checks the embedded dashboard, then runs all four Rust gates for pull requests and pushes to
-`main` when a non-Markdown file changes. A Markdown-only change keeps a green
-`rust` check but skips compilation and deployment. This allows the check to be
-required by future branch protection without leaving documentation PRs
-pending. A successful code push to `main` builds static Linux amd64 and arm64 binaries
-on GitHub-hosted runners and keeps both as artifacts. Only amd64 is deployed. It copies the binary to a dedicated `vorp-deploy` account
-over SSH and
-invokes `/usr/local/sbin/vorp-deploy-staging` through a narrowly scoped sudo
-rule. The server verifies the checksum, replaces `/opt/vorp/vorp`, restarts
-`vorp.service`, and checks the HTTPS health endpoint. On failure it restores
-the previous binary and restarts the service. The SQLite database and TLS
-files are outside this release path.
+The `CI` workflow builds and type-checks the embedded dashboard, then runs all
+four Rust gates for pull requests and pushes to `main` when a non-Markdown file
+changes. A Markdown-only change keeps a green `rust` check but skips
+compilation and deployment, so the check can be required by branch protection
+without leaving documentation PRs pending.
 
-The systemd unit is versioned as [`deploy/vorp-staging.service`](../deploy/vorp-staging.service)
-but is not deployed by CI. After changing it, install it on the host:
+A successful code push to `main` builds static Linux amd64 and arm64 binaries
+on GitHub-hosted runners and keeps both as artifacts. The amd64 binary goes to
+staging: CI copies it over SSH to a dedicated `vorp-deploy` account and runs
+`/usr/local/sbin/vorp-deploy-staging` through a narrowly scoped sudo rule. The
+host verifies the checksum, replaces the binary, restarts `vorp.service`, and
+checks the HTTPS health endpoint. On failure it restores the previous binary
+and restarts the service. The SQLite database and TLS files are outside this
+path.
 
-```sh
-sudo install -m 0644 deploy/vorp-staging.service /etc/systemd/system/vorp.service
-sudo systemctl daemon-reload && sudo systemctl restart vorp
-```
+The staging host's deploy script and systemd unit live on that host, not in
+this repository. [`deploy/vorp.service`](../deploy/vorp.service) is the generic
+form of the same unit.
 
 Repository configuration:
 

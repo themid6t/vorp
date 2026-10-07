@@ -36,7 +36,7 @@ vorp/
 │   ├── relay/              serve mode: ALPN listener, sessions, tunnel map, proxy.
 │   ├── agent/              agent mode: dial, register, forward to upstream.
 │   └── web/                axum: dashboard, /api, auth; the Svelte UI in web/ui.
-├── deploy/                 staging unit, deploy and certificate hook scripts
+├── deploy/                 example systemd unit and certificate renewal hook
 ├── install.sh              verified installer, published with each release
 └── src/main.rs             the single binary; wires the modes together. Thin.
 ```
@@ -77,8 +77,8 @@ Order matters: ACME comes first, because `setup` and `doctor` depend on it.
    becomes admin. On a public install the admin is created from the command
    line by `setup`, or the relay prints a one-time setup code that the
    bootstrap page requires.
-7. **`vorp service install`** for the relay (a system unit, hardened like the
-   staging unit) and the agent (a systemd user unit with linger on Linux,
+7. **`vorp service install`** for the relay (a system unit, hardened like
+   `deploy/vorp.service`) and the agent (a systemd user unit with linger on Linux,
    launchd on macOS).
 8. **Agent first run.** `vorp login <relay>` stores the relay host and the
    token once; the token comes from a prompt or standard input, never an

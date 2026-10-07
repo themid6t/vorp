@@ -45,8 +45,8 @@ vorp serve \
 
 To serve the dashboard from a name other than the base domain, add
 `--dashboard-host dashboard.example.com`. That name must also resolve to the
-relay. [`deploy/vorp-staging.service`](deploy/vorp-staging.service) is a
-hardened systemd unit you can adapt.
+relay. [`deploy/vorp.service`](deploy/vorp.service) is a hardened systemd unit you
+can adapt.
 
 **Create the admin account right away.** On an empty database the dashboard
 asks for one, and whoever gets there first gets it. Signup is `closed` by

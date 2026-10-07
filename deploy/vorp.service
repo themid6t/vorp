@@ -1,0 +1,33 @@
+# Example systemd unit for the relay. Replace example.com with your domain,
+# then install it:
+#   sudo install -m 0644 deploy/vorp.service /etc/systemd/system/vorp.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vorp
+# It expects a `vorp` system user, the binary from install.sh, the
+# certificate copied to /etc/vorp by deploy/cert-deploy.sh, and /var/lib/vorp
+# owned by vorp.
+[Unit]
+Description=Vorp reverse tunnel relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vorp
+Group=vorp
+WorkingDirectory=/var/lib/vorp
+ExecStart=/usr/local/bin/vorp serve --base-domain example.com --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem --database-path /var/lib/vorp/vorp.sqlite3
+Restart=on-failure
+# Restarting faster than reconnecting agents spread out (0-5s) re-forms the herd.
+RestartSec=5s
+# Above --max-connections (default 1024); systemd's soft default is 1024.
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vorp
+
+[Install]
+WantedBy=multi-user.target
