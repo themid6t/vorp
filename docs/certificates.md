@@ -2,7 +2,7 @@
 
 Vorp currently needs a supplied certificate and private key in `serve` mode.
 The built-in ACME DNS-01 issuer in the roadmap is not implemented yet. This
-procedure is the one staging and production use today. It uses Let's Encrypt,
+procedure is the one production uses today. It uses Let's Encrypt,
 Certbot, and the Cloudflare DNS plugin; Vorp itself still terminates TLS on
 port 443. No nginx or Cloudflare proxy sits in the agent connection path.
 

@@ -1,7 +1,7 @@
 name: Release
 
-# Publishes the binaries CI built and staging ran for the tagged commit. It
-# never rebuilds: an annotated vX.Y.Z tag promotes an existing artifact.
+# Publishes the binaries CI built for the tagged commit. It never rebuilds:
+# an annotated vX.Y.Z tag promotes existing artifacts.
 
 on:
   push:

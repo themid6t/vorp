@@ -277,7 +277,7 @@ without replacing what it defends.
 
 All of these must pass for changes beyond Markdown; CI enforces them and a red
 gate is not merged. Markdown-only changes keep a successful lightweight check
-and skip the Rust gates and staging deployment. The dashboard is built first,
+and skip the Rust gates and release builds. The dashboard is built first,
 because the binary embeds it:
 
 ```sh
@@ -322,21 +322,19 @@ cargo deny check          # or, at minimum, cargo audit
 ## Release and certificate operations
 
 - Use one long-lived `main` branch. Pull requests with non-Markdown changes run
-  the four CI gates; a passing push to `main` with such changes builds and
-  deploys to staging automatically. The current pipeline is documented in
-  `docs/releases.md`.
+  the four CI gates; a passing push to `main` with such changes also builds
+  static Linux amd64 and arm64 binaries. The pipeline is documented in
+  `docs/releases.md`. There is no staging environment.
 - An annotated `vX.Y.Z` tag publishes a release (`release.yml`): it promotes
-  the binaries CI built for that commit, which staging already ran, and never
-  rebuilds on the tag. It signs the manifest and uploads the release to the
+  the binaries CI built for that commit and never rebuilds on the tag. It signs the manifest and uploads the release to the
   `get-vorp` S3 bucket and a GitHub Release. `install.sh` installs from there.
   Bump `version` in the root `Cargo.toml` before tagging; the workflow rejects
   a mismatch.
-- Production is upgraded by hand with the installer. Automatic production deploys are not configured; if added,
-  they need credentials separate from staging. Operator details for specific
-  hosts stay out of this repo.
+- Deployed relays are upgraded by hand with the installer; nothing deploys
+  automatically. Operator details for specific hosts stay out of this repo.
 - Until Vorp implements its own ACME DNS-01 issuer, deployed relays use
-  supplied certificate files. Staging obtains and renews its wildcard cert
-  through Certbot and the Cloudflare DNS plugin. Preserve the renewal hook and
+  supplied certificate files, obtained and renewed through Certbot and the
+  Cloudflare DNS plugin. Preserve the renewal hook and
   Vorp's certificate-file reload behavior; see `docs/certificates.md`. Never
   place the Cloudflare token, TLS private key, or agent tokens in the repo or
   GitHub Actions artifacts.
