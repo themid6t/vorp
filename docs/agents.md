@@ -8,7 +8,7 @@ Commands use `example.com` as the relay's base domain, `myapp` as a reserved
 name, and a local service on `http://127.0.0.1:3000`. Substitute your own.
 
 v0.0.1 has no `vorp login`, `vorp http` or `vorp service install`. They are
-planned ([roadmap](roadmap.md)). Everything below uses the agent's flags.
+planned. Everything below uses the agent's flags.
 
 > **A tunnel URL is not access control.** Anyone who has the URL can reach the
 > service. Random names stop guessing, not sharing. Put authentication in the

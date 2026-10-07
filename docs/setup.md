@@ -16,8 +16,8 @@ Rules for whoever runs it:
 - Never print, log or commit the Cloudflare token, the TLS private key, an
   agent token or the admin password.
 
-v0.0.1 has no `vorp setup`, `vorp doctor` or built-in ACME. They are planned
-([roadmap](roadmap.md)). Until then, the certificate comes from Certbot.
+v0.0.1 has no `vorp setup`, `vorp doctor` or built-in ACME. They are planned.
+Until then, the certificate comes from Certbot.
 
 ## Inputs to collect first
 

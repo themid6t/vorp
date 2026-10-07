@@ -25,7 +25,7 @@ routers, corporate firewalls and Kubernetes clusters.
 
 > **Status: v0.0.1.** Linux amd64 and arm64. Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
-> certificates is planned for v0.1 ([roadmap](docs/roadmap.md)).
+> certificates is planned for v0.1.
 
 ## Contents
 

@@ -2,7 +2,7 @@
 
 In `serve` mode, vorp v0.0.1 needs a certificate and private key supplied as
 files (`--tls-cert`, `--tls-key`). Built-in ACME is planned
-([roadmap](roadmap.md)) but not implemented. This page is the reference for
+but not implemented. This page is the reference for
 the procedure in [README step 4](../README.md#4-get-a-wildcard-certificate):
 the same commands and paths, with the reasons and the checks.
 

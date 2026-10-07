@@ -20,7 +20,6 @@ Current release: v0.0.1, Linux amd64 and arm64 only. The relay needs a supplied 
 
 ## Optional
 
-- [Roadmap](https://raw.githubusercontent.com/themid6t/vorp/main/docs/roadmap.md): what v0.0.1 includes and what is planned.
 - [SQLite schema](https://raw.githubusercontent.com/themid6t/vorp/main/docs/schema.md): tables and repository methods, for contributors.
 - [CI and releases](https://raw.githubusercontent.com/themid6t/vorp/main/docs/releases.md): how signed releases are built and published.
 - [Contributor rules](https://raw.githubusercontent.com/themid6t/vorp/main/AGENTS.md): read before changing code in this repository.
