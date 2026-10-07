@@ -19,7 +19,7 @@ env:
   AWS_REGION: ap-south-1
   S3_BUCKET: get-vorp
   # Each entry is <os>-<arch>, matching CI's artifact names.
-  PLATFORMS: linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
+  PLATFORMS: linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64
 
 jobs:
   publish:
@@ -52,7 +52,7 @@ jobs:
           [ -n "$run_id" ] || { echo "no successful CI run on main for $GITHUB_SHA" >&2; exit 1; }
           for platform in $PLATFORMS; do
             gh run download "$run_id" --name "vorp-$platform-$GITHUB_SHA" --dir "bin/$platform"
-            chmod 755 "bin/$platform/vorp"
+            [ -f "bin/$platform/vorp" ] && chmod 755 "bin/$platform/vorp"
           done
           reported=$(bin/linux-amd64/vorp --version)
           [ "$reported" = "vorp $VERSION" ] || { echo "binary reports '$reported'" >&2; exit 1; }
@@ -63,8 +63,13 @@ jobs:
           mkdir dist
           for platform in $PLATFORMS; do
             os=${platform%-*} arch=${platform#*-}
-            file="dist/vorp_${VERSION}_${os}_${arch}.tar.gz"
-            tar -czf "$file" -C "bin/$platform" vorp
+            if [ "$os" = windows ]; then
+              file="dist/vorp_${VERSION}_${os}_${arch}.zip"
+              (cd "bin/$platform" && zip -q "$GITHUB_WORKSPACE/$file" vorp.exe)
+            else
+              file="dist/vorp_${VERSION}_${os}_${arch}.tar.gz"
+              tar -czf "$file" -C "bin/$platform" vorp
+            fi
             jq -n --arg filename "$(basename "$file")" --arg os "$os" --arg arch "$arch" \
               --arg sha256 "$(sha256sum "$file" | cut -d ' ' -f 1)" \
               --argjson size "$(stat -c %s "$file")" \
@@ -72,7 +77,7 @@ jobs:
           done | jq -s --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
             '{version: $version, commit: $commit, artifacts: .}' > dist/release-manifest.json
           jq . dist/release-manifest.json
-          (cd dist && sha256sum vorp_*.tar.gz > SHA256SUMS)
+          (cd dist && sha256sum vorp_*.tar.gz vorp_*.zip > SHA256SUMS)
 
       - name: Sign the manifest
         env:
@@ -100,7 +105,7 @@ jobs:
         run: |
           set -eu
           s3="s3://$S3_BUCKET"
-          for archive in dist/vorp_*.tar.gz; do
+          for archive in dist/vorp_*.tar.gz dist/vorp_*.zip; do
             aws s3 cp "$archive" "$s3/$(basename "$archive")"
           done
           aws s3 cp vorp.asc "$s3/vorp.asc" --content-type application/pgp-keys
@@ -115,4 +120,4 @@ jobs:
       - name: Create the GitHub release
         run: |
           gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag \
-            dist/vorp_*.tar.gz dist/SHA256SUMS dist/release-manifest.json dist/release-manifest.json.asc
+            dist/vorp_*.tar.gz dist/vorp_*.zip dist/SHA256SUMS dist/release-manifest.json dist/release-manifest.json.asc
