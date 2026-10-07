@@ -23,7 +23,8 @@ routers, corporate firewalls and Kubernetes clusters.
                     *.example.com                  any network
 ```
 
-> **Status: v0.0.1.** Linux amd64 and arm64. Setting up a relay takes about
+> **Status: v0.0.2.** The agent runs on Linux and macOS, the relay on Linux
+> (amd64 and arm64). Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
 > certificates is planned for v0.1.
 
@@ -163,12 +164,15 @@ approves reservations unless your account may reserve directly.
 
 ### 2. Install and save the token
 
-On the machine running the service:
+On the machine running the service (Linux or macOS):
 
 ```sh
 curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
 vorp authtoken          # paste the token, then press Ctrl-D
 ```
+
+On macOS the installer needs GnuPG and jq to verify the download:
+`brew install gnupg jq` first.
 
 This saves it to `~/.config/vorp/authtoken`, readable only by you. Prefer this,
 or `--token-file`, over passing the token as an argument, where `ps` and shell
@@ -212,6 +216,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now vorp-myapp
 sudo loginctl enable-linger "$USER"   # keep it running after you log out
 ```
+
+On macOS, use a launchd agent instead; [docs/agents.md](docs/agents.md#launchd-agent-macos)
+has one.
 
 ### In a container or Kubernetes
 

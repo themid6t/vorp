@@ -18,6 +18,8 @@ concurrency:
 env:
   AWS_REGION: ap-south-1
   S3_BUCKET: get-vorp
+  # Each entry is <os>-<arch>, matching CI's artifact names.
+  PLATFORMS: linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
 jobs:
   publish:
@@ -42,37 +44,34 @@ jobs:
           [ "$crate_version" = "$version" ] || { echo "Cargo.toml is $crate_version, tag is $version" >&2; exit 1; }
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      - name: Fetch the staged binaries
+      - name: Fetch the CI binaries
         run: |
           set -eu
           run_id=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --event push \
             --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
           [ -n "$run_id" ] || { echo "no successful CI run on main for $GITHUB_SHA" >&2; exit 1; }
-          for arch in amd64 arm64; do
-            gh run download "$run_id" --name "vorp-linux-$arch-$GITHUB_SHA" --dir "bin/$arch"
-            chmod 755 "bin/$arch/vorp"
+          for platform in $PLATFORMS; do
+            gh run download "$run_id" --name "vorp-$platform-$GITHUB_SHA" --dir "bin/$platform"
+            chmod 755 "bin/$platform/vorp"
           done
-          reported=$(bin/amd64/vorp --version)
+          reported=$(bin/linux-amd64/vorp --version)
           [ "$reported" = "vorp $VERSION" ] || { echo "binary reports '$reported'" >&2; exit 1; }
 
       - name: Package and write the manifest
         run: |
-          set -eu
+          set -euo pipefail
           mkdir dist
-          for arch in amd64 arm64; do
-            tar -czf "dist/vorp_${VERSION}_linux_${arch}.tar.gz" -C "bin/$arch" vorp
-          done
-          artifact() {
-            file="dist/vorp_${VERSION}_linux_$1.tar.gz"
-            jq -n --arg filename "$(basename "$file")" --arg arch "$1" \
+          for platform in $PLATFORMS; do
+            os=${platform%-*} arch=${platform#*-}
+            file="dist/vorp_${VERSION}_${os}_${arch}.tar.gz"
+            tar -czf "$file" -C "bin/$platform" vorp
+            jq -n --arg filename "$(basename "$file")" --arg os "$os" --arg arch "$arch" \
               --arg sha256 "$(sha256sum "$file" | cut -d ' ' -f 1)" \
               --argjson size "$(stat -c %s "$file")" \
-              '{filename: $filename, os: "linux", arch: $arch, sha256: $sha256, size: $size}'
-          }
-          jq -n --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
-            --argjson amd64 "$(artifact amd64)" --argjson arm64 "$(artifact arm64)" \
-            '{version: $version, commit: $commit, artifacts: [$amd64, $arm64]}' \
-            > dist/release-manifest.json
+              '{filename: $filename, os: $os, arch: $arch, sha256: $sha256, size: $size}'
+          done | jq -s --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
+            '{version: $version, commit: $commit, artifacts: .}' > dist/release-manifest.json
+          jq . dist/release-manifest.json
           (cd dist && sha256sum vorp_*.tar.gz > SHA256SUMS)
 
       - name: Sign the manifest

@@ -1,6 +1,6 @@
 # Relay setup runbook
 
-This runbook sets up a vorp v0.0.1 relay on a fresh Linux server. It is
+This runbook sets up a vorp relay on a fresh Linux server. It is
 written so that an AI agent can execute it step by step. A person can follow
 it the same way. The [README](../README.md#set-up-a-relay) has the same
 procedure in short form; this file adds the checks between the steps.
@@ -16,7 +16,8 @@ Rules for whoever runs it:
 - Never print, log or commit the Cloudflare token, the TLS private key, an
   agent token or the admin password.
 
-v0.0.1 has no `vorp setup`, `vorp doctor` or built-in ACME. They are planned.
+vorp does not have `vorp setup`, `vorp doctor` or built-in ACME yet. They are
+planned.
 Until then, the certificate comes from Certbot.
 
 ## Inputs to collect first
@@ -60,8 +61,8 @@ Run these on the server.
 uname -sm
 ```
 
-Expected: `Linux x86_64` or `Linux aarch64`. Anything else is unsupported by
-the v0.0.1 release builds.
+Expected: `Linux x86_64` or `Linux aarch64`. Anything else is not supported for a
+relay.
 
 ### P2. Package manager and systemd
 
@@ -121,7 +122,7 @@ vorp --version
 ```
 
 Expected: the installer ends with `vorp installed to /usr/local/bin/vorp`, and
-`vorp --version` prints the release, such as `vorp 0.0.1`. The installer checks the release
+`vorp --version` prints the release, such as `vorp 0.0.2`. The installer checks the release
 signature and the archive's checksum and stops on any mismatch. It installs
 `curl`, `gpg`, `jq` and the other tools it needs if they are missing.
 
@@ -441,10 +442,10 @@ Stop and ask the human in these cases. Do not work around them.
 | Situation | Why it matters | Ask |
 | --- | --- | --- |
 | The root name already serves something (website, other proxy) | The relay would take over the root name's HTTPS. | Confirm the dashboard goes on `dashboard.<domain>` (or another name under the wildcard), or pick a different base domain such as `tunnels.example.com`. |
-| The domain's DNS is not on Cloudflare | Step 3 and 4 use the Cloudflare DNS plugin; built-in ACME is not in v0.0.1. | Move the zone to Cloudflare, delegate a subdomain to Cloudflare, or supply a wildcard certificate another way (any PEM chain and key in `/etc/vorp` works). |
+| The domain's DNS is not on Cloudflare | Step 3 and 4 use the Cloudflare DNS plugin; vorp has no built-in ACME yet. | Move the zone to Cloudflare, delegate a subdomain to Cloudflare, or supply a wildcard certificate another way (any PEM chain and key in `/etc/vorp` works). |
 | No API token, or the token check fails | Certbot cannot create the challenge record. | Ask for a zone-scoped token with Zone → DNS → Edit. |
 | Port 443 is in use (P3) | The relay must own TCP 443 and terminate TLS itself. It cannot sit behind nginx or a TLS-terminating proxy. | Ask whether to stop that service, or to use a different server. |
 | DNS shows a Cloudflare IP or another IP (P4) | Proxied or wrong records break agents. | Ask the human to set both records to DNS only, pointing at this server. |
 | `needs_bootstrap` is `false` before step 6, or bootstrap returns `409` | Someone already created an account, possibly not the human. | Ask before deleting `/var/lib/vorp/vorp.sqlite3*` and starting over. Never delete the database without approval. |
-| Not Linux amd64/arm64, no systemd, or no `apt-get` | Only Linux amd64 and arm64 builds exist; the steps assume systemd and apt. | Ask whether to adapt the Certbot install for this distribution or use another server. |
+| Not Linux amd64/arm64, no systemd, or no `apt-get` | A relay runs on Linux amd64 or arm64; the steps assume systemd and apt. | Ask whether to adapt the Certbot install for this distribution or use another server. |
 | The server cannot reach Let's Encrypt or the Cloudflare API | Issuance and renewal need outbound HTTPS. | Ask for outbound access to be opened. |

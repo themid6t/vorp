@@ -6,7 +6,7 @@ staging environment.
 | Event | What runs |
 | --- | --- |
 | Pull request with non-Markdown changes | Dashboard type check and build, then format, Clippy, all-feature tests, dependency policy |
-| Push or merge to `main` with non-Markdown changes | The same checks, then static Linux amd64 and arm64 release builds, kept as artifacts for 30 days |
+| Push or merge to `main` with non-Markdown changes | The same checks, then release builds for Linux (static) and macOS, each amd64 and arm64, kept as artifacts for 30 days |
 | Markdown-only pull request or push | A lightweight passing check; the Rust gates and builds are skipped |
 | Annotated `vX.Y.Z` tag on `main` | Publish that commit's builds as a signed release |
 
