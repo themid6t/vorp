@@ -246,6 +246,12 @@ So a config file can hold the relay, and a flag still overrides it for one
 run. A missing default config file is fine; a file named with `--config` or
 `VORP_CONFIG` must exist.
 
+**Relative paths.** A relative `token_file` or `ca_cert` in the config file is
+relative to the config file's directory, so `ca_cert: ca.pem` in
+`~/.config/vorp/config.yaml` means `~/.config/vorp/ca.pem`. A relative path
+given as a flag or `VORP_*` variable is relative to the working directory.
+Absolute paths are used as written.
+
 A config file with every key:
 
 ```yaml
@@ -276,17 +282,23 @@ Expected, after step 4:
 ```
 config                /home/you/.config/vorp/config.yaml  (default)
 relay_host            example.com  (file)
-relay_addr            (not set)
+relay_addr            example.com:443  (default: relay_host)
 ca_cert               (not set)
-token_file            /home/you/.config/vorp/authtoken  (default)
+token_file            /home/you/.config/vorp/authtoken  (default: config)
 upstream              (not set)
 subdomains            (not set)
 allow_remote_targets  false  (default)
-token                 read from /home/you/.config/vorp/authtoken  (default)
+token                 read from /home/you/.config/vorp/authtoken  (default: config)
 ```
 
-Agent flags go before `config`, so `vorp --upstream http://127.0.0.1:3000
-config show` shows the flag's effect. The token's value is never printed.
+`(default: relay_host)` marks a value that falls back on another setting:
+with no `relay_addr`, the agent dials `relay_host` on port 443, and with no
+`token_file`, the token is `authtoken` next to the config file. Agent flags go
+before `config`, so `vorp --upstream http://127.0.0.1:3000 config show` shows
+the flag's effect. The token's value is never printed.
+
+When the agent starts with a config file, it logs
+`config file loaded path=...`, naming the file but none of its values.
 
 Behaviour to rely on:
 

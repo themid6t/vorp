@@ -246,6 +246,8 @@ If the dashboard is not on the base domain, set `dashboard_host`:
 ```
 
 Every key is described in the file's comments. Leave `signup` closed for now.
+A relative path in the file (`database_path`, `tls.cert`, `tls.key`) is
+relative to `/etc/vorp`; the example uses absolute paths.
 
 Install the unit. Its `ExecStart=` only names the config file:
 
@@ -268,14 +270,14 @@ sudo -u vorp vorp config show --relay
 ```
 
 Expected: the unit line, then the effective settings, each followed by where
-it came from (`file` or `default`). An unset `dashboard_host` means the base
-domain. With your names:
+it came from (`file` or `default`). An unset `dashboard_host` shows the base
+domain it falls back on, marked `(default: base_domain)`. With your names:
 
 ```
 ExecStart=/usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml
 config                         /etc/vorp/vorp.yaml  (default)
 base_domain                    example.com  (file)
-dashboard_host                 (not set)
+dashboard_host                 example.com  (default: base_domain)
 listen                         0.0.0.0:443  (default)
 database_path                  /var/lib/vorp/vorp.sqlite3  (file)
 signup                         closed  (default)

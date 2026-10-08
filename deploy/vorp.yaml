@@ -9,6 +9,11 @@
 # wins over the built-in default. `vorp config show --relay` prints the
 # effective value of each setting and where it came from.
 #
+# A relative path in this file (database_path, tls.cert, tls.key) is relative
+# to this file's directory, so `database_path: vorp.sqlite3` here means
+# /etc/vorp/vorp.sqlite3. A relative path given as a flag or VORP_* variable is
+# relative to the working directory. Absolute paths are used as written.
+#
 # This file holds no secrets: there is no token key, and the TLS key is only a
 # path. The development flags (--dev-self-signed, --dev-cert-out, --dev-token)
 # cannot be set here.
@@ -24,7 +29,8 @@ base_domain: example.com
 # Address and port of the single TLS listener. Default: 0.0.0.0:443.
 # listen: 0.0.0.0:443
 
-# SQLite database. Default: vorp.sqlite3 in the working directory.
+# SQLite database. Default: vorp.sqlite3 in the working directory (when not
+# set here; a relative value here is relative to this file).
 database_path: /var/lib/vorp/vorp.sqlite3
 
 # Whether anyone can create a dashboard account: open or closed.
