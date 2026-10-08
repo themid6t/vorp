@@ -363,13 +363,22 @@ fn verify_password_blocking(password: &str, hash: &str) -> bool {
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
 }
+/// `__Host-` makes browsers refuse the cookie unless it is `Secure`, `Path=/`
+/// and has no `Domain`, so a tunnel at `<name>.<base_domain>` cannot plant one
+/// for the dashboard.
+const SESSION_COOKIE: &str = "__Host-vorp_session";
+/// The session id, or `None` when the session cookie appears more than once
+/// (across all `Cookie` headers): a duplicate means one was planted, and
+/// picking either would allow session fixation.
 fn cookie_session(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|pair| pair.trim().strip_prefix("vorp_session="))
+    let mut ids = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='));
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
 }
 /// The signed-in user, refusing an account that must first change its password.
 async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
@@ -405,10 +414,10 @@ fn mutating_request(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 fn session_cookie(id: &str, max_age: u64) -> String {
-    format!("vorp_session={id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}")
+    format!("{SESSION_COOKIE}={id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}")
 }
-fn expired_cookie() -> &'static str {
-    "vorp_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"
+fn expired_cookie() -> String {
+    session_cookie("", 0)
 }
 async fn issue_session(state: &AppState, user_id: i64) -> Result<Response, ApiError> {
     let id = random_hex::<32>()?;
@@ -763,6 +772,38 @@ mod tests {
             .next()
             .expect("pair")
             .to_owned()
+    }
+    #[test]
+    fn session_cookie_is_host_prefixed_without_domain() {
+        for cookie in [session_cookie("abc", 60), expired_cookie()] {
+            assert!(cookie.starts_with("__Host-vorp_session="));
+            for attr in ["; HttpOnly", "; Secure", "; SameSite=Lax", "; Path=/;"] {
+                assert!(cookie.contains(attr), "{cookie} lacks {attr}");
+            }
+            assert!(!cookie.to_ascii_lowercase().contains("domain"));
+        }
+        assert!(expired_cookie().ends_with("Max-Age=0"));
+    }
+    #[test]
+    fn duplicated_session_cookie_is_unauthenticated() {
+        let cases: [(&[&str], Option<&str>); 6] = [
+            (&["__Host-vorp_session=abc"], Some("abc")),
+            (&["a=1; __Host-vorp_session=abc; b=2"], Some("abc")),
+            (&["vorp_session=evil; __Host-vorp_session=abc"], Some("abc")),
+            (&["__Host-vorp_session=evil; __Host-vorp_session=abc"], None),
+            (
+                &["__Host-vorp_session=evil", "__Host-vorp_session=abc"],
+                None,
+            ),
+            (&["vorp_session=abc"], None),
+        ];
+        for (cookies, expected) in cases {
+            let mut headers = HeaderMap::new();
+            for cookie in cookies {
+                headers.append(header::COOKIE, cookie.parse().expect("cookie"));
+            }
+            assert_eq!(cookie_session(&headers), expected, "{cookies:?}");
+        }
     }
     async fn account(router: &Router, email: &str) -> String {
         let body = serde_json::json!({"email":email,"password":"long enough password"}).to_string();
