@@ -244,7 +244,7 @@ key in `~/.config/vorp/config.yaml`, with the same name:
 
 So a config file can hold the relay, and a flag still overrides it for one
 run. A missing default config file is fine; a file named with `--config` or
-`VORP_CONFIG` must exist. An empty environment variable counts as unset.
+`VORP_CONFIG` must exist.
 
 A config file with every key:
 
@@ -280,7 +280,7 @@ relay_addr            (not set)
 ca_cert               (not set)
 token_file            /home/you/.config/vorp/authtoken  (default)
 upstream              (not set)
-subdomains            none (one random name)  (default)
+subdomains            (not set)
 allow_remote_targets  false  (default)
 token                 read from /home/you/.config/vorp/authtoken  (default)
 ```

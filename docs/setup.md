@@ -268,13 +268,14 @@ sudo -u vorp vorp config show --relay
 ```
 
 Expected: the unit line, then the effective settings, each followed by where
-it came from (`file` or `default`). With your names:
+it came from (`file` or `default`). An unset `dashboard_host` means the base
+domain. With your names:
 
 ```
 ExecStart=/usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml
 config                         /etc/vorp/vorp.yaml  (default)
 base_domain                    example.com  (file)
-dashboard_host                 example.com  (default)
+dashboard_host                 (not set)
 listen                         0.0.0.0:443  (default)
 database_path                  /var/lib/vorp/vorp.sqlite3  (file)
 signup                         closed  (default)
