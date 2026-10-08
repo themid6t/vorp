@@ -7,8 +7,9 @@ up ([setup.md](setup.md)) and that you have a dashboard account on it.
 Commands use `example.com` as the relay's base domain, `myapp` as a reserved
 name, and a local service on `http://127.0.0.1:3000`. Substitute your own.
 
-vorp does not have `vorp login`, `vorp http` or `vorp service install` yet.
-They are planned. Everything below uses the agent's flags.
+vorp does not have `vorp http` or `vorp service install` yet. They are
+planned. `vorp login` (step 4) saves the token and the relay's name, so the
+commands below need only `--upstream` and `--subdomain`.
 
 > **A tunnel URL is not access control.** Anyone who has the URL can reach the
 > service. Random names stop guessing, not sharing. Put authentication in the
@@ -135,45 +136,72 @@ Errors:
 The relay stores only a SHA-256 hash of the token. A lost token cannot be
 recovered; create a new one and revoke the old one.
 
-## 4. Save the token
+## 4. Save the token and the relay
 
-On Windows, install by hand from the latest GitHub Release (see the README),
-then pipe the token in: `Get-Content token.txt | vorp.exe authtoken`. It is
-saved to `%APPDATA%\vorp\authtoken`. The rest of this section is for Linux
-and macOS.
-
-On the machine that runs the agent:
+On the machine that runs the agent, install vorp, then log in to the relay:
 
 ```sh
 curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
-jq -r .raw_token token.json | vorp authtoken && rm token.json
+jq -r .raw_token token.json | vorp login example.com && rm token.json
 ```
 
-Or paste it: run `vorp authtoken`, paste, press Enter, then Ctrl-D.
+`vorp login` reads the token from standard input, or from a hidden prompt
+when standard input is a terminal: run `vorp login example.com` and paste it.
+It never takes the token as an argument. The relay name is any name that
+resolves to the relay and that its certificate covers, usually the base
+domain.
 
-Expected log line: `agent token stored path=/home/you/.config/vorp/authtoken`.
-The file is mode `0600`. Check with `stat -c '%a' ~/.config/vorp/authtoken`
-(expected `600`).
+On Windows, install by hand from the latest GitHub Release (see the README),
+then `Get-Content token.txt | vorp.exe login example.com`. The files go to
+`%APPDATA%\vorp\` instead of `~/.config/vorp/`.
+
+Expected log lines:
+
+```
+INFO vorp::token: agent token stored path=/home/you/.config/vorp/authtoken
+INFO vorp::login: agent config saved config=/home/you/.config/vorp/config.yaml relay_host=example.com
+```
+
+It wrote two files:
+
+- `~/.config/vorp/authtoken`, the token, mode `0600`. Check with
+  `stat -c '%a' ~/.config/vorp/authtoken` (expected `600`).
+- `~/.config/vorp/config.yaml`, the agent config, with the line
+  `relay_host: example.com`. If the file already existed, only that line
+  changed; comments and other keys are kept. If it names a different relay,
+  `vorp login` refuses and says which one; add `--force` to replace it.
+
+`$XDG_CONFIG_HOME/vorp/` is used instead of `~/.config/vorp/` when
+`XDG_CONFIG_HOME` is set. `vorp config path` prints the config file in use.
+
+`vorp authtoken` still saves only the token, from standard input, for scripts
+and Kubernetes Secrets: `jq -r .raw_token token.json | vorp authtoken`.
+`vorp authtoken --token-file PATH` writes to `PATH` instead.
 
 Where the agent looks for the token, first match wins:
 
 1. `--token VALUE`, or the `VORP_TOKEN` environment variable. Avoid both
    outside throwaway tests: `ps`, shell history and process managers can
    expose them. If `VORP_TOKEN` is set, `--token-file` is ignored.
-2. `--token-file PATH`.
-3. `$XDG_CONFIG_HOME/vorp/authtoken`, else `~/.config/vorp/authtoken`.
+2. The token file: `--token-file PATH`, `VORP_TOKEN_FILE`, or `token_file` in
+   the config file.
+3. `authtoken` next to the config file, by default
+   `~/.config/vorp/authtoken`.
 
-`vorp authtoken --token-file PATH` writes to `PATH` instead.
+The token never goes in the config file. A `token:` key there is an error.
 
 ## 5. Run a tunnel
 
 ```sh
 # Random name
-vorp --relay-host example.com --upstream http://127.0.0.1:3000
+vorp --upstream http://127.0.0.1:3000
 
 # Reserved name
-vorp --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp
+vorp --upstream http://127.0.0.1:3000 --subdomain myapp
 ```
+
+The relay comes from `relay_host` in the config file (step 4). Without it the
+agent dials `localhost`.
 
 Expected log lines:
 
@@ -191,17 +219,86 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://myapp.example.com/
 Expected: the status your service returns (for example `200`). `502` means
 the relay reached the agent but the agent could not reach the upstream.
 
-Agent flags:
+Agent settings. Each one is a flag, a `VORP_*` environment variable and a
+key in `~/.config/vorp/config.yaml`, with the same name:
 
-| Flag | Meaning |
-| --- | --- |
-| `--relay-host` | The relay's name. The agent checks the relay certificate against it. Default `localhost`. |
-| `--upstream` | Required. `http://host:port` only: no `https`, path, query, fragment or user info. |
-| `--subdomain` | A name to claim. Repeat it for several names. Omit it for one random name. |
-| `--allow-remote-targets` | Allow an upstream that is not loopback (`localhost`, `127.0.0.0/8`, `::1`). |
-| `--token-file`, `--token` | See step 4. |
-| `--relay-addr IP:PORT` | Dial this address instead of resolving `--relay-host` on port 443. |
-| `--ca-cert PATH` | Extra CA certificate to trust, for test relays. |
+| Flag | Environment | Config key | Meaning |
+| --- | --- | --- | --- |
+| `--relay-host` | `VORP_RELAY_HOST` | `relay_host` | The relay's name. The agent checks the relay certificate against it. Default `localhost`. |
+| `--upstream` | `VORP_UPSTREAM` | `upstream` | Required. `http://host:port` only: no `https`, path, query, fragment or user info. |
+| `--subdomain` | `VORP_SUBDOMAINS` (comma-separated) | `subdomains` (a list) | Names to claim. Repeat the flag for several names. Omit it for one random name. |
+| `--allow-remote-targets` | `VORP_ALLOW_REMOTE_TARGETS` (`true`/`false`) | `allow_remote_targets` | Allow an upstream that is not loopback (`localhost`, `127.0.0.0/8`, `::1`). |
+| `--token-file` | `VORP_TOKEN_FILE` | `token_file` | Path of the token file. See step 4. |
+| `--relay-addr IP:PORT` | `VORP_RELAY_ADDR` | `relay_addr` | Dial this address instead of resolving the relay host on port 443. |
+| `--ca-cert PATH` | `VORP_CA_CERT` | `ca_cert` | Extra CA certificate to trust, for test relays. |
+| `--config PATH` | `VORP_CONFIG` | | The config file. Default `~/.config/vorp/config.yaml`. |
+
+`--token` / `VORP_TOKEN` is the token itself, so it has no config key.
+
+**Precedence.** For each setting, the first of these that sets it wins:
+
+1. the command-line flag;
+2. the `VORP_*` environment variable;
+3. the config file;
+4. the built-in default.
+
+So a config file can hold the relay, and a flag still overrides it for one
+run. A missing default config file is fine; a file named with `--config` or
+`VORP_CONFIG` must exist.
+
+**Relative paths.** A relative `token_file` or `ca_cert` in the config file is
+relative to the config file's directory, so `ca_cert: ca.pem` in
+`~/.config/vorp/config.yaml` means `~/.config/vorp/ca.pem`. A relative path
+given as a flag or `VORP_*` variable is relative to the working directory.
+Absolute paths are used as written.
+
+A config file with every key:
+
+```yaml
+# ~/.config/vorp/config.yaml
+relay_host: example.com
+# relay_addr: 203.0.113.10:443     # dial this instead of resolving relay_host
+# ca_cert: /path/to/ca.pem          # extra CA, for test relays
+# token_file: /path/to/authtoken    # default: authtoken next to this file
+# upstream: http://127.0.0.1:3000
+# subdomains: [myapp]
+# allow_remote_targets: false
+```
+
+The file is parsed strictly. An unknown key (a typo such as `relay_hots`), a
+value of the wrong type, or a secret key (`token`, `dev_token`) stops the
+agent with the file name and line, for example
+``config.yaml:2: unknown key `relay_hots` ``. The `tunnels:` key is reserved
+for multi-tunnel config in a later release and is rejected for now.
+
+To see what is in effect and where each value came from:
+
+```sh
+vorp config show
+```
+
+Expected, after step 4:
+
+```
+config                /home/you/.config/vorp/config.yaml  (default)
+relay_host            example.com  (file)
+relay_addr            example.com:443  (default: relay_host)
+ca_cert               (not set)
+token_file            /home/you/.config/vorp/authtoken  (default: config)
+upstream              (not set)
+subdomains            (not set)
+allow_remote_targets  false  (default)
+token                 read from /home/you/.config/vorp/authtoken  (default: config)
+```
+
+`(default: relay_host)` marks a value that falls back on another setting:
+with no `relay_addr`, the agent dials `relay_host` on port 443, and with no
+`token_file`, the token is `authtoken` next to the config file. Agent flags go
+before `config`, so `vorp --upstream http://127.0.0.1:3000 config show` shows
+the flag's effect. The token's value is never printed.
+
+When the agent starts with a config file, it logs
+`config file loaded path=...`, naming the file but none of its values.
 
 Behaviour to rely on:
 
@@ -231,7 +328,7 @@ cat > ~/.config/systemd/user/vorp-myapp.service <<'EOF'
 Description=vorp tunnel for myapp
 
 [Service]
-ExecStart=/usr/local/bin/vorp --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp
+ExecStart=/usr/local/bin/vorp --upstream http://127.0.0.1:3000 --subdomain myapp
 Environment=NO_COLOR=1
 Restart=always
 RestartSec=5
@@ -245,7 +342,7 @@ sudo loginctl enable-linger "$USER"
 ```
 
 Linger keeps user services running after logout and starts them at boot. The
-token comes from `~/.config/vorp/authtoken` (step 4).
+relay and the token come from `~/.config/vorp/` (step 4).
 
 Check:
 
@@ -274,7 +371,6 @@ cat > ~/Library/LaunchAgents/com.example.vorp-myapp.plist <<EOF
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/vorp</string>
-    <string>--relay-host</string><string>example.com</string>
     <string>--upstream</string><string>http://127.0.0.1:3000</string>
     <string>--subdomain</string><string>myapp</string>
   </array>
@@ -290,8 +386,8 @@ EOF
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.example.vorp-myapp.plist
 ```
 
-It starts at login and restarts if it exits. The token comes from
-`~/.config/vorp/authtoken` (step 4). The heredoc is unquoted on purpose, so
+It starts at login and restarts if it exits. The relay and the token come
+from `~/.config/vorp/` (step 4). The heredoc is unquoted on purpose, so
 `$HOME` is written into the log paths; launchd does not expand it.
 
 Check:
@@ -313,13 +409,13 @@ environment, and `pm2 save` writes them to `~/.pm2/dump.pm2`, so `--token` or
 
 ```sh
 pm2 start /usr/local/bin/vorp --name vorp-myapp --interpreter none -- \
-  --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp \
-  --token-file "$HOME/.config/vorp/authtoken"
+  --upstream http://127.0.0.1:3000 --subdomain myapp
 pm2 save
 pm2 startup    # prints a command to run once with sudo, so pm2 starts at boot
 ```
 
-`--interpreter none` runs the binary directly instead of through Node.
+`--interpreter none` runs the binary directly instead of through Node. The
+relay and the token file come from `~/.config/vorp/` (step 4).
 
 Check:
 
@@ -328,8 +424,8 @@ pm2 jlist | jq -r '.[] | select(.name=="vorp-myapp") | .pm2_env.status, (.pm2_en
 pm2 logs vorp-myapp --lines 20 --nostream | grep 'tunnel registered'
 ```
 
-Expected: `online`, the arguments with `--token-file` and no token value, and
-a `tunnel registered` line.
+Expected: `online`, the arguments with no token value, and a
+`tunnel registered` line.
 
 ### Kubernetes sidecar
 
@@ -435,6 +531,12 @@ Notes:
   `SUBDOMAIN_TAKEN` and exits. Keep `replicas: 1` with a reserved name, and use
   `Recreate` so a rollout does not start the new Pod while the old one still
   holds the name. With random names, each replica gets its own URL.
+- **Flags or environment, no config file needed.** The container has no
+  `~/.config/vorp/config.yaml`, so the agent uses its flags. Every flag also
+  has a `VORP_*` variable (see step 5), for example
+  `{name: VORP_RELAY_HOST, value: example.com}` in `env:`. To share one
+  config, mount a ConfigMap as a file and pass `--config=/etc/vorp-config/config.yaml`;
+  keep the token in the Secret.
 - **Agent in its own Deployment.** To run the agent apart from the app, point
   it at the Service and allow a non-loopback upstream:
   `--upstream=http://myapp:3000 --allow-remote-targets`.

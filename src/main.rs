@@ -1,164 +1,20 @@
-use std::{net::SocketAddr, path::PathBuf};
+mod cli;
+mod config;
+mod login;
+mod token;
+
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, parser::ValueSource};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-use vorp_agent::AgentConfig;
-use vorp_relay::{EdgeLimits, RelayConfig, SignupMode, TlsConfig};
 
-#[derive(Parser)]
-#[command(name = "vorp", version, about = "Self-hosted reverse tunnels")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-
-    #[command(flatten)]
-    agent: AgentArgs,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Run the relay.
-    Serve(Box<ServeArgs>),
-    /// Save an agent token read from standard input.
-    Authtoken(TokenArgs),
-    /// Account recovery, run on the relay host against its database.
-    #[command(subcommand)]
-    Admin(AdminCommand),
-}
-
-#[derive(Subcommand)]
-enum AdminCommand {
-    /// Replace an account's password with a new random one and end its
-    /// sessions. Prints the new password once.
-    ResetPassword(ResetPasswordArgs),
-}
-
-#[derive(Args)]
-struct ResetPasswordArgs {
-    #[arg(long)]
-    email: String,
-
-    /// The relay's database; the relay may keep running.
-    #[arg(long, default_value = "vorp.sqlite3")]
-    database_path: PathBuf,
-}
-
-#[derive(Args)]
-struct TokenArgs {
-    #[arg(long)]
-    token_file: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SignupArg {
-    Open,
-    Closed,
-}
-
-impl From<SignupArg> for SignupMode {
-    fn from(value: SignupArg) -> Self {
-        match value {
-            SignupArg::Open => Self::Open,
-            SignupArg::Closed => Self::Closed,
-        }
-    }
-}
-
-#[derive(Args)]
-struct AgentArgs {
-    #[arg(long, default_value = "localhost")]
-    relay_host: String,
-
-    /// Dial this address instead of resolving `--relay-host` on port 443.
-    #[arg(long)]
-    relay_addr: Option<SocketAddr>,
-
-    #[arg(long)]
-    ca_cert: Option<PathBuf>,
-
-    #[arg(long, env = "VORP_TOKEN", hide_env_values = true)]
-    token: Option<String>,
-
-    #[arg(long)]
-    token_file: Option<PathBuf>,
-
-    #[arg(long)]
-    upstream: Option<String>,
-
-    #[arg(long = "subdomain")]
-    subdomains: Vec<String>,
-
-    #[arg(long)]
-    allow_remote_targets: bool,
-}
-
-#[derive(Args)]
-struct ServeArgs {
-    #[arg(long, default_value = "0.0.0.0:443")]
-    listen: SocketAddr,
-
-    #[arg(long)]
-    base_domain: String,
-
-    #[arg(long)]
-    dashboard_host: Option<String>,
-
-    #[arg(long, default_value = "vorp.sqlite3")]
-    database_path: PathBuf,
-
-    #[arg(long, value_enum, default_value = "closed")]
-    signup: SignupArg,
-
-    /// Concurrent TLS connections, including handshakes.
-    #[arg(long, default_value_t = EdgeLimits::default().max_connections)]
-    max_connections: usize,
-
-    /// Concurrent TLS connections from one IP (agents and browsers combined).
-    #[arg(long, default_value_t = EdgeLimits::default().max_connections_per_ip)]
-    max_connections_per_ip: usize,
-
-    /// HTTP requests per second per IP; the burst is twice this.
-    #[arg(long, default_value_t = EdgeLimits::default().requests_per_second_per_ip)]
-    rate_limit_rps: u64,
-
-    /// Concurrent proxied HTTP requests across all tunnels.
-    #[arg(long, default_value_t = EdgeLimits::default().max_requests)]
-    max_requests: usize,
-
-    /// Concurrent WebSockets across all tunnels.
-    #[arg(long, default_value_t = EdgeLimits::default().max_websockets)]
-    max_websockets: usize,
-
-    /// Concurrent proxied HTTP requests per tunnel.
-    #[arg(long, default_value_t = EdgeLimits::default().tunnel_requests)]
-    tunnel_requests: usize,
-
-    /// Concurrent WebSockets per tunnel.
-    #[arg(long, default_value_t = EdgeLimits::default().tunnel_websockets)]
-    tunnel_websockets: usize,
-
-    /// Seconds to wait for an upstream's response head (resets on upload progress).
-    #[arg(long, default_value_t = EdgeLimits::default().response_timeout.as_secs())]
-    response_timeout_secs: u64,
-
-    #[arg(long, requires = "tls_key", conflicts_with = "dev_self_signed")]
-    tls_cert: Option<PathBuf>,
-
-    #[arg(long, requires = "tls_cert", conflicts_with = "dev_self_signed")]
-    tls_key: Option<PathBuf>,
-
-    /// Generate a temporary certificate for local development.
-    #[arg(long)]
-    dev_self_signed: bool,
-
-    #[arg(long, requires = "dev_self_signed")]
-    dev_cert_out: Option<PathBuf>,
-
-    #[arg(long, env = "VORP_DEV_TOKEN", hide_env_values = true)]
-    dev_token: Option<String>,
-}
+use cli::{
+    AdminCommand, Cli, Command, ConfigCommand, LoginArgs, ResetPasswordArgs, ServeArgs, ShowArgs,
+    TokenArgs,
+};
+use config::{AgentLayer, Merge, RelayLayer, Row, Source};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -167,49 +23,270 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let cli = Cli::parse();
+    let matches = command_line(std::env::args_os().collect()).unwrap_or_else(|error| error.exit());
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    // The matches of the subcommand, for the sources of its flags.
+    let sub = matches.subcommand().map_or(&matches, |(_, sub)| sub);
     match cli.command {
-        Some(Command::Serve(args)) => serve(*args).await,
+        Some(Command::Serve(args)) => serve(*args, cli.config, sub).await,
         Some(Command::Authtoken(args)) => save_token(args),
+        Some(Command::Login(args)) => run_login(args, cli.config, cli.agent.token_file),
+        Some(Command::Config(ConfigCommand::Path { relay })) => {
+            print_config_path(relay, cli.config)
+        }
+        Some(Command::Config(ConfigCommand::Show(args))) => {
+            let show = sub.subcommand().map_or(sub, |(_, show)| show);
+            show_config(*args, cli.config, cli.agent, &matches, show)
+        }
         Some(Command::Admin(AdminCommand::ResetPassword(args))) => reset_password(args).await,
-        None => run_agent(cli.agent).await,
+        None => run_agent(cli, &matches).await,
     }
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
-    let tls = match (args.tls_cert, args.tls_key, args.dev_self_signed) {
-        (Some(cert), Some(key), false) => TlsConfig::Files { cert, key },
-        (None, None, true) => TlsConfig::SelfSigned {
-            cert_output: args
-                .dev_cert_out
-                .context("--dev-self-signed requires --dev-cert-out")?,
-        },
-        _ => bail!("provide --tls-cert and --tls-key, or --dev-self-signed --dev-cert-out"),
+/// Parses the command line. clap reads a root flag's `VORP_*` variable
+/// whatever the subcommand, so a malformed agent variable would fail
+/// `vorp serve`. The first pass ignores the agent's variables; only the agent
+/// run and the agent's `vorp config show` parse again with them. `token_file`
+/// keeps its variable for `vorp login`; any value is a valid path.
+fn command_line(argv: Vec<OsString>) -> Result<ArgMatches, clap::Error> {
+    let agent: Vec<clap::Id> = AgentLayer::augment_args(clap::Command::new("agent"))
+        .get_arguments()
+        .map(|arg| arg.get_id().clone())
+        .filter(|id| id != "token_file")
+        .collect();
+    let matches = Cli::command()
+        .mut_args(|arg| {
+            if agent.contains(arg.get_id()) {
+                arg.env(None)
+            } else {
+                arg
+            }
+        })
+        .try_get_matches_from(&argv)?;
+    let agent_mode = match matches.subcommand() {
+        None => true,
+        Some(("config", config)) => {
+            matches!(config.subcommand(), Some(("show", show)) if !show.get_flag("relay"))
+        }
+        Some(_) => false,
     };
-    let config = RelayConfig {
-        listen: args.listen,
-        dashboard_host: args
-            .dashboard_host
-            .unwrap_or_else(|| args.base_domain.clone()),
-        base_domain: args.base_domain,
-        database_path: args.database_path,
-        tls,
-        signup_mode: args.signup.into(),
-        dev_token: args.dev_token,
-        limits: EdgeLimits {
-            max_connections: args.max_connections,
-            max_connections_per_ip: args.max_connections_per_ip,
-            requests_per_second_per_ip: args.rate_limit_rps,
-            max_requests: args.max_requests,
-            max_websockets: args.max_websockets,
-            tunnel_requests: args.tunnel_requests,
-            tunnel_websockets: args.tunnel_websockets,
-            response_timeout: std::time::Duration::from_secs(args.response_timeout_secs),
-        },
+    if agent_mode {
+        Cli::command().try_get_matches_from(argv)
+    } else {
+        Ok(matches)
+    }
+}
+
+/// The startup line naming the config file read, if any. Never its values.
+fn log_loaded(loaded: Option<PathBuf>) {
+    if let Some(path) = loaded {
+        tracing::info!(path = %path.display(), "config file loaded");
+    }
+}
+
+/// `Flag` or `Env` when the user set clap id `id`; `None` for a built-in
+/// default or nothing.
+fn explicit(matches: &ArgMatches) -> impl Fn(&str) -> Option<Source> + '_ {
+    |id| match matches.value_source(id) {
+        Some(ValueSource::CommandLine) => Some(Source::Flag),
+        Some(ValueSource::EnvVariable) => Some(Source::Env),
+        _ => None,
+    }
+}
+
+/// Whether `vorp config show` got a relay flag on its command line.
+fn explicit_flags(show: &ArgMatches) -> bool {
+    show.ids().any(|id| {
+        !["relay", "config"].contains(&id.as_str())
+            && show.value_source(id.as_str()) == Some(ValueSource::CommandLine)
+    })
+}
+
+/// The `config` row: the file, whether it exists, and who chose it.
+fn config_row(path: Option<&PathBuf>, named: bool, matches: &ArgMatches) -> Row {
+    let source = if named {
+        explicit(matches)("config").unwrap_or(Source::Flag)
+    } else {
+        Source::Default
     };
+    let row = path.map(|path| {
+        let missing = if path.exists() { "" } else { " (not found)" };
+        (format!("{}{missing}", path.display()), source)
+    });
+    ("config", row)
+}
+
+fn agent_config_path(config: Option<PathBuf>) -> Option<PathBuf> {
+    config.or_else(|| {
+        config::agent_dir(|name| std::env::var_os(name)).map(|dir| dir.join("config.yaml"))
+    })
+}
+
+/// The agent's settings merged from flags, environment, file and defaults,
+/// with a `vorp config show` row for each, the config file's first, and the
+/// path of the file if one was read. The default token file is `authtoken`
+/// next to the config file.
+fn agent_settings(
+    config: Option<PathBuf>,
+    clap: AgentLayer,
+    matches: &ArgMatches,
+) -> Result<(AgentLayer, Vec<Row>, Option<PathBuf>)> {
+    let named = config.is_some();
+    let path = agent_config_path(config);
+    let file = match &path {
+        Some(path) => config::read::<AgentLayer>(path, named, true)?
+            .map(|file| file.relative_to(config::file_dir(path))),
+        None => None,
+    };
+    let loaded = path.clone().filter(|_| file.is_some());
+    let explicit = explicit(matches);
+    let mut merge = Merge::new(&explicit);
+    merge.rows.push(config_row(path.as_ref(), named, matches));
+    let mut settings = clap.merge(file.unwrap_or_default(), &mut merge);
+    if settings.token_file.is_none() {
+        settings.token_file = path.map(|path| path.with_file_name("authtoken"));
+        let shown = settings
+            .token_file
+            .as_ref()
+            .map(|p| p.display().to_string());
+        merge.fallback("token_file", "config", shown);
+    }
+    Ok((settings, merge.rows, loaded))
+}
+
+/// Like [`agent_settings`], for `vorp serve`.
+fn relay_settings(
+    config: Option<PathBuf>,
+    clap: RelayLayer,
+    matches: &ArgMatches,
+) -> Result<(RelayLayer, Vec<Row>, Option<PathBuf>)> {
+    let named = config.is_some();
+    let path = config.unwrap_or_else(|| PathBuf::from(config::RELAY_CONFIG));
+    let file = config::read::<RelayLayer>(&path, named, false)?
+        .map(|file| file.relative_to(config::file_dir(&path)));
+    let loaded = file.is_some().then(|| path.clone());
+    let explicit = explicit(matches);
+    let mut merge = Merge::new(&explicit);
+    merge.rows.push(config_row(Some(&path), named, matches));
+    let settings = clap.merge(file.unwrap_or_default(), &mut merge);
+    Ok((settings, merge.rows, loaded))
+}
+
+/// Prints each effective setting and its source. Secrets are never printed.
+fn show_config(
+    args: ShowArgs,
+    config: Option<PathBuf>,
+    agent: AgentLayer,
+    matches: &ArgMatches,
+    show: &ArgMatches,
+) -> Result<()> {
+    if !args.relay && explicit_flags(show) {
+        bail!("relay flags need --relay; agent flags go before `config`");
+    }
+    let rows = if args.relay {
+        relay_settings(config, args.serve, show)?.1
+    } else {
+        agent_rows(config, agent, matches)?
+    };
+    print_rows(&rows)
+}
+
+/// The agent rows plus where the token comes from, never its value.
+fn agent_rows(config: Option<PathBuf>, clap: AgentLayer, matches: &ArgMatches) -> Result<Vec<Row>> {
+    let (_, mut rows, _) = agent_settings(config, clap, matches)?;
+    let token_row = match explicit(matches)("token") {
+        Some(Source::Flag) => Some(("set by --token".to_owned(), Source::Flag)),
+        Some(source) => Some(("set by VORP_TOKEN".to_owned(), source)),
+        _ => rows
+            .iter()
+            .find(|(key, _)| *key == "token_file")
+            .and_then(|(_, file)| file.clone())
+            .map(|(path, source)| (format!("read from {path}"), source)),
+    };
+    rows.push(("token", token_row));
+    Ok(rows)
+}
+
+fn print_rows(rows: &[Row]) -> Result<()> {
+    use std::io::Write;
+
+    let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(key, value)| match value {
+            Some((value, source)) => format!("{key:<width$}  {value}  ({source})"),
+            None => format!("{key:<width$}  (not set)"),
+        })
+        .collect();
+    writeln!(std::io::stdout().lock(), "{}", lines.join("\n")).context("print settings")
+}
+
+fn print_config_path(relay: bool, config: Option<PathBuf>) -> Result<()> {
+    use std::io::Write;
+
+    let path = if relay {
+        config.unwrap_or_else(|| PathBuf::from(config::RELAY_CONFIG))
+    } else {
+        agent_config_path(config).context("no config directory; pass --config")?
+    };
+    writeln!(std::io::stdout().lock(), "{}", path.display()).context("print config path")
+}
+
+async fn serve(args: ServeArgs, config: Option<PathBuf>, matches: &ArgMatches) -> Result<()> {
+    let (settings, _, loaded) = relay_settings(config, args.settings, matches)?;
+    log_loaded(loaded);
+    let config = settings
+        .into_relay_config(args.dev)
+        .context("relay configuration is incomplete")?;
     vorp_relay::serve_until(config, shutdown_on_signal()?)
         .await
         .context("relay stopped")
+}
+
+async fn run_agent(cli: Cli, matches: &ArgMatches) -> Result<()> {
+    let (settings, _, loaded) = agent_settings(cli.config, cli.agent, matches)?;
+    log_loaded(loaded);
+    let token = match cli.token {
+        Some(token) => token,
+        None => {
+            let path = settings
+                .token_file
+                .clone()
+                .context("no config directory; pass --token-file or set VORP_TOKEN")?;
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("read agent token from {}", path.display()))?
+                .trim()
+                .to_owned()
+        }
+    };
+    if token.is_empty() {
+        bail!("agent token is empty");
+    }
+    let config = settings
+        .into_agent_config(token)
+        .context("agent configuration is incomplete")?;
+    config
+        .validate()
+        .context("agent configuration is invalid")?;
+    vorp_agent::run_until(config, shutdown_on_signal()?)
+        .await
+        .context("agent stopped")
+}
+
+fn save_token(args: TokenArgs) -> Result<()> {
+    let path = match args.token_file {
+        Some(path) => path,
+        None => token::default_path()?,
+    };
+    let raw = token::read_from_stdin(false)?;
+    token::save(&path, token::validate(&raw)?)
+}
+
+fn run_login(args: LoginArgs, config: Option<PathBuf>, token_file: Option<PathBuf>) -> Result<()> {
+    let path = agent_config_path(config).context("no config directory; pass --config")?;
+    login::login(&path, token_file, &args.relay_host, args.force, || {
+        token::read_from_stdin(true)
+    })
 }
 
 async fn reset_password(args: ResetPasswordArgs) -> Result<()> {
@@ -234,43 +311,6 @@ async fn reset_password(args: ResetPasswordArgs) -> Result<()> {
     )
     .context("print new password")?;
     Ok(())
-}
-
-async fn run_agent(args: AgentArgs) -> Result<()> {
-    let token = match args.token {
-        Some(token) => token,
-        None => {
-            let path = args.token_file.unwrap_or(default_token_path()?);
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("read agent token from {}", path.display()))?
-                .trim()
-                .to_owned()
-        }
-    };
-    if token.is_empty() {
-        bail!("agent token is empty");
-    }
-    let upstream = args.upstream.context("--upstream is required")?;
-    let requested_subdomains = if args.subdomains.is_empty() {
-        vec![None]
-    } else {
-        args.subdomains.into_iter().map(Some).collect()
-    };
-    let config = AgentConfig {
-        relay_host: args.relay_host,
-        relay_addr: args.relay_addr,
-        ca_cert: args.ca_cert,
-        token,
-        upstream,
-        requested_subdomains,
-        allow_remote_targets: args.allow_remote_targets,
-    };
-    config
-        .validate()
-        .context("agent configuration is invalid")?;
-    vorp_agent::run_until(config, shutdown_on_signal()?)
-        .await
-        .context("agent stopped")
 }
 
 /// Cancels the returned token on Ctrl-C or SIGTERM (what systemd and
@@ -301,51 +341,237 @@ fn shutdown_on_signal() -> Result<CancellationToken> {
     Ok(shutdown)
 }
 
-fn default_token_path() -> Result<PathBuf> {
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("no config directory; pass --token-file or set VORP_TOKEN")?;
-    Ok(config_dir.join("vorp").join("authtoken"))
-}
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
 
-fn save_token(args: TokenArgs) -> Result<()> {
-    use std::io::{Read, Write};
+    use vorp_relay::{EdgeLimits, SignupMode, TlsConfig};
 
-    let path = args.token_file.unwrap_or(default_token_path()?);
-    let mut token = String::new();
-    std::io::stdin()
-        .take(4096)
-        .read_to_string(&mut token)
-        .context("read agent token from standard input")?;
-    let token = token.trim();
-    if token.is_empty() || token.len() >= 4096 {
-        bail!("agent token must contain 1 to 4095 bytes");
+    use super::*;
+    use crate::config::TempDir;
+
+    fn parse(argv: &[&str]) -> (Cli, ArgMatches) {
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .expect("valid command line");
+        let cli = Cli::from_arg_matches(&matches).expect("matches fit Cli");
+        (cli, matches)
     }
-    let directory = path
-        .parent()
-        .context("token file has no parent directory")?;
-    std::fs::create_dir_all(directory)
-        .with_context(|| format!("create token directory {}", directory.display()))?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+
+    fn relay(argv: &[&str]) -> (vorp_relay::RelayConfig, Vec<Row>) {
+        let (cli, matches) = parse(argv);
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve");
+        };
+        let serve = matches.subcommand_matches("serve").expect("serve matches");
+        let (settings, rows, _) =
+            relay_settings(cli.config, args.settings, serve).expect("settings");
+        let config = settings
+            .into_relay_config(args.dev)
+            .expect("complete config");
+        (config, rows)
     }
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("open token file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("secure token file {}", path.display()))?;
+
+    fn source<'a>(rows: &'a [Row], key: &str) -> Option<&'a (String, Source)> {
+        rows.iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, value)| value.as_ref())
     }
-    file.write_all(token.as_bytes())
-        .with_context(|| format!("write token file {}", path.display()))?;
-    tracing::info!(path = %path.display(), "agent token stored");
-    Ok(())
+
+    fn write(dir: &Path, name: &str, text: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write config");
+        path.display().to_string()
+    }
+
+    /// The flag-only `ExecStart=` from before config files existed, with an
+    /// empty config file, yields the same relay config.
+    #[test]
+    fn flag_only_relay_unit_is_unchanged() {
+        let dir = TempDir::new("main-flag-only-relay");
+        let empty = write(&dir.0, "empty.yaml", "");
+        let (config, _) = relay(&[
+            "vorp",
+            "serve",
+            "--config",
+            &empty,
+            "--base-domain",
+            "example.com",
+            "--tls-cert",
+            "/etc/vorp/fullchain.pem",
+            "--tls-key",
+            "/etc/vorp/privkey.pem",
+            "--database-path",
+            "/var/lib/vorp/vorp.sqlite3",
+        ]);
+        assert_eq!(config.listen, "0.0.0.0:443".parse().expect("valid address"));
+        assert_eq!(config.base_domain, "example.com");
+        assert_eq!(config.dashboard_host, "example.com");
+        assert_eq!(
+            config.database_path,
+            PathBuf::from("/var/lib/vorp/vorp.sqlite3")
+        );
+        assert_eq!(config.signup_mode, SignupMode::Closed);
+        assert!(config.dev_token.is_none());
+        let TlsConfig::Files { cert, key } = config.tls else {
+            panic!("expected certificate files");
+        };
+        assert_eq!(cert, PathBuf::from("/etc/vorp/fullchain.pem"));
+        assert_eq!(key, PathBuf::from("/etc/vorp/privkey.pem"));
+        assert_eq!(
+            format!("{:?}", config.limits),
+            format!("{:?}", EdgeLimits::default())
+        );
+    }
+
+    /// Every relay key from the file, one overridden by a flag; also checks
+    /// that each `vorp config show` key is a real clap id.
+    #[test]
+    fn relay_file_under_flags() {
+        let dir = TempDir::new("main-relay-file");
+        let file = write(
+            &dir.0,
+            "vorp.yaml",
+            "base_domain: example.com\ndashboard_host: dash.example.com\n\
+             listen: 127.0.0.1:1\ndatabase_path: /db\nsignup: open\n\
+             tls: {cert: /c.pem, key: /k.pem}\nlimits: {max_connections: 5, max_requests: 6}\n",
+        );
+        let (config, rows) = relay(&["vorp", "serve", "--config", &file, "--max-requests", "7"]);
+        assert_eq!(config.dashboard_host, "dash.example.com");
+        assert_eq!(config.signup_mode, SignupMode::Open);
+        assert_eq!(config.limits.max_connections, 5);
+        assert_eq!(config.limits.max_requests, 7);
+        assert_eq!(
+            source(&rows, "limits.max_connections"),
+            Some(&("5".to_owned(), Source::File))
+        );
+        assert_eq!(
+            source(&rows, "limits.max_requests"),
+            Some(&("7".to_owned(), Source::Flag))
+        );
+        assert_eq!(
+            source(&rows, "limits.max_websockets").map(|(_, s)| *s),
+            Some(Source::Default)
+        );
+        assert_eq!(source(&rows, "config"), Some(&(file, Source::Flag)));
+    }
+
+    #[test]
+    fn flag_only_agent_is_unchanged() {
+        let dir = TempDir::new("main-flag-only-agent");
+        let empty = write(&dir.0, "empty.yaml", "");
+        let agent = |argv: &[&str]| {
+            let (cli, matches) = parse(argv);
+            let (settings, _, _) =
+                agent_settings(Some(empty.clone().into()), cli.agent, &matches).expect("settings");
+            settings
+                .into_agent_config("token".into())
+                .expect("complete config")
+        };
+        let config = agent(&[
+            "vorp",
+            "--relay-host",
+            "example.com",
+            "--upstream",
+            "http://127.0.0.1:3000",
+            "--subdomain",
+            "a",
+            "--subdomain",
+            "b",
+            "--allow-remote-targets",
+        ]);
+        assert_eq!(config.relay_host, "example.com");
+        assert_eq!(config.upstream, "http://127.0.0.1:3000");
+        assert_eq!(
+            config.requested_subdomains,
+            vec![Some("a".to_owned()), Some("b".to_owned())]
+        );
+        assert!(config.allow_remote_targets);
+
+        let config = agent(&["vorp", "--upstream", "http://127.0.0.1:3000"]);
+        assert_eq!(config.relay_host, "localhost");
+        assert_eq!(config.requested_subdomains, vec![None]);
+        assert!(!config.allow_remote_targets);
+    }
+
+    #[test]
+    fn agent_token_row_never_shows_the_token() {
+        let dir = TempDir::new("main-token-row");
+        let file = write(&dir.0, "config.yaml", "relay_host: example.com\n");
+        let (cli, matches) = parse(&["vorp", "--token", "vorp_1_secret", "config", "show"]);
+        let rows = agent_rows(Some(file.into()), cli.agent, &matches).expect("rows");
+        assert_eq!(
+            source(&rows, "token"),
+            Some(&("set by --token".to_owned(), Source::Flag))
+        );
+        assert_eq!(
+            source(&rows, "relay_host"),
+            Some(&("example.com".to_owned(), Source::File))
+        );
+        assert!(!format!("{rows:?}").contains("vorp_1_secret"));
+        assert_eq!(
+            source(&rows, "relay_addr"),
+            Some(&("example.com:443".to_owned(), Source::Fallback("relay_host")))
+        );
+        let authtoken = dir.0.join("authtoken").display().to_string();
+        assert_eq!(
+            source(&rows, "token_file"),
+            Some(&(authtoken, Source::Fallback("config")))
+        );
+    }
+
+    /// The file's relative paths are relative to its directory, a flag's to
+    /// the working directory; and the file read is reported for the log line.
+    #[test]
+    fn relay_file_paths_and_loaded() {
+        let dir = TempDir::new("main-relay-paths");
+        let file = write(
+            &dir.0,
+            "vorp.yaml",
+            "base_domain: example.com
+database_path: db.sqlite3
+tls: {key: k.pem}
+",
+        );
+        let (cli, matches) = parse(&["vorp", "serve", "--config", &file, "--tls-cert", "c.pem"]);
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve");
+        };
+        let serve = matches.subcommand_matches("serve").expect("serve matches");
+        let (settings, rows, loaded) =
+            relay_settings(cli.config, args.settings, serve).expect("settings");
+        assert_eq!(settings.database_path, Some(dir.0.join("db.sqlite3")));
+        assert_eq!(settings.tls.key, Some(dir.0.join("k.pem")));
+        assert_eq!(settings.tls.cert, Some(PathBuf::from("c.pem")));
+        assert_eq!(loaded, Some(PathBuf::from(&file)));
+        assert_eq!(
+            source(&rows, "dashboard_host"),
+            Some(&("example.com".to_owned(), Source::Fallback("base_domain")))
+        );
+    }
+
+    #[test]
+    fn relay_flags_on_config_show_need_relay() {
+        for (argv, expected) in [
+            (
+                &["vorp", "config", "show", "--listen", "127.0.0.1:1"][..],
+                true,
+            ),
+            (
+                &["vorp", "config", "show", "--config", "/c.yaml"][..],
+                false,
+            ),
+            (
+                &["vorp", "--upstream", "http://127.0.0.1:1", "config", "show"][..],
+                false,
+            ),
+        ] {
+            let (_, matches) = parse(argv);
+            let show = matches
+                .subcommand_matches("config")
+                .and_then(|config| config.subcommand_matches("show"))
+                .expect("show matches");
+            assert_eq!(explicit_flags(show), expected, "{argv:?}");
+        }
+    }
 }

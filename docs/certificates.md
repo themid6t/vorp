@@ -132,13 +132,18 @@ exist yet.
 
 ## 5. Point the relay at the copies
 
-[`deploy/vorp.service`](../deploy/vorp.service) runs:
+[`deploy/vorp.service`](../deploy/vorp.service) runs
+`vorp serve --config /etc/vorp/vorp.yaml`, and
+[`deploy/vorp.yaml`](../deploy/vorp.yaml) points at the copies:
 
-```sh
-/usr/local/bin/vorp serve --base-domain example.com \
-  --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem \
-  --database-path /var/lib/vorp/vorp.sqlite3
+```yaml
+tls:
+  cert: /etc/vorp/fullchain.pem
+  key: /etc/vorp/privkey.pem
 ```
+
+The flags `--tls-cert` and `--tls-key` set the same paths and override the
+file.
 
 The relay re-reads both files every 30 seconds. When their content changes
 and the new pair is valid, it logs `TLS certificate reloaded` and uses the new

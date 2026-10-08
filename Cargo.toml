@@ -1,6 +1,6 @@
 [package]
 name = "vorp"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -31,7 +31,11 @@ tokio = { version = "1", features = ["io-util"] }
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
+rpassword = "7"
+serde.workspace = true
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
+thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7"
 tracing = "0.1"
@@ -40,3 +44,4 @@ vorp-agent = { path = "crates/agent" }
 vorp-relay = { path = "crates/relay" }
 vorp-store = { path = "crates/store" }
 vorp-web = { path = "crates/web" }
+

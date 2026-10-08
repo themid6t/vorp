@@ -1,0 +1,65 @@
+# Example relay config. Replace example.com with your domain, then install it:
+#   sudo install -m 0644 deploy/vorp.yaml /etc/vorp/vorp.yaml
+# deploy/vorp.service runs `vorp serve --config /etc/vorp/vorp.yaml`. Changes
+# take effect on `sudo systemctl restart vorp`; the relay does not reload this
+# file while running. Certificate files are still reloaded within 30 seconds.
+#
+# Every setting can also be a `vorp serve` flag or a VORP_* environment
+# variable. A flag wins over the environment, which wins over this file, which
+# wins over the built-in default. `vorp config show --relay` prints the
+# effective value of each setting and where it came from.
+#
+# A relative path in this file (database_path, tls.cert, tls.key) is relative
+# to this file's directory, so `database_path: vorp.sqlite3` here means
+# /etc/vorp/vorp.sqlite3. A relative path given as a flag or VORP_* variable is
+# relative to the working directory. Absolute paths are used as written.
+#
+# This file holds no secrets: there is no token key, and the TLS key is only a
+# path. The development flags (--dev-self-signed, --dev-cert-out, --dev-token)
+# cannot be set here.
+
+# Tunnels are served at <name>.<base_domain>. Required.
+base_domain: example.com
+
+# Where the dashboard and API are served. Default: base_domain. Use a name
+# under the wildcard, such as dashboard.example.com, when the bare base domain
+# is in use by something else.
+# dashboard_host: dashboard.example.com
+
+# Address and port of the single TLS listener. Default: 0.0.0.0:443.
+# listen: 0.0.0.0:443
+
+# SQLite database. Default: vorp.sqlite3 in the working directory (when not
+# set here; a relative value here is relative to this file).
+database_path: /var/lib/vorp/vorp.sqlite3
+
+# Whether anyone can create a dashboard account: open or closed.
+# Default: closed (the first account is created with the bootstrap step).
+# signup: closed
+
+# The wildcard certificate and its private key, as copied by
+# deploy/cert-deploy.sh. Both are required (outside development mode).
+tls:
+  cert: /etc/vorp/fullchain.pem
+  key: /etc/vorp/privkey.pem
+
+# Edge limits. Every key is optional; the values shown are the built-in
+# defaults. Flags: --max-connections and so on. Environment variables join
+# the path with `_`, for example VORP_LIMITS_MAX_CONNECTIONS.
+# limits:
+#   # Concurrent TLS connections, including handshakes.
+#   max_connections: 1024
+#   # Concurrent TLS connections from one IP (agents and browsers combined).
+#   max_connections_per_ip: 64
+#   # HTTP requests per second per IP; the burst is twice this.
+#   rate_limit_rps: 200
+#   # Concurrent proxied HTTP requests across all tunnels.
+#   max_requests: 256
+#   # Concurrent WebSockets across all tunnels.
+#   max_websockets: 128
+#   # Concurrent proxied HTTP requests per tunnel.
+#   tunnel_requests: 128
+#   # Concurrent WebSockets per tunnel.
+#   tunnel_websockets: 128
+#   # Seconds to wait for an upstream's response head (resets on upload progress).
+#   response_timeout_secs: 30
