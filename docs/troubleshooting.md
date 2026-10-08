@@ -43,11 +43,13 @@ Caused by:
 
 | Output | Cause | Fix |
 | --- | --- | --- |
-| `Error: --upstream is required` | No `--upstream`. | Add `--upstream http://127.0.0.1:PORT`. |
+| ``upstream is not set: pass --upstream, set VORP_UPSTREAM, or add `upstream` to the config file`` | No upstream. | Add `--upstream http://127.0.0.1:PORT`. |
+| `/home/you/.config/vorp/config.yaml:2: unknown key ...`, `... is a secret ...`, or another message starting with the config file's name | The agent config file has a typo, a wrong type, or a `token:` key. | Fix that line. The token goes in its own file (`vorp login`), never in the config. `vorp config show` prints what is in effect. |
+| `config file ... does not exist` | `--config` or `VORP_CONFIG` names a missing file. | Fix the path. Only the default config file may be absent. |
 | `agent configuration is invalid` / `non-loopback upstream requires explicit opt-in` | The upstream host is not `localhost`, `127.0.0.0/8` or `::1`. | Use a loopback address, or add `--allow-remote-targets` if the service really is on another host (a container or Kubernetes Service name). |
 | `upstream URL is invalid: expected an origin with no userinfo, path, query or fragment` | The upstream has a path such as `/api`, a query, or `user@`. | Give only `http://host:port`. The request path is forwarded as is. |
 | `only http upstreams are supported` | `https://` upstream. | Point the agent at the service's plain HTTP port. |
-| `read agent token from /home/you/.config/vorp/authtoken` / `No such file or directory (os error 2)` | No saved token. | Run `vorp authtoken`, or pass `--token-file`. |
+| `read agent token from /home/you/.config/vorp/authtoken` / `No such file or directory (os error 2)` | No saved token. | Run `vorp login example.com` (or `vorp authtoken`), or pass `--token-file`. |
 | `agent token is empty` | The token file or `VORP_TOKEN` is empty. | Save the token again. |
 | `agent connection failed: no machine MAC address found` | No network interface with a MAC address, for example a container with `--network none`. | Run the agent with a normal network interface. |
 
@@ -113,11 +115,13 @@ Read `journalctl -u vorp -n 50 --no-pager`. The cause follows `Caused by:`.
 | --- | --- | --- |
 | `TLS setup failed: read certificate /etc/vorp/fullchain.pem: No such file or directory (os error 2)` | The Certbot deploy hook has not copied the certificate. | See [certificates.md](certificates.md#test-the-hook-by-hand). |
 | `TLS setup failed: read certificate ...: Permission denied (os error 13)` | The `vorp` user cannot read the files. | `sudo stat -c '%U %G %a %n' /etc/vorp/*.pem` must show `root vorp 640`; rerun the hook. |
-| `TLS setup failed: parse certificate: ...` or `parse private key: ...` | The file is not a PEM certificate chain or key. | Point `--tls-cert` at `fullchain.pem` and `--tls-key` at `privkey.pem`. |
+| `TLS setup failed: parse certificate: ...` or `parse private key: ...` | The file is not a PEM certificate chain or key. | Point `tls.cert` at `fullchain.pem` and `tls.key` at `privkey.pem`. |
 | `relay listener failed: bind 0.0.0.0:443: Address already in use (os error 98)` | Another process holds TCP 443. | `sudo ss -ltnp 'sport = :443'` shows it. Stop it; the relay must own 443. |
 | `relay listener failed: bind 0.0.0.0:443: Permission denied (os error 13)` | Started by hand as a normal user. Ports below 1024 need `CAP_NET_BIND_SERVICE`. | Use the systemd unit, which grants it, or test on a high port with `--listen`. |
 | `repository failed: database operation failed: unable to open database file: /var/lib/vorp/vorp.sqlite3` | The directory is missing or not writable by `vorp`. | `sudo install -d -o vorp -g vorp -m 0750 /var/lib/vorp`. |
-| `provide --tls-cert and --tls-key, or --dev-self-signed --dev-cert-out` | No certificate flags. | Add `--tls-cert` and `--tls-key`. |
+| `relay configuration is incomplete` / `tls: set both tls.cert and tls.key ...` | No certificate paths. | Set `tls.cert` and `tls.key` in `/etc/vorp/vorp.yaml` (or `--tls-cert` and `--tls-key`). |
+| `relay configuration is incomplete` / `base_domain is not set: ...` | No base domain. | Set `base_domain` in `/etc/vorp/vorp.yaml` (or `--base-domain`). |
+| `/etc/vorp/vorp.yaml:4: unknown key ...` or another message starting with the file name | A typo, a wrong type, or a secret key in the config file. | Fix that line, then `sudo -u vorp vorp config show --relay` to check before restarting. |
 | `relay configuration invalid: development token requires self-signed TLS and a loopback listener` | `VORP_DEV_TOKEN` is set in the environment. | Unset it. It is only for local development. |
 
 ## Relay log lines while running

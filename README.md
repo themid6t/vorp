@@ -91,6 +91,7 @@ sudo useradd --system --home-dir /var/lib/vorp --shell /usr/sbin/nologin vorp
 sudo install -d -o vorp -g vorp -m 0750 /var/lib/vorp
 sudo install -d -o root -g vorp -m 0750 /etc/vorp
 
+sudo apt-get update
 sudo apt-get install -y certbot python3-certbot-dns-cloudflare sqlite3
 sudo install -d -m 0755 /etc/letsencrypt
 sudo install -m 0600 /dev/null /etc/letsencrypt/cloudflare.ini
@@ -117,21 +118,30 @@ renewal.
 
 ### 5. Run it as a service
 
-Replace `YOUR-DOMAIN` with your base domain:
+The relay reads its settings from `/etc/vorp/vorp.yaml`. Replace `YOUR-DOMAIN`
+with your base domain:
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.yaml \
+  | sed 's/example\.com/YOUR-DOMAIN/g' \
+  | sudo tee /etc/vorp/vorp.yaml >/dev/null
 curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.service \
-  | sed 's/example\.com/YOUR-DOMAIN/' \
   | sudo tee /etc/systemd/system/vorp.service >/dev/null
+sudo -u vorp vorp config show --relay   # check the effective settings
 sudo systemctl daemon-reload
 sudo systemctl enable --now vorp
 curl -fsS https://YOUR-DOMAIN/healthz
 ```
 
 [`deploy/vorp.service`](deploy/vorp.service) runs
-`vorp serve --base-domain example.com` as the `vorp` user with a hardened
-sandbox. To put the dashboard on its own name, add
-`--dashboard-host dashboard.example.com` to its `ExecStart`.
+`vorp serve --config /etc/vorp/vorp.yaml` as the `vorp` user with a hardened
+sandbox. [`deploy/vorp.yaml`](deploy/vorp.yaml) describes every setting; to
+put the dashboard on its own name, set `dashboard_host: dashboard.example.com`
+there. After editing the file, run `sudo systemctl restart vorp`.
+
+A relay installed earlier with every setting in the unit's `ExecStart=` keeps
+working unchanged; moving to the config file is optional
+([setup.md](docs/setup.md#upgrading-a-relay-installed-with-the-flag-only-unit)).
 
 ### 6. Create the admin account, right away
 
@@ -143,8 +153,8 @@ before starting the service, as in
 [setup.md step 6](docs/setup.md#step-6-create-the-admin-account-before-going-public).
 
 Signup is closed by default: the admin creates accounts in the dashboard, and
-each new user picks their own password at first login. Start the relay with
-`--signup open` to let anyone register.
+each new user picks their own password at first login. Set `signup: open` in
+`/etc/vorp/vorp.yaml` to let anyone register.
 
 ## Connect an agent
 
@@ -162,13 +172,13 @@ shown only once. Pick a bind policy:
 To use a fixed name such as `myapp`, reserve it under **Subdomains** first. An admin
 approves reservations unless your account may reserve directly.
 
-### 2. Install and save the token
+### 2. Install and log in
 
 On the machine running the service (Linux or macOS):
 
 ```sh
 curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
-vorp authtoken          # paste the token, then press Ctrl-D
+vorp login example.com     # paste the token at the hidden prompt
 ```
 
 On macOS the installer needs GnuPG and jq to verify the download:
@@ -182,28 +192,29 @@ check the hash, and put `vorp.exe` somewhere on your `PATH`. In PowerShell:
 (Get-FileHash .\vorp_0.0.3_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
 Select-String windows_amd64 .\SHA256SUMS      # the two hashes must match
 Expand-Archive .\vorp_0.0.3_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
-Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" authtoken
+Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" login example.com
 ```
 
-The token is saved to `%APPDATA%\vorp\authtoken`.
-
-This saves it to `~/.config/vorp/authtoken`, readable only by you. Prefer this,
-or `--token-file`, over passing the token as an argument, where `ps` and shell
-history would see it.
+`vorp login` saves the token to `~/.config/vorp/authtoken` (on Windows
+`%APPDATA%\vorp\authtoken`), readable only by you, and writes
+`relay_host: example.com` to `config.yaml` beside it. The relay name is any
+name that resolves to the relay, such as the base domain or the dashboard
+host. The token is never an argument, where `ps` and shell history would see
+it, and never goes in the config file.
 
 ### 3. Open a tunnel
 
 ```sh
 # A random name, such as https://k3n4xq7p2wd9a5bm.example.com
-vorp --relay-host example.com --upstream http://127.0.0.1:3000
+vorp --upstream http://127.0.0.1:3000
 
 # A reserved name: https://myapp.example.com
-vorp --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp
+vorp --upstream http://127.0.0.1:3000 --subdomain myapp
 ```
 
-`--relay-host` is any name that resolves to the relay, such as the base domain
-or the dashboard host. The agent logs the public URL once the tunnel is up,
-and reconnects with backoff if the connection drops.
+The agent logs the public URL once the tunnel is up, and reconnects with
+backoff if the connection drops. `vorp config show` prints the settings in
+effect and where each came from.
 
 ### 4. Keep it running
 
@@ -216,7 +227,7 @@ Description=vorp tunnel for myapp
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/vorp --relay-host example.com --upstream http://127.0.0.1:3000 --subdomain myapp
+ExecStart=/usr/local/bin/vorp --upstream http://127.0.0.1:3000 --subdomain myapp
 Restart=always
 RestartSec=5
 
@@ -295,37 +306,62 @@ Dockerfile, a Deployment and pm2 instructions.
 
 ## Command reference
 
+Every setting below can be given three ways, with the same name: a flag
+(`--max-connections`), a `VORP_*` environment variable, and a key in the
+config file. A nested key's variable joins its path with `_`
+(`limits.max_connections` is `VORP_LIMITS_MAX_CONNECTIONS`). For each
+setting the flag wins, then the environment, then the file, then the default.
+Unknown keys and secrets in the file are errors that name the file and line.
+
 ### `vorp serve` (relay)
 
-| Flag | Default | |
-| --- | --- | --- |
-| `--base-domain` | required | Tunnels are served at `*.<base-domain>` |
-| `--dashboard-host` | the base domain | Host name that serves the dashboard and `/api` |
-| `--tls-cert`, `--tls-key` | required | PEM certificate chain and key, re-read every 30 s |
-| `--database-path` | `vorp.sqlite3` | SQLite file |
-| `--listen` | `0.0.0.0:443` | Listen address |
-| `--signup` | `closed` | `open` lets anyone create an account |
-| `--max-connections` | 1024 | Concurrent TLS connections |
-| `--max-connections-per-ip` | 64 | Concurrent TLS connections from one IP |
-| `--rate-limit-rps` | 200 | HTTP requests per second per IP (burst is twice this) |
-| `--max-requests` / `--tunnel-requests` | 256 / 128 | Concurrent proxied requests, overall / per tunnel |
-| `--max-websockets` / `--tunnel-websockets` | 128 / 128 | Concurrent WebSockets, overall / per tunnel |
-| `--response-timeout-secs` | 30 | Wait for an upstream's response headers |
+Config file: `/etc/vorp/vorp.yaml`, or `--config PATH` / `VORP_CONFIG`. See
+[deploy/vorp.yaml](deploy/vorp.yaml).
+
+| Flag | Config key | Default | |
+| --- | --- | --- | --- |
+| `--base-domain` | `base_domain` | required | Tunnels are served at `*.<base-domain>` |
+| `--dashboard-host` | `dashboard_host` | the base domain | Host name that serves the dashboard and `/api` |
+| `--tls-cert`, `--tls-key` | `tls.cert`, `tls.key` | required | PEM certificate chain and key, re-read every 30 s |
+| `--database-path` | `database_path` | `vorp.sqlite3` | SQLite file |
+| `--listen` | `listen` | `0.0.0.0:443` | Listen address |
+| `--signup` | `signup` | `closed` | `open` lets anyone create an account |
+| `--max-connections` | `limits.max_connections` | 1024 | Concurrent TLS connections |
+| `--max-connections-per-ip` | `limits.max_connections_per_ip` | 64 | Concurrent TLS connections from one IP |
+| `--rate-limit-rps` | `limits.rate_limit_rps` | 200 | HTTP requests per second per IP (burst is twice this) |
+| `--max-requests` / `--tunnel-requests` | `limits.max_requests` / `limits.tunnel_requests` | 256 / 128 | Concurrent proxied requests, overall / per tunnel |
+| `--max-websockets` / `--tunnel-websockets` | `limits.max_websockets` / `limits.tunnel_websockets` | 128 / 128 | Concurrent WebSockets, overall / per tunnel |
+| `--response-timeout-secs` | `limits.response_timeout_secs` | 30 | Wait for an upstream's response headers |
+
+The development flags `--dev-self-signed`, `--dev-cert-out` and `--dev-token`
+are flags only, so a config file can never turn them on.
 
 ### `vorp` (agent)
 
-| Flag | |
-| --- | --- |
-| `--relay-host` | Relay name to connect to; its certificate is checked |
-| `--upstream` | Local service URL, such as `http://127.0.0.1:3000` |
-| `--subdomain` | Reserved name to use; omit for a random name |
-| `--token-file` | Token file; defaults to `~/.config/vorp/authtoken`. `VORP_TOKEN` also works |
-| `--allow-remote-targets` | Allow an upstream that is not loopback |
-| `--relay-addr` | Dial this `IP:port` instead of resolving `--relay-host` |
-| `--ca-cert` | Extra CA to trust, for development certificates |
+Config file: `~/.config/vorp/config.yaml` (`%APPDATA%\vorp\config.yaml` on
+Windows), or `--config PATH` / `VORP_CONFIG`.
 
-Other commands: `vorp authtoken` saves a token from standard input, and
-`vorp admin reset-password` resets an account's password on the relay host.
+| Flag | Config key | |
+| --- | --- | --- |
+| `--relay-host` | `relay_host` | Relay name to connect to; its certificate is checked. Default `localhost` |
+| `--upstream` | `upstream` | Local service URL, such as `http://127.0.0.1:3000` |
+| `--subdomain` | `subdomains` | Reserved name to use, repeatable (`VORP_SUBDOMAINS` is comma-separated); omit for a random name |
+| `--token-file` | `token_file` | Token file; defaults to `authtoken` next to the config file. `--token` / `VORP_TOKEN` also work |
+| `--allow-remote-targets` | `allow_remote_targets` | Allow an upstream that is not loopback |
+| `--relay-addr` | `relay_addr` | Dial this `IP:port` instead of resolving the relay host |
+| `--ca-cert` | `ca_cert` | Extra CA to trust, for development certificates |
+
+Other commands:
+
+- `vorp login HOST` saves a token (hidden prompt, or standard input) and sets
+  `relay_host` in the agent config. It edits only that line, and refuses to
+  replace a different relay without `--force`.
+- `vorp authtoken` saves a token from standard input.
+- `vorp config path [--relay]` prints the config file in use.
+- `vorp config show [--relay]` prints the effective settings and whether each
+  came from a flag, the environment, the file or the default. It never prints
+  a secret.
+- `vorp admin reset-password` resets an account's password on the relay host.
 
 ## Develop
 

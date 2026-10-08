@@ -152,6 +152,7 @@ root vorp 750 /etc/vorp
 ## Step 3. Install Certbot and store the Cloudflare token
 
 ```sh
+sudo apt-get update
 sudo apt-get install -y certbot python3-certbot-dns-cloudflare sqlite3
 sudo install -d -m 0755 /etc/letsencrypt
 sudo install -m 0600 /dev/null /etc/letsencrypt/cloudflare.ini
@@ -225,20 +226,32 @@ missing but Certbot succeeded, the hook did not run: check
 `ls -l /usr/local/libexec/vorp-cert-deploy` and rerun the hook by hand as shown
 in [certificates.md](certificates.md#test-the-hook-by-hand).
 
-## Step 5. Install the systemd unit
+## Step 5. Write the config file and install the systemd unit
+
+The relay reads its settings from `/etc/vorp/vorp.yaml`. The file holds no
+secrets: the TLS key is only a path, and agent tokens never go in it.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.service \
-  | sed "s/example\.com/$DOMAIN/" \
-  | sudo tee /etc/systemd/system/vorp.service >/dev/null
+curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.yaml \
+  | sed "s/example\.com/$DOMAIN/g" \
+  | sudo tee /etc/vorp/vorp.yaml >/dev/null
+sudo chmod 0644 /etc/vorp/vorp.yaml
 ```
 
-If the dashboard is not on the base domain, add `--dashboard-host`:
+If the dashboard is not on the base domain, set `dashboard_host`:
 
 ```sh
 [ "$DASHBOARD" = "$DOMAIN" ] || sudo sed -i \
-  "s|--base-domain $DOMAIN |--base-domain $DOMAIN --dashboard-host $DASHBOARD |" \
-  /etc/systemd/system/vorp.service
+  "s|^# dashboard_host: .*|dashboard_host: $DASHBOARD|" /etc/vorp/vorp.yaml
+```
+
+Every key is described in the file's comments. Leave `signup` closed for now.
+
+Install the unit. Its `ExecStart=` only names the config file:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.service \
+  | sudo tee /etc/systemd/system/vorp.service >/dev/null
 ```
 
 The unit sets `NO_COLOR=1`, so journal lines are plain text and easy to
@@ -251,16 +264,31 @@ Check:
 ```sh
 sudo systemctl daemon-reload
 grep '^ExecStart=' /etc/systemd/system/vorp.service
+sudo -u vorp vorp config show --relay
 ```
 
-Expected (with your names):
+Expected: the unit line, then the effective settings, each followed by where
+it came from (`file` or `default`). With your names:
 
 ```
-ExecStart=/usr/local/bin/vorp serve --base-domain example.com --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem --database-path /var/lib/vorp/vorp.sqlite3
+ExecStart=/usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml
+config                         /etc/vorp/vorp.yaml  (default)
+base_domain                    example.com  (file)
+dashboard_host                 example.com  (default)
+listen                         0.0.0.0:443  (default)
+database_path                  /var/lib/vorp/vorp.sqlite3  (file)
+signup                         closed  (default)
+tls.cert                       /etc/vorp/fullchain.pem  (file)
+tls.key                        /etc/vorp/privkey.pem  (file)
+limits.max_connections         1024  (default)
+...
 ```
 
-With a separate dashboard host, `--dashboard-host dashboard.example.com`
-follows `--base-domain example.com`.
+With a separate dashboard host, `dashboard_host` shows
+`dashboard.example.com  (file)`. A typo in a key stops `vorp config show` and
+the relay with the file name and line, such as
+``/etc/vorp/vorp.yaml:4: unknown key `relay_hots` ``. Fix the line and rerun the
+check.
 
 ## Step 6. Create the admin account before going public
 
@@ -269,13 +297,12 @@ On a fresh database, the first account created becomes the admin, and
 public port first, a stranger who finds it can take the admin account. Close
 that race by creating the admin while the relay listens only on loopback.
 
-Start a temporary relay on `127.0.0.1:8443` with the same database:
+Start a temporary relay on `127.0.0.1:8443` with the same config. A flag
+overrides the file, so `--listen` moves it to loopback:
 
 ```sh
 sudo systemd-run --unit vorp-bootstrap -p User=vorp -p Group=vorp \
-  /usr/local/bin/vorp serve --base-domain "$DOMAIN" --dashboard-host "$DASHBOARD" \
-  --tls-cert /etc/vorp/fullchain.pem --tls-key /etc/vorp/privkey.pem \
-  --database-path /var/lib/vorp/vorp.sqlite3 --listen 127.0.0.1:8443
+  /usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml --listen 127.0.0.1:8443
 sleep 2
 curl -fsS --resolve "$DASHBOARD:8443:127.0.0.1" "https://$DASHBOARD:8443/api/config"; echo
 ```
@@ -429,8 +456,8 @@ When every check passed, tell the human:
 - The admin email and the generated password, once. Ask them to sign in and
   change it under **Account**.
 - Signup is closed. The admin creates accounts under **Admin**; each new user
-  must choose a new password at first login. `--signup open` in the unit's
-  `ExecStart` lets anyone register.
+  must choose a new password at first login. `signup: open` in
+  `/etc/vorp/vorp.yaml` lets anyone register.
 - Next: [agents.md](agents.md) to connect services.
 - A tunnel URL is not access control. Anyone with the URL can reach the
   service behind it.
@@ -449,3 +476,29 @@ Stop and ask the human in these cases. Do not work around them.
 | `needs_bootstrap` is `false` before step 6, or bootstrap returns `409` | Someone already created an account, possibly not the human. | Ask before deleting `/var/lib/vorp/vorp.sqlite3*` and starting over. Never delete the database without approval. |
 | Not Linux amd64/arm64, no systemd, or no `apt-get` | A relay runs on Linux amd64 or arm64; the steps assume systemd and apt. | Ask whether to adapt the Certbot install for this distribution or use another server. |
 | The server cannot reach Let's Encrypt or the Cloudflare API | Issuance and renewal need outbound HTTPS. | Ask for outbound access to be opened. |
+
+## Upgrading a relay installed with the flag-only unit
+
+Relays set up before the config file existed run `vorp serve` with every
+setting as a flag in `ExecStart=`. That unit keeps working unchanged with
+newer releases: with no `/etc/vorp/vorp.yaml`, the relay uses its flags and
+built-in defaults exactly as before. Moving to the config file is optional.
+
+To move, write each flag as the matching key (`--base-domain` is
+`base_domain`, `--tls-cert` is `tls.cert`, `--max-connections` is
+`limits.max_connections`; [deploy/vorp.yaml](../deploy/vorp.yaml) lists them
+all), then shorten the unit:
+
+```sh
+grep '^ExecStart=' /etc/systemd/system/vorp.service
+sudoedit /etc/vorp/vorp.yaml
+sudo -u vorp vorp config show --relay
+sudo sed -i 's|^ExecStart=.*|ExecStart=/usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml|' \
+  /etc/systemd/system/vorp.service
+sudo systemctl daemon-reload && sudo systemctl restart vorp
+systemctl is-active vorp
+```
+
+Expected: `vorp config show --relay` shows the same values the old flags set,
+each marked `(file)`, before the unit is changed; then `active`. A flag still
+wins over the file, so a flag left in `ExecStart=` overrides the file's value.
