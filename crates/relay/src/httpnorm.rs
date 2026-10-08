@@ -97,6 +97,17 @@ pub(crate) fn normalize_request_headers(
         headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
         headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
     }
+    // Upstreams trusting loopback (where the agent connects from) would honour
+    // a client's `Forwarded` / `X-Forwarded-*`; drop them all before asserting ours.
+    headers.remove(header::FORWARDED);
+    let spoofable: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-forwarded-"))
+        .cloned()
+        .collect();
+    for name in spoofable {
+        headers.remove(name);
+    }
     headers.insert(
         HeaderName::from_static("x-forwarded-for"),
         HeaderValue::from_str(&peer_ip.to_string())?,
@@ -181,6 +192,18 @@ mod tests {
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
         headers.insert("x-real-ip", HeaderValue::from_static("spoof"));
+        let spoofed = [
+            "forwarded",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-FORWARDED-server",
+        ];
+        for name in spoofed {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("for=10.0.0.1;host=evil.test"),
+            );
+        }
         assert!(
             !normalize_request_headers(&mut headers, "app.test", "203.0.113.7".parse().unwrap())
                 .unwrap()
@@ -188,6 +211,9 @@ mod tests {
         assert!(!headers.contains_key("x-secret"));
         assert!(!headers.contains_key(header::CONNECTION));
         assert!(!headers.contains_key("x-real-ip"));
+        for name in spoofed {
+            assert!(!headers.contains_key(name.to_ascii_lowercase()), "{name}");
+        }
         assert_eq!(headers["x-forwarded-for"], "203.0.113.7");
         assert_eq!(headers["x-forwarded-host"], "app.test");
         assert_eq!(headers["x-forwarded-proto"], "https");

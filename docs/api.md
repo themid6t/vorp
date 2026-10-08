@@ -2,8 +2,8 @@
 
 The embedded dashboard is same-origin with this API; there is no CORS. All
 bodies are JSON; send `Content-Type: application/json` with a body.
-Authentication is the `vorp_session` cookie
-(`HttpOnly; Secure; SameSite=Lax`), set by bootstrap, signup and login. A
+Authentication is the `__Host-vorp_session` cookie
+(`HttpOnly; Secure; SameSite=Lax; Path=/`, no `Domain`), set by bootstrap, signup and login. A
 session lasts 24 hours. `GET /healthz` (outside `/api`) is public and returns
 an empty `200`.
 
