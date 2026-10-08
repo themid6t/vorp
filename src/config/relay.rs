@@ -1,10 +1,14 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 use vorp_relay::{EdgeLimits, RelayConfig, SignupMode, TlsConfig};
 
-use super::{ConfigError, Merge, Show, required};
+use super::{ConfigError, Merge, Show, required, resolve};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -124,9 +128,18 @@ pub(crate) struct DevArgs {
 }
 
 impl RelayLayer {
+    /// This layer, read from a config file in `dir`, with its relative paths
+    /// made relative to `dir`.
+    pub(crate) fn relative_to(mut self, dir: &Path) -> Self {
+        resolve(dir, &mut self.database_path);
+        resolve(dir, &mut self.tls.cert);
+        resolve(dir, &mut self.tls.key);
+        self
+    }
+
     pub(crate) fn merge(self, file: Self, merge: &mut Merge) -> Self {
         let (limits, file_limits) = (self.limits, file.limits);
-        Self {
+        let merged = Self {
             listen: merge.pick("listen", self.listen, file.listen),
             base_domain: merge.pick("base_domain", self.base_domain, file.base_domain),
             dashboard_host: merge.pick("dashboard_host", self.dashboard_host, file.dashboard_host),
@@ -178,7 +191,9 @@ impl RelayLayer {
                     file_limits.response_timeout_secs,
                 ),
             },
-        }
+        };
+        merge.fallback("dashboard_host", "base_domain", merged.base_domain.clone());
+        merged
     }
 
     pub(crate) fn into_relay_config(self, dev: DevArgs) -> Result<RelayConfig, ConfigError> {

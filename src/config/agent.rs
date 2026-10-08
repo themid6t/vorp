@@ -1,10 +1,13 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use clap::Args;
 use serde::Deserialize;
 use vorp_agent::AgentConfig;
 
-use super::{ConfigError, Merge, required};
+use super::{ConfigError, Merge, required, resolve};
 
 /// The agent's settings: the flags (with their `VORP_*` variables) and the
 /// config file share this one definition. The token is deliberately absent.
@@ -47,8 +50,16 @@ pub(crate) struct AgentLayer {
 }
 
 impl AgentLayer {
+    /// This layer, read from a config file in `dir`, with its relative paths
+    /// made relative to `dir`.
+    pub(crate) fn relative_to(mut self, dir: &Path) -> Self {
+        resolve(dir, &mut self.ca_cert);
+        resolve(dir, &mut self.token_file);
+        self
+    }
+
     pub(crate) fn merge(self, file: Self, merge: &mut Merge) -> Self {
-        Self {
+        let merged = Self {
             relay_host: merge.pick("relay_host", self.relay_host, file.relay_host),
             relay_addr: merge.pick("relay_addr", self.relay_addr, file.relay_addr),
             ca_cert: merge.pick("ca_cert", self.ca_cert, file.ca_cert),
@@ -60,7 +71,11 @@ impl AgentLayer {
                 self.allow_remote_targets,
                 file.allow_remote_targets,
             ),
-        }
+        };
+        // The agent dials the relay host on port 443; see `vorp_agent`'s dial.
+        let dialed = merged.relay_host.as_ref().map(|host| format!("{host}:443"));
+        merge.fallback("relay_addr", "relay_host", dialed);
+        merged
     }
 
     pub(crate) fn into_agent_config(self, token: String) -> Result<AgentConfig, ConfigError> {

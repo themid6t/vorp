@@ -114,7 +114,9 @@ pub(crate) fn login(
     };
     let updated = set_relay_host(path, &text, host, force)?;
     let token_file = token_file
-        .or(config::parse::<AgentLayer>(path, &text, true)?.token_file)
+        .or(config::parse::<AgentLayer>(path, &text, true)?
+            .relative_to(config::file_dir(path))
+            .token_file)
         .unwrap_or_else(|| path.with_file_name("authtoken"));
 
     let token = read_token()?;
@@ -241,12 +243,10 @@ mod tests {
     fn existing_config_keeps_comments_and_token_file() {
         let dir = TempDir::new("login-existing");
         let config = dir.0.join("config.yaml");
+        // Relative, so it is relative to the config file's directory.
         let token_file = dir.0.join("secrets").join("vorp-token");
-        let original = format!(
-            "# my agent\nupstream: http://127.0.0.1:3000  # app\ntoken_file: {}\n\n# subdomains: [x]\n",
-            token_file.display()
-        );
-        std::fs::write(&config, &original).expect("write config");
+        let original = "# my agent\nupstream: http://127.0.0.1:3000  # app\ntoken_file: secrets/vorp-token\n\n# subdomains: [x]\n";
+        std::fs::write(&config, original).expect("write config");
         login(&config, None, "tunnels.example.com", false, || {
             Ok("t".to_owned())
         })

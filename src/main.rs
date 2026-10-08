@@ -3,10 +3,10 @@ mod config;
 mod login;
 mod token;
 
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, parser::ValueSource};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, parser::ValueSource};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let matches = Cli::command().get_matches();
+    let matches = command_line(std::env::args_os().collect()).unwrap_or_else(|error| error.exit());
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     // The matches of the subcommand, for the sources of its flags.
     let sub = matches.subcommand().map_or(&matches, |(_, sub)| sub);
@@ -40,6 +40,47 @@ async fn main() -> Result<()> {
         }
         Some(Command::Admin(AdminCommand::ResetPassword(args))) => reset_password(args).await,
         None => run_agent(cli, &matches).await,
+    }
+}
+
+/// Parses the command line. clap reads a root flag's `VORP_*` variable
+/// whatever the subcommand, so a malformed agent variable would fail
+/// `vorp serve`. The first pass ignores the agent's variables; only the agent
+/// run and the agent's `vorp config show` parse again with them. `token_file`
+/// keeps its variable for `vorp login`; any value is a valid path.
+fn command_line(argv: Vec<OsString>) -> Result<ArgMatches, clap::Error> {
+    let agent: Vec<clap::Id> = AgentLayer::augment_args(clap::Command::new("agent"))
+        .get_arguments()
+        .map(|arg| arg.get_id().clone())
+        .filter(|id| id != "token_file")
+        .collect();
+    let matches = Cli::command()
+        .mut_args(|arg| {
+            if agent.contains(arg.get_id()) {
+                arg.env(None)
+            } else {
+                arg
+            }
+        })
+        .try_get_matches_from(&argv)?;
+    let agent_mode = match matches.subcommand() {
+        None => true,
+        Some(("config", config)) => {
+            matches!(config.subcommand(), Some(("show", show)) if !show.get_flag("relay"))
+        }
+        Some(_) => false,
+    };
+    if agent_mode {
+        Cli::command().try_get_matches_from(argv)
+    } else {
+        Ok(matches)
+    }
+}
+
+/// The startup line naming the config file read, if any. Never its values.
+fn log_loaded(loaded: Option<PathBuf>) {
+    if let Some(path) = loaded {
+        tracing::info!(path = %path.display(), "config file loaded");
     }
 }
 
@@ -82,26 +123,35 @@ fn agent_config_path(config: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// The agent's settings merged from flags, environment, file and defaults,
-/// with a `vorp config show` row for each, the config file's first. The
-/// default token file is `authtoken` next to the config file.
+/// with a `vorp config show` row for each, the config file's first, and the
+/// path of the file if one was read. The default token file is `authtoken`
+/// next to the config file.
 fn agent_settings(
     config: Option<PathBuf>,
-    mut clap: AgentLayer,
+    clap: AgentLayer,
     matches: &ArgMatches,
-) -> Result<(AgentLayer, Vec<Row>)> {
+) -> Result<(AgentLayer, Vec<Row>, Option<PathBuf>)> {
     let named = config.is_some();
     let path = agent_config_path(config);
     let file = match &path {
-        Some(path) => config::read(path, named, true)?,
-        None => AgentLayer::default(),
+        Some(path) => config::read::<AgentLayer>(path, named, true)?
+            .map(|file| file.relative_to(config::file_dir(path))),
+        None => None,
     };
-    if clap.token_file.is_none() {
-        clap.token_file = path.as_ref().map(|path| path.with_file_name("authtoken"));
-    }
+    let loaded = path.clone().filter(|_| file.is_some());
     let explicit = explicit(matches);
     let mut merge = Merge::new(&explicit);
     merge.rows.push(config_row(path.as_ref(), named, matches));
-    Ok((clap.merge(file, &mut merge), merge.rows))
+    let mut settings = clap.merge(file.unwrap_or_default(), &mut merge);
+    if settings.token_file.is_none() {
+        settings.token_file = path.map(|path| path.with_file_name("authtoken"));
+        let shown = settings
+            .token_file
+            .as_ref()
+            .map(|p| p.display().to_string());
+        merge.fallback("token_file", "config", shown);
+    }
+    Ok((settings, merge.rows, loaded))
 }
 
 /// Like [`agent_settings`], for `vorp serve`.
@@ -109,14 +159,17 @@ fn relay_settings(
     config: Option<PathBuf>,
     clap: RelayLayer,
     matches: &ArgMatches,
-) -> Result<(RelayLayer, Vec<Row>)> {
+) -> Result<(RelayLayer, Vec<Row>, Option<PathBuf>)> {
     let named = config.is_some();
     let path = config.unwrap_or_else(|| PathBuf::from(config::RELAY_CONFIG));
-    let file = config::read(&path, named, false)?;
+    let file = config::read::<RelayLayer>(&path, named, false)?
+        .map(|file| file.relative_to(config::file_dir(&path)));
+    let loaded = file.is_some().then(|| path.clone());
     let explicit = explicit(matches);
     let mut merge = Merge::new(&explicit);
     merge.rows.push(config_row(Some(&path), named, matches));
-    Ok((clap.merge(file, &mut merge), merge.rows))
+    let settings = clap.merge(file.unwrap_or_default(), &mut merge);
+    Ok((settings, merge.rows, loaded))
 }
 
 /// Prints each effective setting and its source. Secrets are never printed.
@@ -140,7 +193,7 @@ fn show_config(
 
 /// The agent rows plus where the token comes from, never its value.
 fn agent_rows(config: Option<PathBuf>, clap: AgentLayer, matches: &ArgMatches) -> Result<Vec<Row>> {
-    let (_, mut rows) = agent_settings(config, clap, matches)?;
+    let (_, mut rows, _) = agent_settings(config, clap, matches)?;
     let token_row = match explicit(matches)("token") {
         Some(Source::Flag) => Some(("set by --token".to_owned(), Source::Flag)),
         Some(source) => Some(("set by VORP_TOKEN".to_owned(), source)),
@@ -180,7 +233,8 @@ fn print_config_path(relay: bool, config: Option<PathBuf>) -> Result<()> {
 }
 
 async fn serve(args: ServeArgs, config: Option<PathBuf>, matches: &ArgMatches) -> Result<()> {
-    let (settings, _) = relay_settings(config, args.settings, matches)?;
+    let (settings, _, loaded) = relay_settings(config, args.settings, matches)?;
+    log_loaded(loaded);
     let config = settings
         .into_relay_config(args.dev)
         .context("relay configuration is incomplete")?;
@@ -190,7 +244,8 @@ async fn serve(args: ServeArgs, config: Option<PathBuf>, matches: &ArgMatches) -
 }
 
 async fn run_agent(cli: Cli, matches: &ArgMatches) -> Result<()> {
-    let (settings, _) = agent_settings(cli.config, cli.agent, matches)?;
+    let (settings, _, loaded) = agent_settings(cli.config, cli.agent, matches)?;
+    log_loaded(loaded);
     let token = match cli.token {
         Some(token) => token,
         None => {
@@ -309,7 +364,8 @@ mod tests {
             panic!("expected serve");
         };
         let serve = matches.subcommand_matches("serve").expect("serve matches");
-        let (settings, rows) = relay_settings(cli.config, args.settings, serve).expect("settings");
+        let (settings, rows, _) =
+            relay_settings(cli.config, args.settings, serve).expect("settings");
         let config = settings
             .into_relay_config(args.dev)
             .expect("complete config");
@@ -406,7 +462,7 @@ mod tests {
         let empty = write(&dir.0, "empty.yaml", "");
         let agent = |argv: &[&str]| {
             let (cli, matches) = parse(argv);
-            let (settings, _) =
+            let (settings, _, _) =
                 agent_settings(Some(empty.clone().into()), cli.agent, &matches).expect("settings");
             settings
                 .into_agent_config("token".into())
@@ -453,6 +509,45 @@ mod tests {
             Some(&("example.com".to_owned(), Source::File))
         );
         assert!(!format!("{rows:?}").contains("vorp_1_secret"));
+        assert_eq!(
+            source(&rows, "relay_addr"),
+            Some(&("example.com:443".to_owned(), Source::Fallback("relay_host")))
+        );
+        let authtoken = dir.0.join("authtoken").display().to_string();
+        assert_eq!(
+            source(&rows, "token_file"),
+            Some(&(authtoken, Source::Fallback("config")))
+        );
+    }
+
+    /// The file's relative paths are relative to its directory, a flag's to
+    /// the working directory; and the file read is reported for the log line.
+    #[test]
+    fn relay_file_paths_and_loaded() {
+        let dir = TempDir::new("main-relay-paths");
+        let file = write(
+            &dir.0,
+            "vorp.yaml",
+            "base_domain: example.com
+database_path: db.sqlite3
+tls: {key: k.pem}
+",
+        );
+        let (cli, matches) = parse(&["vorp", "serve", "--config", &file, "--tls-cert", "c.pem"]);
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve");
+        };
+        let serve = matches.subcommand_matches("serve").expect("serve matches");
+        let (settings, rows, loaded) =
+            relay_settings(cli.config, args.settings, serve).expect("settings");
+        assert_eq!(settings.database_path, Some(dir.0.join("db.sqlite3")));
+        assert_eq!(settings.tls.key, Some(dir.0.join("k.pem")));
+        assert_eq!(settings.tls.cert, Some(PathBuf::from("c.pem")));
+        assert_eq!(loaded, Some(PathBuf::from(&file)));
+        assert_eq!(
+            source(&rows, "dashboard_host"),
+            Some(&("example.com".to_owned(), Source::Fallback("base_domain")))
+        );
     }
 
     #[test]

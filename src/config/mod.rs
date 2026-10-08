@@ -97,16 +97,16 @@ pub(crate) fn agent_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBu
         .map(|dir| dir.join("vorp"))
 }
 
-/// Reads and parses a config file. A missing file is an empty layer unless
-/// the user named it with `--config` or `VORP_CONFIG`.
-pub(crate) fn read<T: DeserializeOwned + Default>(
+/// Reads and parses a config file. A missing file is `None` unless the user
+/// named it with `--config` or `VORP_CONFIG`.
+pub(crate) fn read<T: DeserializeOwned>(
     path: &Path,
     named: bool,
     reserve_tunnels: bool,
-) -> Result<T, ConfigError> {
+) -> Result<Option<T>, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse(path, &text, reserve_tunnels),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !named => Ok(T::default()),
+        Ok(text) => parse(path, &text, reserve_tunnels).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !named => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ConfigError::NotFound {
             path: path.to_owned(),
         }),
@@ -114,6 +114,20 @@ pub(crate) fn read<T: DeserializeOwned + Default>(
             path: path.to_owned(),
             source,
         }),
+    }
+}
+
+/// The directory a config file's relative paths are relative to.
+pub(crate) fn file_dir(path: &Path) -> &Path {
+    path.parent().unwrap_or(Path::new(""))
+}
+
+/// Makes a relative path from the config file relative to the file's
+/// directory `dir`. Flag and environment paths stay relative to the working
+/// directory; they never pass through here.
+fn resolve(dir: &Path, path: &mut Option<PathBuf>) {
+    if let Some(path) = path.as_mut().filter(|path| path.is_relative()) {
+        *path = dir.join(&*path);
     }
 }
 
@@ -189,16 +203,19 @@ pub(crate) enum Source {
     Env,
     File,
     Default,
+    /// Unset, so it falls back on the setting named here.
+    Fallback(&'static str),
 }
 
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Flag => "flag",
-            Self::Env => "env",
-            Self::File => "file",
-            Self::Default => "default",
-        })
+        match self {
+            Self::Flag => f.write_str("flag"),
+            Self::Env => f.write_str("env"),
+            Self::File => f.write_str("file"),
+            Self::Default => f.write_str("default"),
+            Self::Fallback(key) => write!(f, "default: {key}"),
+        }
     }
 }
 
@@ -265,6 +282,14 @@ impl<'a> Merge<'a> {
         self.rows
             .push((key, value.as_ref().map(|value| (value.show(), source))));
         value
+    }
+
+    /// Shows `value` for the unset setting `key`, which falls back on the
+    /// setting `from`.
+    pub(crate) fn fallback(&mut self, key: &str, from: &'static str, value: Option<String>) {
+        if let Some(row) = self.rows.iter_mut().find(|(k, v)| *k == key && v.is_none()) {
+            row.1 = value.map(|value| (value, Source::Fallback(from)));
+        }
     }
 }
 
@@ -410,7 +435,7 @@ mod tests {
         let missing = dir.0.join("absent.yaml");
         assert!(matches!(
             read::<AgentLayer>(&missing, false, true),
-            Ok(layer) if layer == AgentLayer::default()
+            Ok(None)
         ));
         assert!(matches!(
             read::<AgentLayer>(&missing, true, true),
@@ -436,6 +461,80 @@ mod tests {
             });
             assert_eq!(got, expected.map(PathBuf::from), "{vars:?}");
         }
+    }
+
+    /// A relative path from the config file is relative to the file's
+    /// directory; one from a flag or the environment stays relative to the
+    /// working directory. Checked for every path key of both modes.
+    #[test]
+    fn relative_paths() {
+        let dir = std::env::temp_dir().join("etc-vorp");
+        let elsewhere = std::env::temp_dir().join("elsewhere");
+        // (clap's source, clap's value, the file's value) -> effective path
+        let cases = [
+            (None, None, PathBuf::from("p"), dir.join("p")),
+            (None, None, PathBuf::from("sub/p"), dir.join("sub/p")),
+            (None, None, elsewhere.clone(), elsewhere),
+            (
+                Some(Source::Flag),
+                Some(PathBuf::from("p")),
+                "f".into(),
+                "p".into(),
+            ),
+            (
+                Some(Source::Env),
+                Some(PathBuf::from("p")),
+                "f".into(),
+                "p".into(),
+            ),
+        ];
+        for (clap_source, clap, file, expected) in cases {
+            let explicit = move |_: &str| clap_source;
+            let mut merge = Merge::new(&explicit);
+            let agent = |path: Option<PathBuf>| AgentLayer {
+                ca_cert: path.clone(),
+                token_file: path,
+                ..AgentLayer::default()
+            };
+            let relay = |path: Option<PathBuf>| {
+                let mut layer = RelayLayer {
+                    database_path: path.clone(),
+                    ..RelayLayer::default()
+                };
+                layer.tls.cert = path.clone();
+                layer.tls.key = path;
+                layer
+            };
+            let a =
+                agent(clap.clone()).merge(agent(Some(file.clone())).relative_to(&dir), &mut merge);
+            let r = relay(clap).merge(relay(Some(file)).relative_to(&dir), &mut merge);
+            for got in [
+                a.ca_cert,
+                a.token_file,
+                r.database_path,
+                r.tls.cert,
+                r.tls.key,
+            ] {
+                assert_eq!(got.as_ref(), Some(&expected), "{clap_source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_names_the_setting() {
+        let explicit = |_: &str| None;
+        let mut merge = Merge::new(&explicit);
+        let layer = RelayLayer {
+            base_domain: Some("example.com".into()),
+            ..RelayLayer::default()
+        };
+        RelayLayer::default().merge(layer, &mut merge);
+        let row = merge.rows.iter().find(|(key, _)| *key == "dashboard_host");
+        assert_eq!(
+            row.and_then(|(_, value)| value.as_ref())
+                .map(|(value, source)| format!("{value}  ({source})")),
+            Some("example.com  (default: base_domain)".to_owned())
+        );
     }
 
     /// Flag > env > file > default for a scalar (`relay_host`), a list
