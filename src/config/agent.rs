@@ -117,7 +117,11 @@ impl AgentSettings {
     }
 
     pub(crate) fn rows(&self) -> Vec<Row> {
-        let subdomains = Setting::new(self.subdomains.value.join(","), self.subdomains.source);
+        let subdomains = match self.subdomains.value.as_slice() {
+            [] => "none (one random name)".to_owned(),
+            names => names.join(","),
+        };
+        let subdomains = Setting::new(subdomains, self.subdomains.source);
         let token_file = self
             .token_file
             .as_ref()
