@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["io-util"] }
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 rpassword = "7"
 serde.workspace = true
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
@@ -45,5 +45,3 @@ vorp-relay = { path = "crates/relay" }
 vorp-store = { path = "crates/store" }
 vorp-web = { path = "crates/web" }
 
-[dev-dependencies]
-tempfile = "3"

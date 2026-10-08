@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::config::vorp_config_dir;
+use crate::config::agent_dir;
 
 const MAX_TOKEN_BYTES: usize = 4096;
 
@@ -29,7 +29,7 @@ pub(crate) fn validate(token: &str) -> Result<&str, TokenError> {
 
 /// `authtoken` in the agent's config directory.
 pub(crate) fn default_path() -> Result<PathBuf> {
-    vorp_config_dir()
+    agent_dir(|name| std::env::var_os(name))
         .map(|dir| dir.join("authtoken"))
         .context("no config directory; pass --token-file or set VORP_TOKEN")
 }
