@@ -19,10 +19,10 @@ export const bytesToMib = (bytes: number) => +(bytes / MIB).toFixed(3);
 
 export const tunnelUrl = (name: string, baseDomain: string) => `https://${name}.${baseDomain}`;
 
-// The agent dials port 443 of --relay-host, which must match the relay certificate.
+// The agent dials port 443 of vorp.<base domain>, the relay's own name.
 // A relay on another port also needs --relay-addr, which takes an IP address.
 export function agentCommand(baseDomain: string, rawToken?: string, names: string[] = []): string {
-  const parts = [`VORP_TOKEN=${rawToken || '<your-token>'}`, 'vorp', '--relay-host', baseDomain];
+  const parts = [`VORP_TOKEN=${rawToken || '<your-token>'}`, 'vorp', '--relay-host', `vorp.${baseDomain}`];
   const port = location.port;
   if (port && port !== '443') parts.push('--relay-addr', `${relayIp()}:${port}`);
   for (const name of names) parts.push('--subdomain', name);
@@ -32,7 +32,7 @@ export function agentCommand(baseDomain: string, rawToken?: string, names: strin
 
 function relayIp(): string {
   const host = location.hostname;
-  if (host === 'localhost') return '127.0.0.1';
+  if (host === 'localhost' || host.endsWith('.localhost')) return '127.0.0.1';
   if (/^[\d.]+$/.test(host) || host.startsWith('[')) return host;
   return '<relay-ip>';
 }

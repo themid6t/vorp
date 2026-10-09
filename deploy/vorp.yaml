@@ -18,13 +18,9 @@
 # path. The development flags (--dev-self-signed, --dev-cert-out, --dev-token)
 # cannot be set here.
 
-# Tunnels are served at <name>.<base_domain>. Required.
+# Tunnels are served at <name>.<base_domain>; the dashboard, API and agent
+# connections at vorp.<base_domain>. Required.
 base_domain: example.com
-
-# Where the dashboard and API are served. Default: base_domain. Use a name
-# under the wildcard, such as dashboard.example.com, when the bare base domain
-# is in use by something else.
-# dashboard_host: dashboard.example.com
 
 # Address and port of the single TLS listener. Default: 0.0.0.0:443.
 # listen: 0.0.0.0:443

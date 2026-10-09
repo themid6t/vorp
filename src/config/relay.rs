@@ -41,13 +41,10 @@ pub(crate) struct RelayLayer {
     #[arg(long, env = "VORP_LISTEN", default_value = "0.0.0.0:443")]
     pub(crate) listen: Option<SocketAddr>,
 
-    /// Tunnels are served at `*.<base-domain>`. Required.
+    /// Tunnels are served at `*.<base-domain>`, the dashboard and agent
+    /// endpoint at `vorp.<base-domain>`. Required.
     #[arg(long, env = "VORP_BASE_DOMAIN")]
     pub(crate) base_domain: Option<String>,
-
-    /// [default: the base domain]
-    #[arg(long, env = "VORP_DASHBOARD_HOST")]
-    pub(crate) dashboard_host: Option<String>,
 
     #[arg(long, env = "VORP_DATABASE_PATH", default_value = "vorp.sqlite3")]
     pub(crate) database_path: Option<PathBuf>,
@@ -139,10 +136,9 @@ impl RelayLayer {
 
     pub(crate) fn merge(self, file: Self, merge: &mut Merge) -> Self {
         let (limits, file_limits) = (self.limits, file.limits);
-        let merged = Self {
+        Self {
             listen: merge.pick("listen", self.listen, file.listen),
             base_domain: merge.pick("base_domain", self.base_domain, file.base_domain),
-            dashboard_host: merge.pick("dashboard_host", self.dashboard_host, file.dashboard_host),
             database_path: merge.pick("database_path", self.database_path, file.database_path),
             signup: merge.pick("signup", self.signup, file.signup),
             tls: TlsLayer {
@@ -191,9 +187,7 @@ impl RelayLayer {
                     file_limits.response_timeout_secs,
                 ),
             },
-        };
-        merge.fallback("dashboard_host", "base_domain", merged.base_domain.clone());
-        merged
+        }
     }
 
     pub(crate) fn into_relay_config(self, dev: DevArgs) -> Result<RelayConfig, ConfigError> {
@@ -219,7 +213,7 @@ impl RelayLayer {
         let (limits, d) = (self.limits, EdgeLimits::default());
         Ok(RelayConfig {
             listen: required(self.listen, "listen")?,
-            dashboard_host: self.dashboard_host.unwrap_or_else(|| base_domain.clone()),
+            dashboard_host: format!("vorp.{base_domain}"),
             base_domain,
             database_path: required(self.database_path, "database_path")?,
             tls,

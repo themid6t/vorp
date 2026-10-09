@@ -5,7 +5,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 //   cargo run -- serve --listen 127.0.0.1:8443 --base-domain localhost --dev-self-signed
 // The relay serves the dashboard only for its dashboard host, hence the Host rewrite.
 const relay = process.env.VORP_RELAY ?? 'https://127.0.0.1:8443';
-const proxy = { target: relay, secure: false, headers: { host: 'localhost' } };
+const proxy = { target: relay, secure: false, headers: { host: 'vorp.localhost' } };
 
 export default defineConfig({
   plugins: [svelte()],

@@ -7,6 +7,7 @@ const SYSTEM_RESERVED: &[&str] = &[
     "admin",
     "dash",
     "dashboard",
+    "vorp",
     "vorpd",
 ];
 
@@ -42,6 +43,7 @@ mod tests {
             ("a_b", false),
             ("a.b", false),
             ("dashboard", false),
+            ("vorp", false),
         ] {
             assert_eq!(valid_subdomain(name), expected, "{name}");
         }

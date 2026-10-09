@@ -406,7 +406,7 @@ mod tests {
         ]);
         assert_eq!(config.listen, "0.0.0.0:443".parse().expect("valid address"));
         assert_eq!(config.base_domain, "example.com");
-        assert_eq!(config.dashboard_host, "example.com");
+        assert_eq!(config.dashboard_host, "vorp.example.com");
         assert_eq!(
             config.database_path,
             PathBuf::from("/var/lib/vorp/vorp.sqlite3")
@@ -432,12 +432,11 @@ mod tests {
         let file = write(
             &dir.0,
             "vorp.yaml",
-            "base_domain: example.com\ndashboard_host: dash.example.com\n\
+            "base_domain: example.com\n\
              listen: 127.0.0.1:1\ndatabase_path: /db\nsignup: open\n\
              tls: {cert: /c.pem, key: /k.pem}\nlimits: {max_connections: 5, max_requests: 6}\n",
         );
         let (config, rows) = relay(&["vorp", "serve", "--config", &file, "--max-requests", "7"]);
-        assert_eq!(config.dashboard_host, "dash.example.com");
         assert_eq!(config.signup_mode, SignupMode::Open);
         assert_eq!(config.limits.max_connections, 5);
         assert_eq!(config.limits.max_requests, 7);
@@ -538,16 +537,12 @@ tls: {key: k.pem}
             panic!("expected serve");
         };
         let serve = matches.subcommand_matches("serve").expect("serve matches");
-        let (settings, rows, loaded) =
+        let (settings, _, loaded) =
             relay_settings(cli.config, args.settings, serve).expect("settings");
         assert_eq!(settings.database_path, Some(dir.0.join("db.sqlite3")));
         assert_eq!(settings.tls.key, Some(dir.0.join("k.pem")));
         assert_eq!(settings.tls.cert, Some(PathBuf::from("c.pem")));
         assert_eq!(loaded, Some(PathBuf::from(&file)));
-        assert_eq!(
-            source(&rows, "dashboard_host"),
-            Some(&("example.com".to_owned(), Source::Fallback("base_domain")))
-        );
     }
 
     #[test]

@@ -63,7 +63,7 @@ an admin.
 
 Names must have 3–63 lowercase ASCII letters, digits or hyphens with an
 alphanumeric first and last character, and must not be a system name (`www`,
-`api`, `mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorpd`);
+`api`, `mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorp`, `vorpd`);
 otherwise `POST /api/reservations` returns `400 {"error":"subdomain name"}`.
 A token `allowlist` is allowed only with `bind_policy: "reserved"`, and every
 name in it must be a reservation the caller owns (`400` otherwise). The raw
