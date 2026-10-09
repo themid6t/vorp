@@ -49,7 +49,7 @@ Caused by:
 | `agent configuration is invalid` / `non-loopback upstream requires explicit opt-in` | The upstream host is not `localhost`, `127.0.0.0/8` or `::1`. | Use a loopback address, or add `--allow-remote-targets` if the service really is on another host (a container or Kubernetes Service name). |
 | `upstream URL is invalid: expected an origin with no userinfo, path, query or fragment` | The upstream has a path such as `/api`, a query, or `user@`. | Give only `http://host:port`. The request path is forwarded as is. |
 | `only http upstreams are supported` | `https://` upstream. | Point the agent at the service's plain HTTP port. |
-| `read agent token from /home/you/.config/vorp/authtoken` / `No such file or directory (os error 2)` | No saved token. | Run `vorp login example.com` (or `vorp authtoken`), or pass `--token-file`. |
+| `read agent token from /home/you/.config/vorp/authtoken` / `No such file or directory (os error 2)` | No saved token. | Run `vorp login vorp.example.com` (or `vorp authtoken`), or pass `--token-file`. |
 | `agent token is empty` | The token file or `VORP_TOKEN` is empty. | Save the token again. |
 | `agent connection failed: no machine MAC address found` | No network interface with a MAC address, for example a container with `--network none`. | Run the agent with a normal network interface. |
 
@@ -61,7 +61,7 @@ Caused by:
 | `relay protocol version is unsupported` | `UNSUPPORTED_VERSION`: agent and relay releases differ. | Install the same release on both. |
 | `relay rejected tunnel; reserve the name in the dashboard or omit --subdomain subdomain="myapp" code=SubdomainNotAllowed` | `SUBDOMAIN_NOT_ALLOWED`: the token's policy does not allow this name. Causes: a `temporary` token with `--subdomain`; a `reserved` token without `--subdomain` or with a name not in its allowlist; an `any` token with a name you have not reserved; a reservation still pending approval. | Check the policy table in [agents.md](agents.md#1-choose-a-bind-policy). Reserve the name (and get it approved), add it to a `reserved` token's allowlist by creating a new token, or drop `--subdomain`. |
 | same line with `code=SubdomainTaken` | `SUBDOMAIN_TAKEN`: another user owns the reservation, or another live tunnel already uses the name (often a second copy of the same agent, or an old Pod still running). | Stop the other agent, or use another name. In Kubernetes use one replica and `strategy: Recreate`. |
-| same line with `code=SubdomainInvalid` | `SUBDOMAIN_INVALID`: the name breaks the rules (3–63 of `a-z`, `0-9`, `-`, alphanumeric at both ends) or is a system name (`www`, `api`, `mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorpd`). | Use a valid name. |
+| same line with `code=SubdomainInvalid` | `SUBDOMAIN_INVALID`: the name breaks the rules (3–63 of `a-z`, `0-9`, `-`, alphanumeric at both ends) or is a system name (`www`, `api`, `mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorp`, `vorpd`). | Use a valid name. |
 | `relay rejected tunnel: your account's tunnel limit is reached; close another tunnel or ask an admin to raise it` | `TUNNEL_LIMIT`: the account already has its quota of live tunnels (3 by default), across all its agents. | Close a tunnel in the dashboard (**Tunnels**) or stop another agent, or ask an admin to raise **Max tunnels**. |
 | `relay closed tunnel permanently subdomain=myapp reason=Forced` | Someone closed the tunnel in the dashboard (or `POST /api/tunnels/myapp/close`). | Intended. A supervisor may restart the agent and reopen it; stop the service to keep it closed. |
 | `relay rejected or permanently closed every tunnel` | Printed last, after one of the lines above, when no requested tunnel is left. | Fix the line above it. |
@@ -78,9 +78,9 @@ working session drops, a random 0–5 s wait).
 | `error=` text | Cause | Fix |
 | --- | --- | --- |
 | `agent connection failed: dial relay: Connection refused (os error 111)` | Nothing listens on the relay's port 443, or a firewall rejects it. | Check `systemctl is-active vorp` on the relay and the cloud firewall. |
-| `dial relay: Connection timed out (os error 110)` | Packets dropped on the way, or wrong IP in DNS. | `dig +short A example.com`; open TCP 443 inbound on the relay. |
+| `dial relay: Connection timed out (os error 110)` | Packets dropped on the way, or wrong IP in DNS. | `dig +short A vorp.example.com`; open TCP 443 inbound on the relay. |
 | `TLS handshake: invalid peer certificate: UnknownIssuer` | The agent does not trust the relay's certificate: no CA bundle on the agent machine, or the relay uses a test/self-signed certificate. | Install CA certificates (`apk add ca-certificates`, `apt-get install ca-certificates`), or pass `--ca-cert` for a test relay. |
-| `TLS handshake: invalid peer certificate: certificate not valid for name "relay.example.net"; ...` | `--relay-host` is a name the relay's certificate does not cover. | Use the base domain or a name under it. |
+| `TLS handshake: invalid peer certificate: certificate not valid for name "relay.example.net"; ...` | `--relay-host` is a name the relay's certificate does not cover. | Use `vorp.<base domain>`. |
 | `relay did not negotiate vorp-agent/1 ALPN`, or a TLS alert such as `NoApplicationProtocol` | Something other than vorp answers on 443: the Cloudflare proxy (orange cloud), nginx, or a load balancer that terminates TLS. | Set the DNS records to DNS only and point them at the relay. Nothing may terminate TLS in front of the relay. |
 | `missed three heartbeats`, `relay closed yamux session`, `agent registration timed out` | The connection dropped or stalled, or the relay restarted. | None if it recovers. If it repeats, check the network path and the relay's log. |
 
@@ -148,5 +148,5 @@ Read `journalctl -u vorp -n 50 --no-pager`. The cause follows `Caused by:`.
 | `400 {"error":"password must contain 12 to 1024 characters"}` | Password too short or too long. | Use 12 to 1024 characters. |
 | `429 {"error":"rate limit exceeded"}` | Too many sign-in attempts: 10 per account or 120 in total per minute, or 4 already being checked. | Wait a minute. |
 | `503 {"error":"relay disconnect unavailable"}` | The relay could not apply the change to live sessions (it is shutting down). | Retry. |
-| The dashboard host shows `404` | The request's host is neither the dashboard host nor `<name>.<base domain>`. | Use the name given to `--dashboard-host`, or the base domain when unset. |
+| The dashboard shows `404` | The request's host is neither `vorp.<base domain>` nor `<name>.<base domain>`. | Open `https://vorp.<base domain>`. |
 | Lost admin password | | On the relay host: `sudo -u vorp vorp admin reset-password --email you@example.com --database-path /var/lib/vorp/vorp.sqlite3`. It prints `New password for you@example.com: ...` once and ends that account's sessions. |

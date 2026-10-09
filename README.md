@@ -23,7 +23,7 @@ routers, corporate firewalls and Kubernetes clusters.
                     *.example.com                  any network
 ```
 
-> **Status: v0.0.5.** The agent runs on Linux and macOS (amd64 and arm64)
+> **Status: v0.0.6.** The agent runs on Linux and macOS (amd64 and arm64)
 > and Windows (amd64); the relay runs on Linux. Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
 > certificates is planned for v0.1.
@@ -56,19 +56,18 @@ subdomain, such as `*.tunnels.example.com`; substitute it throughout.
 
 ### 2. Point DNS at the server
 
-Create two records pointing at the server's public IP:
+Create one record pointing at the server's public IP:
 
 | Type | Name | Value |
 | --- | --- | --- |
-| A | `example.com` | server IP |
 | A | `*.example.com` | server IP |
 
-In Cloudflare, set both to **DNS only** (grey cloud). The Cloudflare proxy
+In Cloudflare, set it to **DNS only** (grey cloud). The Cloudflare proxy
 would intercept TLS and break agent connections.
 
-If the root name already serves something else, such as your website, leave it
-alone and put the dashboard on a name under the wildcard instead, such as
-`dashboard.example.com` (step 5).
+The relay serves its dashboard and takes agent connections at
+`vorp.example.com`, which the wildcard covers. vorp never uses the root name,
+so a website on `example.com` can stay where it is.
 
 ### 3. Install vorp
 
@@ -130,14 +129,13 @@ curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.serv
 sudo -u vorp vorp config show --relay   # check the effective settings
 sudo systemctl daemon-reload
 sudo systemctl enable --now vorp
-curl -fsS https://YOUR-DOMAIN/healthz
+curl -fsS https://vorp.YOUR-DOMAIN/healthz
 ```
 
 [`deploy/vorp.service`](deploy/vorp.service) runs
 `vorp serve --config /etc/vorp/vorp.yaml` as the `vorp` user with a hardened
-sandbox. [`deploy/vorp.yaml`](deploy/vorp.yaml) describes every setting; to
-put the dashboard on its own name, set `dashboard_host: dashboard.example.com`
-there. After editing the file, run `sudo systemctl restart vorp`.
+sandbox. [`deploy/vorp.yaml`](deploy/vorp.yaml) describes every setting.
+After editing the file, run `sudo systemctl restart vorp`.
 
 A relay installed earlier with every setting in the unit's `ExecStart=` keeps
 working unchanged; moving to the config file is optional
@@ -145,7 +143,7 @@ working unchanged; moving to the config file is optional
 
 ### 6. Create the admin account, right away
 
-Open `https://example.com` (or your dashboard host). On a fresh install the
+Open `https://vorp.example.com`. On a fresh install the
 dashboard asks you to create the first account, which becomes the admin.
 **Whoever opens it first gets it,** so do this as soon as the service starts.
 To avoid that window entirely, create the admin through a loopback-only relay
@@ -178,7 +176,7 @@ On the machine running the service (Linux or macOS):
 
 ```sh
 curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
-vorp login example.com     # paste the token at the hidden prompt
+vorp login vorp.example.com  # paste the token at the hidden prompt
 ```
 
 On macOS the installer needs GnuPG and jq to verify the download:
@@ -189,17 +187,15 @@ and `SHA256SUMS` from the [latest release](https://github.com/themid6t/vorp/rele
 check the hash, and put `vorp.exe` somewhere on your `PATH`. In PowerShell:
 
 ```powershell
-(Get-FileHash .\vorp_0.0.5_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\vorp_0.0.6_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
 Select-String windows_amd64 .\SHA256SUMS      # the two hashes must match
-Expand-Archive .\vorp_0.0.5_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
-Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" login example.com
+Expand-Archive .\vorp_0.0.6_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
+Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" login vorp.example.com
 ```
 
 `vorp login` saves the token to `~/.config/vorp/authtoken` (on Windows
 `%APPDATA%\vorp\authtoken`), readable only by you, and writes
-`relay_host: example.com` to `config.yaml` beside it. The relay name is any
-name that resolves to the relay, such as the base domain or the dashboard
-host. The token is never an argument, where `ps` and shell history would see
+`relay_host: vorp.example.com` to `config.yaml` beside it. The token is never an argument, where `ps` and shell history would see
 it, and never goes in the config file.
 
 ### 3. Open a tunnel
@@ -252,7 +248,7 @@ service name, such as a Compose service, add `--allow-remote-targets`, and
 mount the token as a file:
 
 ```sh
-vorp --relay-host example.com --token-file /etc/vorp/token \
+vorp --relay-host vorp.example.com --token-file /etc/vorp/token \
   --upstream http://app:3000 --allow-remote-targets --subdomain myapp
 ```
 
@@ -320,8 +316,7 @@ Config file: `/etc/vorp/vorp.yaml`, or `--config PATH` / `VORP_CONFIG`. See
 
 | Flag | Config key | Default | |
 | --- | --- | --- | --- |
-| `--base-domain` | `base_domain` | required | Tunnels are served at `*.<base-domain>` |
-| `--dashboard-host` | `dashboard_host` | the base domain | Host name that serves the dashboard and `/api` |
+| `--base-domain` | `base_domain` | required | Tunnels are served at `*.<base-domain>`, the dashboard, `/api` and agent connections at `vorp.<base-domain>` |
 | `--tls-cert`, `--tls-key` | `tls.cert`, `tls.key` | required | PEM certificate chain and key, re-read every 30 s |
 | `--database-path` | `database_path` | `vorp.sqlite3` | SQLite file |
 | `--listen` | `listen` | `0.0.0.0:443` | Listen address |

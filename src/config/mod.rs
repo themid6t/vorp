@@ -520,23 +520,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fallback_names_the_setting() {
-        let explicit = |_: &str| None;
-        let mut merge = Merge::new(&explicit);
-        let layer = RelayLayer {
-            base_domain: Some("example.com".into()),
-            ..RelayLayer::default()
-        };
-        RelayLayer::default().merge(layer, &mut merge);
-        let row = merge.rows.iter().find(|(key, _)| *key == "dashboard_host");
-        assert_eq!(
-            row.and_then(|(_, value)| value.as_ref())
-                .map(|(value, source)| format!("{value}  ({source})")),
-            Some("example.com  (default: base_domain)".to_owned())
-        );
-    }
-
     /// Flag > env > file > default for a scalar (`relay_host`), a list
     /// (`subdomains`) and a nested key (`limits.max_connections`), through
     /// the real merge functions. clap itself puts the flag over the

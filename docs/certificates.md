@@ -20,12 +20,13 @@ HTTP is involved, so port 80 can stay closed.
 
 A relay under a subdomain works the same way: a relay at `tunnels.example.com`
 needs a certificate for `tunnels.example.com` and `*.tunnels.example.com`, and
-A records for `tunnels` and `*.tunnels`.
+an A record for `*.tunnels`.
 
 ## 1. DNS and the Cloudflare token
 
-Create A records for `example.com` and `*.example.com` pointing at the relay's
-public IP, both set to **DNS only** (grey cloud). The relay must receive the
+Create an A record for `*.example.com` pointing at the relay's public IP, set
+to **DNS only** (grey cloud). It covers `vorp.example.com`, where the relay
+serves its dashboard and takes agent connections. The relay must receive the
 TLS connection itself: agents negotiate the `vorp-agent/1` ALPN protocol,
 which the Cloudflare proxy cannot pass through. Open TCP 443 on the server.
 
@@ -176,7 +177,7 @@ serves:
 ```sh
 sudo openssl x509 -noout -serial -in /etc/letsencrypt/live/example.com/fullchain.pem
 sudo openssl x509 -noout -serial -in /etc/vorp/fullchain.pem
-openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null \
+openssl s_client -connect vorp.example.com:443 -servername vorp.example.com </dev/null 2>/dev/null \
   | openssl x509 -noout -serial
 journalctl -u vorp --since '-1 day' --no-pager | grep 'TLS certificate'
 ```

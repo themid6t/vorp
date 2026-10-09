@@ -31,22 +31,17 @@ Ask the human for these before touching the server.
 | Cloudflare DNS for the zone | yes / no | The certificate is issued with a Cloudflare DNS challenge. Without Cloudflare, stop: see [Decision points](#decision-points). |
 | Cloudflare API token | (secret) | Scoped to the zone with **Zone → DNS → Edit**. Not the Global API Key. |
 | Admin email | `you@example.com` | Used for Let's Encrypt and for the first dashboard account. |
-| Is the root name free? | yes / no | "Free" means nothing else (a website, mail web UI) uses `example.com` itself. |
 
-From the last answer, pick the dashboard host:
-
-- Root name free: the dashboard is on the base domain. `DASHBOARD=example.com`.
-- Root name in use: put the dashboard on a name under the wildcard, such as
-  `dashboard.example.com`. `DASHBOARD=dashboard.example.com`. The name
-  `dashboard` can never be taken by a tunnel; it is on the relay's list of
-  reserved names.
+The dashboard, the API and agent connections are always at
+`vorp.<base domain>`. The name `vorp` can never be taken by a tunnel. vorp
+never uses the base domain itself, so a website there can stay.
 
 Every command block below uses these shell variables. Set them in each new
 shell:
 
 ```sh
 DOMAIN=example.com
-DASHBOARD=example.com
+DASHBOARD="vorp.$DOMAIN"
 SERVER_IP=203.0.113.10
 EMAIL=you@example.com
 ```
@@ -88,12 +83,10 @@ Create the records in Cloudflare first (or ask the human to):
 
 | Type | Name | Value | Proxy status |
 | --- | --- | --- | --- |
-| A | `example.com` | server IP | DNS only (grey cloud) |
 | A | `*.example.com` | server IP | DNS only (grey cloud) |
 
-If the dashboard is on `dashboard.example.com`, the root A record is not
-needed here; leave the root's existing record alone. The wildcard covers the
-dashboard name.
+The wildcard covers `vorp.example.com`. Leave any record for the root name
+alone.
 
 Check, from the server, against a public resolver:
 
@@ -238,13 +231,6 @@ curl -fsSL https://raw.githubusercontent.com/themid6t/vorp/main/deploy/vorp.yaml
 sudo chmod 0644 /etc/vorp/vorp.yaml
 ```
 
-If the dashboard is not on the base domain, set `dashboard_host`:
-
-```sh
-[ "$DASHBOARD" = "$DOMAIN" ] || sudo sed -i \
-  "s|^# dashboard_host: .*|dashboard_host: $DASHBOARD|" /etc/vorp/vorp.yaml
-```
-
 Every key is described in the file's comments. Leave `signup` closed for now.
 A relative path in the file (`database_path`, `tls.cert`, `tls.key`) is
 relative to `/etc/vorp`; the example uses absolute paths.
@@ -270,14 +256,12 @@ sudo -u vorp vorp config show --relay
 ```
 
 Expected: the unit line, then the effective settings, each followed by where
-it came from (`file` or `default`). An unset `dashboard_host` shows the base
-domain it falls back on, marked `(default: base_domain)`. With your names:
+it came from (`file` or `default`). With your names:
 
 ```
 ExecStart=/usr/local/bin/vorp serve --config /etc/vorp/vorp.yaml
 config                         /etc/vorp/vorp.yaml  (default)
 base_domain                    example.com  (file)
-dashboard_host                 example.com  (default: base_domain)
 listen                         0.0.0.0:443  (default)
 database_path                  /var/lib/vorp/vorp.sqlite3  (file)
 signup                         closed  (default)
@@ -287,8 +271,7 @@ limits.max_connections         1024  (default)
 ...
 ```
 
-With a separate dashboard host, `dashboard_host` shows
-`dashboard.example.com  (file)`. A typo in a key stops `vorp config show` and
+A typo in a key stops `vorp config show` and
 the relay with the file name and line, such as
 ``/etc/vorp/vorp.yaml:4: unknown key `relay_hots` ``. Fix the line and rerun the
 check.
@@ -401,7 +384,7 @@ TOKEN_ID=$(jq -r .token.id "$E/mint.json")
 jq -r .raw_token "$E/mint.json" | vorp authtoken --token-file "$E/token"
 rm "$E/mint.json"
 
-NO_COLOR=1 vorp --relay-host "$DOMAIN" --relay-addr 127.0.0.1:443 \
+NO_COLOR=1 vorp --relay-host "$DASHBOARD" --relay-addr 127.0.0.1:443 \
   --token-file "$E/token" --upstream http://127.0.0.1:18080 > "$E/agent.log" 2>&1 &
 AGENT_PID=$!
 sleep 3
@@ -434,7 +417,7 @@ From a machine **outside** the server's network (the human's laptop, or the
 agent's own machine):
 
 ```sh
-curl -fsS -o /dev/null -w '%{http_code}\n' https://example.com/healthz
+curl -fsS -o /dev/null -w '%{http_code}\n' https://vorp.example.com/healthz
 ```
 
 Expected: `200`. A timeout means TCP 443 is blocked by a cloud firewall or
@@ -471,11 +454,10 @@ Stop and ask the human in these cases. Do not work around them.
 
 | Situation | Why it matters | Ask |
 | --- | --- | --- |
-| The root name already serves something (website, other proxy) | The relay would take over the root name's HTTPS. | Confirm the dashboard goes on `dashboard.<domain>` (or another name under the wildcard), or pick a different base domain such as `tunnels.example.com`. |
 | The domain's DNS is not on Cloudflare | Step 3 and 4 use the Cloudflare DNS plugin; vorp has no built-in ACME yet. | Move the zone to Cloudflare, delegate a subdomain to Cloudflare, or supply a wildcard certificate another way (any PEM chain and key in `/etc/vorp` works). |
 | No API token, or the token check fails | Certbot cannot create the challenge record. | Ask for a zone-scoped token with Zone → DNS → Edit. |
 | Port 443 is in use (P3) | The relay must own TCP 443 and terminate TLS itself. It cannot sit behind nginx or a TLS-terminating proxy. | Ask whether to stop that service, or to use a different server. |
-| DNS shows a Cloudflare IP or another IP (P4) | Proxied or wrong records break agents. | Ask the human to set both records to DNS only, pointing at this server. |
+| DNS shows a Cloudflare IP or another IP (P4) | Proxied or wrong records break agents. | Ask the human to set the record to DNS only, pointing at this server. |
 | `needs_bootstrap` is `false` before step 6, or bootstrap returns `409` | Someone already created an account, possibly not the human. | Ask before deleting `/var/lib/vorp/vorp.sqlite3*` and starting over. Never delete the database without approval. |
 | Not Linux amd64/arm64, no systemd, or no `apt-get` | A relay runs on Linux amd64 or arm64; the steps assume systemd and apt. | Ask whether to adapt the Certbot install for this distribution or use another server. |
 | The server cannot reach Let's Encrypt or the Cloudflare API | Issuance and renewal need outbound HTTPS. | Ask for outbound access to be opened. |

@@ -23,8 +23,11 @@ impl TlsManager {
     pub(crate) async fn new(config: &RelayConfig) -> Result<Self, RelayError> {
         match &config.tls {
             TlsConfig::SelfSigned { cert_output } => {
+                // webpki rejects `*.localhost` (a wildcard over one label),
+                // so the dashboard host is named on its own.
                 let generated = rcgen::generate_simple_self_signed(vec![
                     config.base_domain.clone(),
+                    config.dashboard_host.clone(),
                     format!("*.{}", config.base_domain),
                 ])
                 .map_err(|error| RelayError::Tls(format!("self-signed certificate: {error}")))?;

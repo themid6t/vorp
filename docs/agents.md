@@ -69,7 +69,7 @@ Notes:
 
 Name rules: 3 to 63 characters; lowercase letters, digits and hyphens; starts
 and ends with a letter or digit. These are always refused: `www`, `api`,
-`mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorpd`.
+`mail`, `smtp`, `ftp`, `admin`, `dash`, `dashboard`, `vorp`, `vorpd`.
 
 **Dashboard:** open **Subdomains**, enter the name, and submit. Admins, and
 users an admin allowed to reserve directly, get it at once. Everyone else
@@ -82,13 +82,12 @@ session cookie in a private file:
 J=$(mktemp)
 printf '{"email":"%s","password":"%s"}' "you@example.com" "$PASSWORD" \
   | curl -fsS -c "$J" -H 'X-Vorp-Csrf: 1' -H 'Content-Type: application/json' \
-      --data-binary @- https://example.com/api/login; echo
+      --data-binary @- https://vorp.example.com/api/login; echo
 curl -sS -b "$J" -H 'X-Vorp-Csrf: 1' -H 'Content-Type: application/json' \
-  -d '{"name":"myapp"}' https://example.com/api/reservations; echo
+  -d '{"name":"myapp"}' https://vorp.example.com/api/reservations; echo
 ```
 
-Use the dashboard host in the URLs (the base domain unless the relay was
-started with `--dashboard-host`).
+The dashboard and API are at `vorp.<base domain>`.
 
 Expected: `{"ok":true}`, then `{"name":"myapp","status":"reserved"}` or
 `{"name":"myapp","status":"pending"}`. Other answers:
@@ -105,7 +104,7 @@ An admin approves a pending request with
 `POST /api/admin/reservation-requests/myapp/approve`, which returns
 `{"name":"myapp","user_id":2}`.
 
-Check: `curl -fsS -b "$J" https://example.com/api/reservations` lists
+Check: `curl -fsS -b "$J" https://vorp.example.com/api/reservations` lists
 `{"name":"myapp","status":"reserved"}`.
 
 ## 3. Create a token
@@ -118,7 +117,7 @@ Check: `curl -fsS -b "$J" https://example.com/api/reservations` lists
 ```sh
 curl -fsS -b "$J" -H 'X-Vorp-Csrf: 1' -H 'Content-Type: application/json' \
   -d '{"bind_policy":"reserved","allowlist":["myapp"]}' \
-  https://example.com/api/tokens > token.json
+  https://vorp.example.com/api/tokens > token.json
 jq '.token' token.json
 ```
 
@@ -142,24 +141,24 @@ On the machine that runs the agent, install vorp, then log in to the relay:
 
 ```sh
 curl -fsSL https://get-vorp.s3.ap-south-1.amazonaws.com/install.sh | sudo sh
-jq -r .raw_token token.json | vorp login example.com && rm token.json
+jq -r .raw_token token.json | vorp login vorp.example.com && rm token.json
 ```
 
 `vorp login` reads the token from standard input, or from a hidden prompt
-when standard input is a terminal: run `vorp login example.com` and paste it.
+when standard input is a terminal: run `vorp login vorp.example.com` and paste it.
 It never takes the token as an argument. The relay name is any name that
 resolves to the relay and that its certificate covers, usually the base
 domain.
 
 On Windows, install by hand from the latest GitHub Release (see the README),
-then `Get-Content token.txt | vorp.exe login example.com`. The files go to
+then `Get-Content token.txt | vorp.exe login vorp.example.com`. The files go to
 `%APPDATA%\vorp\` instead of `~/.config/vorp/`.
 
 Expected log lines:
 
 ```
 INFO vorp::token: agent token stored path=/home/you/.config/vorp/authtoken
-INFO vorp::login: agent config saved config=/home/you/.config/vorp/config.yaml relay_host=example.com
+INFO vorp::login: agent config saved config=/home/you/.config/vorp/config.yaml relay_host=vorp.example.com
 ```
 
 It wrote two files:
@@ -167,7 +166,7 @@ It wrote two files:
 - `~/.config/vorp/authtoken`, the token, mode `0600`. Check with
   `stat -c '%a' ~/.config/vorp/authtoken` (expected `600`).
 - `~/.config/vorp/config.yaml`, the agent config, with the line
-  `relay_host: example.com`. If the file already existed, only that line
+  `relay_host: vorp.example.com`. If the file already existed, only that line
   changed; comments and other keys are kept. If it names a different relay,
   `vorp login` refuses and says which one; add `--force` to replace it.
 
@@ -224,7 +223,7 @@ key in `~/.config/vorp/config.yaml`, with the same name:
 
 | Flag | Environment | Config key | Meaning |
 | --- | --- | --- | --- |
-| `--relay-host` | `VORP_RELAY_HOST` | `relay_host` | The relay's name. The agent checks the relay certificate against it. Default `localhost`. |
+| `--relay-host` | `VORP_RELAY_HOST` | `relay_host` | The relay's name, `vorp.<base domain>`. The agent checks the relay certificate against it. Default `localhost`. |
 | `--upstream` | `VORP_UPSTREAM` | `upstream` | Required. `http://host:port` only: no `https`, path, query, fragment or user info. |
 | `--subdomain` | `VORP_SUBDOMAINS` (comma-separated) | `subdomains` (a list) | Names to claim. Repeat the flag for several names. Omit it for one random name. |
 | `--allow-remote-targets` | `VORP_ALLOW_REMOTE_TARGETS` (`true`/`false`) | `allow_remote_targets` | Allow an upstream that is not loopback (`localhost`, `127.0.0.0/8`, `::1`). |
@@ -256,7 +255,7 @@ A config file with every key:
 
 ```yaml
 # ~/.config/vorp/config.yaml
-relay_host: example.com
+relay_host: vorp.example.com
 # relay_addr: 203.0.113.10:443     # dial this instead of resolving relay_host
 # ca_cert: /path/to/ca.pem          # extra CA, for test relays
 # token_file: /path/to/authtoken    # default: authtoken next to this file
@@ -281,8 +280,8 @@ Expected, after step 4:
 
 ```
 config                /home/you/.config/vorp/config.yaml  (default)
-relay_host            example.com  (file)
-relay_addr            example.com:443  (default: relay_host)
+relay_host            vorp.example.com  (file)
+relay_addr            vorp.example.com:443  (default: relay_host)
 ca_cert               (not set)
 token_file            /home/you/.config/vorp/authtoken  (default: config)
 upstream              (not set)
@@ -491,7 +490,7 @@ spec:
         - name: vorp
           image: registry.example.com/vorp-agent:0.0.2
           args:
-            - --relay-host=example.com
+            - --relay-host=vorp.example.com
             - --upstream=http://127.0.0.1:3000
             - --subdomain=myapp
             - --token-file=/etc/vorp/token
@@ -534,7 +533,7 @@ Notes:
 - **Flags or environment, no config file needed.** The container has no
   `~/.config/vorp/config.yaml`, so the agent uses its flags. Every flag also
   has a `VORP_*` variable (see step 5), for example
-  `{name: VORP_RELAY_HOST, value: example.com}` in `env:`. To share one
+  `{name: VORP_RELAY_HOST, value: vorp.example.com}` in `env:`. To share one
   config, mount a ConfigMap as a file and pass `--config=/etc/vorp-config/config.yaml`;
   keep the token in the Secret.
 - **Agent in its own Deployment.** To run the agent apart from the app, point
@@ -564,7 +563,7 @@ Check: `vorp --version` prints the new version, and the agent logs
 Revoke in the dashboard (**Tokens**, then revoke), or with the API:
 
 ```sh
-curl -fsS -b "$J" -X POST -H 'X-Vorp-Csrf: 1' https://example.com/api/tokens/3/revoke; echo
+curl -fsS -b "$J" -X POST -H 'X-Vorp-Csrf: 1' https://vorp.example.com/api/tokens/3/revoke; echo
 ```
 
 Expected: `{"ok":true}`. The relay closes every live session that
@@ -591,7 +590,7 @@ kubectl rollout restart deploy/myapp
 When finished with the API, end the session and delete the cookie file:
 
 ```sh
-curl -fsS -b "$J" -X POST -H 'X-Vorp-Csrf: 1' https://example.com/api/logout; echo
+curl -fsS -b "$J" -X POST -H 'X-Vorp-Csrf: 1' https://vorp.example.com/api/logout; echo
 rm -f "$J"
 ```
 
