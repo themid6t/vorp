@@ -435,7 +435,7 @@ one Pod share the network namespace, so the upstream is loopback and
 Use the official image, `ghcr.io/themid6t/vorp` (amd64 and arm64). It holds
 the same signed binary as the release archives, on `distroless/static` as a
 non-root user. Tags are `X.Y.Z`, `X.Y` and `latest`. It is published from
-the first release after v0.0.6.
+v0.0.7 on.
 
 ```sh
 docker run --rm ghcr.io/themid6t/vorp:0.0 --version
