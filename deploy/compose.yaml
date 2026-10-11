@@ -1,0 +1,21 @@
+# Relay in Docker. Put vorp.yaml (base_domain, tls.cert, tls.key) and the
+# certificate files in /etc/vorp on the host, then: docker compose up -d
+#
+# In vorp.yaml, set database_path: /var/lib/vorp/vorp.sqlite3 so the
+# database lands in the volume. The relay reloads the certificate files
+# within 30 seconds of Certbot renewing them; the container needs no restart.
+# The image runs as uid/gid 65532, so the certificate files must be readable
+# by it: in deploy/cert-deploy.sh use `-g 65532` instead of `-g vorp`.
+services:
+  vorp:
+    image: ghcr.io/themid6t/vorp:0.0
+    command: ["serve", "--config", "/etc/vorp/vorp.yaml"]
+    ports:
+      - "443:443"
+    volumes:
+      - /etc/vorp:/etc/vorp:ro
+      - vorp-data:/var/lib/vorp
+    restart: unless-stopped
+
+volumes:
+  vorp-data:

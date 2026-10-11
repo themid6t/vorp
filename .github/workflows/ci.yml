@@ -65,6 +65,24 @@ jobs:
       - if: steps.changes.outputs.run_ci == 'true'
         run: cargo test --all-features
 
+  # The release image is cut from the CI binaries at tag time; this builds the
+  # source Dockerfile so a broken one fails here, not mid-release.
+  docker:
+    if: needs.rust.outputs.run_ci == 'true'
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: vorp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker run --rm vorp:ci --version
+
   # Release binaries for every code push to main. A release tag publishes
   # these artifacts for its commit instead of rebuilding.
   build:

@@ -23,7 +23,7 @@ routers, corporate firewalls and Kubernetes clusters.
                     *.example.com                  any network
 ```
 
-> **Status: v0.0.6.** The agent runs on Linux and macOS (amd64 and arm64)
+> **Status: v0.0.7.** The agent runs on Linux and macOS (amd64 and arm64)
 > and Windows (amd64); the relay runs on Linux. Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
 > certificates is planned for v0.1.
@@ -187,9 +187,9 @@ and `SHA256SUMS` from the [latest release](https://github.com/themid6t/vorp/rele
 check the hash, and put `vorp.exe` somewhere on your `PATH`. In PowerShell:
 
 ```powershell
-(Get-FileHash .\vorp_0.0.6_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\vorp_0.0.7_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
 Select-String windows_amd64 .\SHA256SUMS      # the two hashes must match
-Expand-Archive .\vorp_0.0.6_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
+Expand-Archive .\vorp_0.0.7_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
 Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" login vorp.example.com
 ```
 
@@ -252,9 +252,19 @@ vorp --relay-host vorp.example.com --token-file /etc/vorp/token \
   --upstream http://app:3000 --allow-remote-targets --subdomain myapp
 ```
 
-The binary is static, so any small image with CA certificates works, such as
-`alpine` with `ca-certificates`. [docs/agents.md](docs/agents.md) has a
-Dockerfile, a Deployment and pm2 instructions.
+The official image is `ghcr.io/themid6t/vorp` (amd64 and arm64, from
+v0.0.7). It runs both modes as uid 65532, so the token
+file must be readable by that user:
+
+```sh
+docker run -d -v /etc/vorp:/etc/vorp:ro ghcr.io/themid6t/vorp:0.0 \
+  --relay-host vorp.example.com --token-file /etc/vorp/token \
+  --upstream http://app:3000 --allow-remote-targets --subdomain myapp
+```
+
+To run the relay in Docker, use [deploy/compose.yaml](deploy/compose.yaml).
+[docs/agents.md](docs/agents.md) has a Kubernetes Deployment and pm2
+instructions.
 
 ## Operate the relay
 
@@ -385,6 +395,10 @@ VORP_TOKEN=dev-secret cargo run -- --relay-host localhost \
 # *.localhost wildcard.
 curl -k --resolve NAME.localhost:8443:127.0.0.1 https://NAME.localhost:8443/
 ```
+
+`docker build -t vorp .` builds the same image from source. To run the
+development relay above in it, use `--network host` (Linux): the development
+token needs a loopback listener, which a published port cannot reach.
 
 For dashboard work with live reload, run `npm run dev` in `crates/web/ui`. It
 proxies `/api` to `https://127.0.0.1:8443` (override with `VORP_RELAY`).

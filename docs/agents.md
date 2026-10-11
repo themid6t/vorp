@@ -432,27 +432,16 @@ The agent runs as a second container in the application's Pod. Containers in
 one Pod share the network namespace, so the upstream is loopback and
 `--allow-remote-targets` is not needed.
 
-There is no official image yet. Build a small one from the verified
-release binary. On a machine where the installer has put the binary at
-`/usr/local/bin/vorp`, with the same CPU architecture as the cluster nodes:
+Use the official image, `ghcr.io/themid6t/vorp` (amd64 and arm64). It holds
+the same signed binary as the release archives, on `distroless/static` as a
+non-root user. Tags are `X.Y.Z`, `X.Y` and `latest`. It is published from
+v0.0.7 on.
 
 ```sh
-mkdir vorp-image && cd vorp-image
-cp /usr/local/bin/vorp .
-cat > Dockerfile <<'EOF'
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
-COPY vorp /usr/local/bin/vorp
-USER 65534:65534
-ENTRYPOINT ["/usr/local/bin/vorp"]
-EOF
-docker build -t registry.example.com/vorp-agent:0.0.2 .
-docker run --rm registry.example.com/vorp-agent:0.0.2 --version
-docker push registry.example.com/vorp-agent:0.0.2
+docker run --rm ghcr.io/themid6t/vorp:0.0 --version
 ```
 
-Expected: `vorp 0.0.2`. The binary is static; `ca-certificates` lets it verify
-the relay's Let's Encrypt certificate.
+Expected: `vorp 0.0.N`.
 
 Store the token as a Secret, created from the file (not `--from-literal`,
 which puts it in shell history):
@@ -488,7 +477,7 @@ spec:
           ports:
             - containerPort: 3000
         - name: vorp
-          image: registry.example.com/vorp-agent:0.0.2
+          image: ghcr.io/themid6t/vorp:0.0
           args:
             - --relay-host=vorp.example.com
             - --upstream=http://127.0.0.1:3000
@@ -552,8 +541,7 @@ protocol version 1. A mismatch makes the agent exit with
   (`systemctl --user restart vorp-myapp`, `pm2 restart vorp-myapp`, or on
   macOS `launchctl kickstart -k "gui/$(id -u)/com.example.vorp-myapp"`). The
   installer keeps the previous binary as `/usr/local/bin/vorp.rollback`.
-- Container: rebuild the image from the new binary with a new tag, and update
-  the Deployment.
+- Container: change the image tag in the Deployment.
 
 Check: `vorp --version` prints the new version, and the agent logs
 `tunnel registered` again.
