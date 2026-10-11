@@ -1,0 +1,9 @@
+target/
+crates/web/ui/node_modules/
+crates/web/ui/dist/
+.git/
+.claude/
+agent-triages/
+*.sqlite3*
+*.key
+*.pem

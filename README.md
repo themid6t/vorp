@@ -252,9 +252,19 @@ vorp --relay-host vorp.example.com --token-file /etc/vorp/token \
   --upstream http://app:3000 --allow-remote-targets --subdomain myapp
 ```
 
-The binary is static, so any small image with CA certificates works, such as
-`alpine` with `ca-certificates`. [docs/agents.md](docs/agents.md) has a
-Dockerfile, a Deployment and pm2 instructions.
+The official image is `ghcr.io/themid6t/vorp` (amd64 and arm64, from the
+first release after v0.0.6). It runs both modes as uid 65532, so the token
+file must be readable by that user:
+
+```sh
+docker run -d -v /etc/vorp:/etc/vorp:ro ghcr.io/themid6t/vorp:0.0 \
+  --relay-host vorp.example.com --token-file /etc/vorp/token \
+  --upstream http://app:3000 --allow-remote-targets --subdomain myapp
+```
+
+To run the relay in Docker, use [deploy/compose.yaml](deploy/compose.yaml).
+[docs/agents.md](docs/agents.md) has a Kubernetes Deployment and pm2
+instructions.
 
 ## Operate the relay
 
@@ -385,6 +395,10 @@ VORP_TOKEN=dev-secret cargo run -- --relay-host localhost \
 # *.localhost wildcard.
 curl -k --resolve NAME.localhost:8443:127.0.0.1 https://NAME.localhost:8443/
 ```
+
+`docker build -t vorp .` builds the same image from source. To run the
+development relay above in it, use `--network host` (Linux): the development
+token needs a loopback listener, which a published port cannot reach.
 
 For dashboard work with live reload, run `npm run dev` in `crates/web/ui`. It
 proxies `/api` to `https://127.0.0.1:8443` (override with `VORP_RELAY`).

@@ -38,7 +38,11 @@ uploads it to `s3://get-vorp` (`ap-south-1`). The archives go first, then
 `version.txt`. A bucket policy makes objects public, and ACLs are disabled.
 The `vorp-release-ci` IAM user can only read, write and delete objects in that
 bucket. The GitHub Release gets the archives, a `SHA256SUMS` file, the
-manifest and its signature.
+manifest and its signature. Last, the workflow builds the `release` target of
+the `Dockerfile` around the same Linux binaries and pushes
+`ghcr.io/themid6t/vorp:X.Y.Z`, `:X.Y` and `:latest` for amd64 and arm64, using
+the workflow's own token. The first push creates the package as private; make
+it public once in the package settings.
 
 Repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `GPG_PRIVATE_KEY` and `GPG_KEY_ID`.
