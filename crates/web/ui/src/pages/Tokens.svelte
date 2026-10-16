@@ -4,6 +4,7 @@
   import { attempt, confirm, notify, session } from '../lib/app.svelte';
   import { agentCommand, commandNote } from '../lib/format';
   import CopyField from '../components/CopyField.svelte';
+  import Icon from '../components/Icon.svelte';
   import Modal from '../components/Modal.svelte';
   import PageHead from '../components/PageHead.svelte';
 
@@ -96,10 +97,10 @@
       {/if}
     </fieldset>
   {/if}
-  <div><button type="submit" class="primary" disabled={creating}>Create token</button></div>
+  <div class="row end"><button type="submit" class="primary" disabled={creating}>Create token</button></div>
 </form>
 
-<section class="card flush">
+<section class="card flush tokens-card">
   <div class="bar"><h2>Your tokens</h2></div>
   {#if tokens?.length}
     <table>
@@ -121,7 +122,11 @@
       </tbody>
     </table>
   {:else if tokens}
-    <p class="empty">You have no tokens yet.</p>
+    <div class="empty token-empty">
+      <span class="empty-icon" aria-hidden="true"><Icon name="tokens" size={23} /></span>
+      <strong>You have no tokens yet.</strong>
+      <p>Create a token to connect an agent.</p>
+    </div>
   {/if}
 </section>
 
@@ -139,6 +144,15 @@
 <style>
   .policies { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
   .choice.name { padding: 10px 14px; align-items: center; }
-  .warn { font-size: 0.92rem; padding: 12px 14px; border-radius: 12px; box-shadow: var(--inset-sm); }
+  .tokens-card { gap: 0; }
+  .token-empty { min-height: 176px; display: grid; place-items: center; align-content: center; gap: 7px; }
+  .empty-icon {
+    width: 46px; height: 46px; margin-bottom: 3px;
+    display: grid; place-items: center; border-radius: 50%;
+    color: var(--text); background: var(--active-surface);
+  }
+  .token-empty strong { color: var(--text); font-size: 0.92rem; }
+  .token-empty p { font-size: 0.8rem; }
+  .warn { font-size: 0.92rem; padding: 12px 14px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--bg); }
   .warn strong { color: var(--warn); }
 </style>

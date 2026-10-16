@@ -47,7 +47,9 @@
 </script>
 
 <PageHead eyebrow="names" title="Reserved subdomains">
-  Only your tokens can open a name you have reserved. Your tunnels appear at <code>{tunnelUrl('<name>', domain)}</code>.
+  {#snippet info()}
+    Only your tokens can open a name you have reserved. Your tunnels appear at <code>{tunnelUrl('<name>', domain)}</code>.
+  {/snippet}
 </PageHead>
 
 <form class="card" onsubmit={reserve}>
@@ -57,8 +59,8 @@
       ? 'Names you reserve are yours at once.'
       : 'An administrator approves each name you request. A pending request already holds the name, so nobody else can take it.'}
   </p>
-  <div class="row">
-    <div class="field grow">
+  <div class="reserve-row">
+    <div class="field">
       <input bind:value={name} aria-label="Subdomain" placeholder="my-app" autocomplete="off" spellcheck="false" required>
       <span class="suffix mono">.{domain}</span>
     </div>
@@ -96,7 +98,12 @@
 </section>
 
 <style>
-  .field { display: flex; align-items: center; gap: 10px; }
+  .reserve-row { display: flex; align-items: center; gap: 10px; }
+  .field { min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; }
   .suffix { color: var(--text-dim); font-size: 0.85rem; white-space: nowrap; }
-  @media (max-width: 600px) { .suffix { display: none; } }
+  @media (max-width: 600px) {
+    .reserve-row { align-items: stretch; flex-direction: column; }
+    .reserve-row button { align-self: flex-end; }
+    .suffix { display: none; }
+  }
 </style>
