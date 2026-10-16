@@ -1,4 +1,4 @@
-import '@fontsource-variable/geist';
+import '@fontsource-variable/dm-sans';
 import '@fontsource-variable/geist-mono';
 import './theme.css';
 import { mount } from 'svelte';

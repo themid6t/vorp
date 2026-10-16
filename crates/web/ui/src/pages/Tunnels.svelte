@@ -3,6 +3,7 @@
   import { api, post, type Tunnel } from '../lib/api';
   import { attempt, confirm, notify, session } from '../lib/app.svelte';
   import { tunnelUrl } from '../lib/format';
+  import Icon from '../components/Icon.svelte';
   import PageHead from '../components/PageHead.svelte';
 
   const limits = $derived(session.me!.limits);
@@ -47,11 +48,18 @@
 
 <PageHead eyebrow="live" title="Tunnels">{summary}</PageHead>
 
-<section class="card flush">
-  <div class="bar">
-    <h2>Open tunnels</h2>
-    <span class="badge ok">auto-refresh</span>
-    <button type="button" class="sm" onclick={refresh} disabled={refreshing}>Refresh</button>
+<section class="card flush tunnel-card">
+  <div class="tunnel-head">
+    <div>
+      <h2>Open tunnels</h2>
+      <p class="dim small">Manage and monitor active tunnels.</p>
+    </div>
+    <div class="head-actions">
+      <span class="badge ok">Auto-refresh</span>
+      <button type="button" class="refresh-button sm" onclick={refresh} disabled={refreshing}>
+        <Icon name="refresh" size={14} />Refresh
+      </button>
+    </div>
   </div>
   {#if tunnels?.length}
     <table>
@@ -69,7 +77,30 @@
       </tbody>
     </table>
   {:else if tunnels}
-    <p class="empty">No tunnels are open. Start the agent to open one — the command is on the <a href="#overview">overview</a>.</p>
+    <div class="empty tunnel-empty">
+      <Icon name="share" size={25} />
+      <strong>No tunnels open</strong>
+      <p>Start the agent to open a tunnel. The command is available on <a href="#overview">Overview</a>.</p>
+    </div>
   {/if}
 </section>
+
+<style>
+  .tunnel-card { gap: 0; }
+  .tunnel-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 16px; border-bottom: 1px solid var(--color-border);
+  }
+  .tunnel-head > div:first-child { display: grid; gap: 5px; }
+  .head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .refresh-button { color: var(--text); background: transparent; border-color: var(--color-border); }
+  .refresh-button:hover:not(:disabled) { color: var(--text); background: var(--hover-surface); filter: none; }
+  .tunnel-empty { min-height: 140px; display: grid; place-items: center; align-content: center; gap: 7px; }
+  .tunnel-empty strong { color: var(--text); font-size: 0.92rem; }
+  .tunnel-empty p { font-size: 0.8rem; }
+  @media (max-width: 600px) {
+    .tunnel-head { align-items: flex-start; flex-direction: column; }
+    .head-actions { width: 100%; }
+  }
+</style>
 
