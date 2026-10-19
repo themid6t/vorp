@@ -9,7 +9,7 @@
 </div>
 
 <style>
-  .stat { gap: 6px; padding: 22px 24px; }
-  .label { font-size: 0.78rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); }
-  .value { font-size: 1.9rem; font-weight: 650; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+  .stat { height: 100%; min-height: 82px; gap: 2px; padding: 12px 16px; align-content: center; }
+  .label { font-size: 0.68rem; font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-dim); }
+  .value { font-size: clamp(1.4rem, 2.2vw, 1.5rem); line-height: 1.1; font-weight: 600; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
 </style>

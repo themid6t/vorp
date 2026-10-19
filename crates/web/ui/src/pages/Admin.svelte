@@ -3,6 +3,7 @@
   import { api, post, type AdminUser, type LimitField, type Limits, type ReservationRequest } from '../lib/api';
   import { attempt, confirm, notify, session } from '../lib/app.svelte';
   import { bandwidthBytes, bytesToMib, formatRate, positiveInt } from '../lib/format';
+  import Icon from '../components/Icon.svelte';
   import PageHead from '../components/PageHead.svelte';
   import LimitsDialog from './LimitsDialog.svelte';
 
@@ -100,12 +101,19 @@
   Approve names, set quotas and manage accounts. Changes reach live tunnels immediately.
 </PageHead>
 
-<section class="card flush">
-  <div class="bar">
-    <h2>Reservation requests</h2>
+<div class="admin-summary">
+  <div class="summary-card"><span class="summary-icon users"><Icon name="account" /></span><span><small>Total users</small><strong>{users?.length ?? '—'}</strong></span></div>
+  <div class="summary-card"><span class="summary-icon pending"><Icon name="clock" /></span><span><small>Pending requests</small><strong>{requests?.length ?? '—'}</strong></span></div>
+  <div class="summary-card"><span class="summary-icon quota-icon"><Icon name="database" /></span><span><small>Default quota</small><strong>{defaults ? `${defaults.max_tunnels} / ${bytesToMib(defaults.bandwidth_bytes_per_sec)} / ${defaults.max_concurrent_requests}` : '—'}</strong><em>Tunnels / MiB/s / Requests</em></span></div>
+  <div class="summary-card"><span class="summary-icon admins"><Icon name="admin" /></span><span><small>Administrators</small><strong>{users ? users.filter((user) => user.is_admin).length : '—'}</strong></span></div>
+</div>
+
+<section class="card flush requests-card">
+  <div class="section-head">
+    <span class="section-icon"><Icon name="clock" size={18} /></span>
+    <div><h2>Reservation requests</h2><p class="dim small">Users without direct reservation ask for names here. A pending request holds the name until you decide.</p></div>
     {#if requests?.length}<span class="badge accent">{requests.length} pending</span>{/if}
   </div>
-  <p class="dim small pad">Users without direct reservation ask for names here. A pending request holds the name until you decide.</p>
   {#if requests?.length}
     <table>
       <thead><tr><th>Name</th><th>Requested by</th><th>When</th><th><span class="sr-only">Actions</span></th></tr></thead>
@@ -124,16 +132,19 @@
       </tbody>
     </table>
   {:else if requests}
-    <p class="empty">No pending requests.</p>
+    <div class="empty request-empty">
+      <span class="empty-icon" aria-hidden="true"><Icon name="document" size={22} /></span>
+      <strong>No pending requests.</strong>
+      <p>Requests from users will appear here.</p>
+    </div>
   {/if}
 </section>
 
-<section class="card flush">
-  <div class="bar"><h2>Users</h2></div>
-  <p class="dim small pad">
-    <span class="badge plain">default</span> marks a value that follows the default quota. Admins are exempt from quotas.
-    "Direct" users get reserved names at once, without a request.
-  </p>
+<section class="card flush users-card">
+  <div class="section-head users-head">
+    <Icon name="account" size={18} />
+    <div><h2>Users</h2><p class="dim small"><span class="badge plain">default</span> marks a value that follows the default quota. Admins are exempt from quotas. "Direct" users get reserved names at once, without a request.</p></div>
+  </div>
   {#if users}
     <table>
       <thead><tr><th>Email</th><th>Role</th><th>Direct</th><th>Tunnels</th><th>Bandwidth</th><th>Requests</th><th><span class="sr-only">Actions</span></th></tr></thead>
@@ -183,22 +194,22 @@
 
 <div class="split">
   <form class="card" onsubmit={saveDefaults}>
-    <h2>Default quotas</h2>
+    <div class="form-heading"><Icon name="database" size={19} /><h2>Default quotas</h2></div>
     <p class="dim small">For every non-admin user without an override. Lowering the tunnel limit does not close tunnels that are already open.</p>
     <div class="fields">
       <label>Max tunnels <input type="number" min="1" step="1" bind:value={form.max_tunnels} required></label>
       <label>Bandwidth (MiB/s) <input type="number" min="0.001" step="any" bind:value={form.bandwidth} required></label>
       <label>Concurrent requests <input type="number" min="1" step="1" bind:value={form.max_concurrent_requests} required></label>
     </div>
-    <div><button type="submit" class="primary" disabled={busy === 'defaults'}>Save defaults</button></div>
+    <div class="row end"><button type="submit" class="primary" disabled={busy === 'defaults'}>Save defaults</button></div>
   </form>
 
   <form class="card" onsubmit={createUser}>
-    <h2>Create a user</h2>
+    <div class="form-heading"><Icon name="userPlus" size={19} /><h2>Create a user</h2></div>
     <p class="dim small">Send the password over a private channel. The user must choose a new one at first login.</p>
     <label>Email <input type="email" autocomplete="off" bind:value={newUser.email} required></label>
     <label>Password <input type="password" autocomplete="new-password" minlength="12" bind:value={newUser.password} required></label>
-    <div><button type="submit" class="primary" disabled={busy === 'create'}>Create user</button></div>
+    <div class="row end"><button type="submit" class="primary" disabled={busy === 'create'}>Create user</button></div>
   </form>
 </div>
 
@@ -207,8 +218,34 @@
 {/if}
 
 <style>
-  .pad { padding: 0 16px 8px; }
-  .split { display: grid; gap: 24px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items: start; }
+  .admin-summary { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .summary-card { min-width: 0; min-height: 80px; padding: 12px 14px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--card-border); border-radius: var(--radius); background: var(--color-surface); box-shadow: var(--card-shadow); }
+  .summary-card > span:last-child { min-width: 0; display: grid; gap: 1px; }
+  .summary-card small { color: var(--text-dim); font-size: 0.62rem; font-style: normal; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+  .summary-card strong { font-size: 1.35rem; line-height: 1.2; white-space: nowrap; }
+  .summary-card em { color: var(--text-dim); font-size: 0.62rem; font-style: normal; white-space: nowrap; }
+  .summary-icon { width: 30px; height: 30px; display: grid; place-items: center; flex: none; border-radius: 8px; }
+  .summary-icon.users { color: var(--accent-ink); background: var(--accent-soft); }
+  .summary-icon.pending { color: var(--ok); background: var(--teal-surface); }
+  .summary-icon.quota-icon { color: var(--warn); background: var(--warm-highlight); }
+  .summary-icon.admins { color: var(--text-dim); background: var(--active-surface); }
+  .requests-card, .users-card { gap: 0; }
+  .section-head { display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; }
+  .section-head > div { min-width: 0; display: grid; gap: 5px; }
+  .section-head > .badge { margin-left: auto; }
+  .section-icon { width: 32px; height: 32px; display: grid; place-items: center; flex: none; border-radius: 50%; color: var(--text-dim); background: var(--active-surface); }
+  .users-head { align-items: center; border-bottom: 1px solid var(--color-border); }
+  .users-head > :global(svg) { flex: none; }
+  .request-empty { min-height: 100px; display: grid; place-items: center; align-content: center; gap: 5px; }
+  .empty-icon { width: 42px; height: 42px; margin-bottom: 2px; display: grid; place-items: center; border-radius: 50%; color: var(--text-dim); background: var(--active-surface); }
+  .request-empty strong { color: var(--text); font-size: 0.82rem; }
+  .request-empty p { font-size: 0.72rem; }
+  .split { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items: stretch; }
+  .split form { height: 100%; }
+  .split .row.end { margin-top: auto; }
+  .form-heading { display: flex; align-items: center; gap: 9px; }
   .fields { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   td .badge.plain { margin-left: 6px; }
+  @media (max-width: 980px) { .admin-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 560px) { .admin-summary { grid-template-columns: minmax(0, 1fr); } }
 </style>

@@ -3,6 +3,7 @@
   import { api, type TrafficEvent } from '../lib/api';
   import { attempt } from '../lib/app.svelte';
   import { formatBytes } from '../lib/format';
+  import Icon from '../components/Icon.svelte';
   import PageHead from '../components/PageHead.svelte';
 
   type Status = { text: string; tone: 'ok' | 'warn' | 'bad' };
@@ -62,8 +63,8 @@
 
 <PageHead eyebrow="requests" title="Recent traffic">The latest requests through your tunnels, updated every two seconds.</PageHead>
 
-<section class="card flush">
-  <div class="bar">
+<section class="card flush traffic-card">
+  <div class="bar traffic-head">
     <h2>Requests</h2>
     <span class="badge {status.tone}">{status.text}</span>
     {#if ended}<button type="button" class="sm" onclick={reconnect}>Reconnect</button>{/if}
@@ -85,10 +86,24 @@
       </tbody>
     </table>
   {:else if sorted}
-    <p class="empty">No requests yet. Traffic through your tunnels appears here.</p>
+    <div class="empty traffic-empty">
+      <span class="empty-icon" aria-hidden="true"><Icon name="traffic" size={28} /></span>
+      <strong>No requests yet</strong>
+      <p>Traffic through your tunnels will appear here when an agent receives requests.</p>
+    </div>
   {/if}
 </section>
 
 <style>
+  .traffic-card { gap: 0; }
+  .traffic-head { padding: 16px 18px 8px; }
+  .traffic-empty { min-height: 250px; display: grid; place-items: center; align-content: center; gap: 8px; }
+  .empty-icon {
+    width: 60px; height: 60px; margin-bottom: 4px;
+    display: grid; place-items: center; border-radius: 50%;
+    color: var(--text-dim); background: var(--active-surface);
+  }
+  .traffic-empty strong { color: var(--text); font-size: 1rem; }
+  .traffic-empty p { max-width: 560px; font-size: 0.86rem; }
   .num { font-variant-numeric: tabular-nums; }
 </style>

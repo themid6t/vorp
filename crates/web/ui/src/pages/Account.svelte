@@ -1,6 +1,7 @@
 <script lang="ts">
   import { post } from '../lib/api';
   import { notify, session, signOut } from '../lib/app.svelte';
+  import Icon from '../components/Icon.svelte';
   import PageHead from '../components/PageHead.svelte';
 
   const forced = $derived(session.me!.must_change_password);
@@ -8,6 +9,9 @@
   let newPassword = $state('');
   let repeat = $state('');
   let busy = $state(false);
+  let showOld = $state(false);
+  let showNew = $state(false);
+  let showRepeat = $state(false);
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
@@ -38,15 +42,48 @@
 {/if}
 
 <form class="card narrow" onsubmit={submit}>
-  <label>Current password <input bind:value={oldPassword} type="password" autocomplete="current-password" required></label>
-  <label>New password <input bind:value={newPassword} type="password" autocomplete="new-password" minlength="12" required></label>
-  <label>Repeat new password <input bind:value={repeat} type="password" autocomplete="new-password" minlength="12" required></label>
+  <div class="form-title"><span class="title-icon" aria-hidden="true"><Icon name="lock" size={18} /></span><h2>Change password</h2></div>
+  <label>Current password
+    <span class="password-field">
+      <input bind:value={oldPassword} type={showOld ? 'text' : 'password'} autocomplete="current-password" required>
+      <button type="button" class="visibility" onclick={() => (showOld = !showOld)} aria-label={showOld ? 'Hide current password' : 'Show current password'} title={showOld ? 'Hide password' : 'Show password'}>
+        <Icon name={showOld ? 'eyeOff' : 'eye'} size={17} />
+      </button>
+    </span>
+  </label>
+  <label>New password
+    <span class="password-field">
+      <input bind:value={newPassword} type={showNew ? 'text' : 'password'} autocomplete="new-password" minlength="12" required>
+      <button type="button" class="visibility" onclick={() => (showNew = !showNew)} aria-label={showNew ? 'Hide new password' : 'Show new password'} title={showNew ? 'Hide password' : 'Show password'}>
+        <Icon name={showNew ? 'eyeOff' : 'eye'} size={17} />
+      </button>
+    </span>
+  </label>
+  <label>Repeat new password
+    <span class="password-field">
+      <input bind:value={repeat} type={showRepeat ? 'text' : 'password'} autocomplete="new-password" minlength="12" required>
+      <button type="button" class="visibility" onclick={() => (showRepeat = !showRepeat)} aria-label={showRepeat ? 'Hide repeated password' : 'Show repeated password'} title={showRepeat ? 'Hide password' : 'Show password'}>
+        <Icon name={showRepeat ? 'eyeOff' : 'eye'} size={17} />
+      </button>
+    </span>
+  </label>
   <p class="dim small">At least 12 characters.</p>
-  <div><button type="submit" class="primary" disabled={busy}>Change password</button></div>
+  <div class="form-actions"><button type="submit" class="primary" disabled={busy}>Change password</button></div>
 </form>
 
 <style>
-  .narrow { max-width: 480px; }
+  .narrow { max-width: 520px; gap: 14px; padding: 18px 20px; }
+  .form-title { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+  .title-icon { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid var(--color-border); border-radius: 7px; color: var(--text-dim); background: var(--active-surface); }
+  .password-field { position: relative; display: block; }
+  .password-field input { padding-right: 46px; }
+  .visibility {
+    position: absolute; top: 50%; right: 7px; transform: translateY(-50%);
+    width: 32px; height: 32px; min-height: 32px; padding: 0;
+    color: var(--text-dim); background: transparent; border-color: transparent;
+  }
+  .visibility:hover:not(:disabled) { color: var(--text); background: var(--hover-surface); filter: none; }
+  .form-actions { display: flex; justify-content: flex-end; margin-top: 4px; padding-top: 14px; border-top: 1px solid var(--color-border); }
   .callout { max-width: 480px; gap: 8px; }
   .callout h2 { color: var(--warn); }
 </style>

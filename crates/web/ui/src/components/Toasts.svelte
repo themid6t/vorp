@@ -18,13 +18,13 @@
   .toast {
     display: flex; gap: 12px; align-items: center;
     padding: 12px 12px 12px 16px;
-    background: var(--bg);
-    border-radius: 16px;
-    box-shadow: 8px 8px 22px var(--shade), -6px -6px 18px var(--hi);
-    outline: 1px solid var(--outline);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    box-shadow: var(--panel-shadow);
   }
   p { flex: 1; font-size: 0.9rem; }
-  .mark { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 0.8rem; box-shadow: var(--inset-sm); color: var(--danger); flex: none; }
+  .mark { width: 26px; height: 26px; border: 1px solid currentColor; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 0.8rem; color: var(--danger); flex: none; }
   .ok .mark { color: var(--ok); }
   .icon.sm { width: 30px; height: 30px; padding: 0; }
 </style>
