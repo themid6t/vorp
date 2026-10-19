@@ -23,7 +23,7 @@ routers, corporate firewalls and Kubernetes clusters.
                     *.example.com                  any network
 ```
 
-> **Status: v0.0.7.** The agent runs on Linux and macOS (amd64 and arm64)
+> **Status: v0.0.8.** The agent runs on Linux and macOS (amd64 and arm64)
 > and Windows (amd64); the relay runs on Linux. Setting up a relay takes about
 > fifteen minutes by hand; a one-command `vorp setup` with built-in
 > certificates is planned for v0.1.
@@ -187,9 +187,9 @@ and `SHA256SUMS` from the [latest release](https://github.com/themid6t/vorp/rele
 check the hash, and put `vorp.exe` somewhere on your `PATH`. In PowerShell:
 
 ```powershell
-(Get-FileHash .\vorp_0.0.7_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\vorp_0.0.8_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
 Select-String windows_amd64 .\SHA256SUMS      # the two hashes must match
-Expand-Archive .\vorp_0.0.7_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
+Expand-Archive .\vorp_0.0.8_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\vorp"
 Get-Content .\token.txt | & "$env:LOCALAPPDATA\vorp\vorp.exe" login vorp.example.com
 ```
 
